@@ -661,8 +661,10 @@ class SyncExecutor:
                             break
                 if not replaced:
                     ctx.existing_playlists_raw.append(upl)
-            logger.info("Merged user playlist '%s' (id=0x%X, new=%s)",
-                        upl.get("Title", "?"), pid, is_new)
+            logger.info("Merged user playlist '%s' (id=%s, new=%s)",
+                        upl.get("Title", "?"),
+                        ("0x%X" % pid) if pid is not None else "new",
+                        is_new)
             ctx.progress("playlists", idx + 1, len(user_pls),
                          message=f"Merged playlist: {upl.get('Title', '?')}")
 
