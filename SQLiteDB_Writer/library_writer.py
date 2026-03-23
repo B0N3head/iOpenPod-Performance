@@ -7,37 +7,16 @@ Schema matches real iTunes-written databases on iPod Nano 6G.
 Reference: libgpod itdb_sqlite.c mk_Library()
 """
 
-import sqlite3
 import time
 import logging
 from typing import Optional
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
-from iTunesDB_Shared.constants import FILETYPE_CODES
+from iTunesDB_Shared.field_base import strip_article
 from iTunesDB_Writer.mhyp_writer import PlaylistInfo
+from ._helpers import s64 as _s64, unix_to_coredata as _unix_to_coredata, open_db
 
 logger = logging.getLogger(__name__)
-
-# ── Timestamp helpers ──────────────────────────────────────────────────
-# SQLite databases use Core Data timestamps: seconds since 2001-01-01 UTC
-# (the Cocoa/Core Foundation reference date).
-CORE_DATA_EPOCH = 978307200  # Unix timestamp of 2001-01-01 00:00:00 UTC
-
-
-def _unix_to_coredata(unix_ts: int, tz_offset: int = 0) -> int:
-    """Convert Unix timestamp to Core Data timestamp.
-
-    Args:
-        unix_ts: Unix timestamp (seconds since 1970-01-01)
-        tz_offset: Timezone offset in seconds (positive = east of UTC)
-
-    Returns:
-        Core Data timestamp (seconds since 2001-01-01) adjusted for timezone.
-        Returns 0 if input is 0.
-    """
-    if unix_ts == 0:
-        return 0
-    return unix_ts - CORE_DATA_EPOCH - tz_offset
 
 
 # ── Audio format codes ─────────────────────────────────────────────────
@@ -59,12 +38,6 @@ _FILETYPE_TO_AUDIO_FORMAT = {
     'aif': AUDIO_FORMAT_AIFF,
     'aiff': AUDIO_FORMAT_AIFF,
 }
-
-# ── Extension (file type) codes ────────────────────────────────────────
-# Stored as big-endian 4-byte ASCII, same as iTunesDB filetype codes.
-# These are the same values as FILETYPE_CODES from mhit_writer.
-_EXTENSION_CODES = FILETYPE_CODES
-
 
 # ── Media kind flags ───────────────────────────────────────────────────
 # item.media_kind in the SQLite database. These differ from the binary
@@ -95,59 +68,78 @@ def _media_kind(track: TrackInfo) -> int:
     return _ITDB_MEDIATYPE_TO_MEDIA_KIND.get(track.media_type, MEDIA_KIND_SONG)
 
 
-def _is_song(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_SONG else 0
+# All media_kind values that produce an is_* = 1 flag in the item table.
+_MEDIA_KIND_FLAGS = (
+    MEDIA_KIND_SONG, MEDIA_KIND_AUDIOBOOK, MEDIA_KIND_MUSIC_VIDEO,
+    MEDIA_KIND_MOVIE, MEDIA_KIND_TV_SHOW, MEDIA_KIND_RINGTONE, MEDIA_KIND_PODCAST,
+)
 
 
-def _is_audio_book(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_AUDIOBOOK else 0
+def _media_kind_flags(mk: int) -> tuple[int, ...]:
+    """Return (is_song, is_audio_book, is_music_video, is_movie, is_tv_show, is_ringtone, is_podcast)."""
+    return tuple(int(mk == k) for k in _MEDIA_KIND_FLAGS)
 
 
-def _is_music_video(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_MUSIC_VIDEO else 0
+_CONTAINER_INSERT_SQL = """\
+INSERT INTO container (
+    pid, distinguished_kind, date_created, date_modified,
+    name, name_order, parent_pid, media_kinds,
+    workout_template_id, is_hidden,
+    smart_is_folder, smart_is_dynamic, smart_is_filtered,
+    smart_is_genius, smart_enabled_only, smart_is_limited,
+    smart_limit_kind, smart_limit_order, smart_evaluation_order,
+    smart_limit_value, smart_reverse_limit_order,
+    smart_criteria, description
+) VALUES (
+    :pid, :distinguished_kind, :date_created, :date_modified,
+    :name, :name_order, 0, :media_kinds,
+    0, :is_hidden,
+    :smart_is_folder, :smart_is_dynamic, :smart_is_filtered,
+    0, 0, :smart_is_limited,
+    :smart_limit_kind, :smart_limit_order, :smart_evaluation_order,
+    :smart_limit_value, :smart_reverse_limit_order,
+    :smart_criteria, NULL
+)"""
 
 
-def _is_movie(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_MOVIE else 0
-
-
-def _is_tv_show(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_TV_SHOW else 0
-
-
-def _is_podcast(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_PODCAST else 0
-
-
-def _is_ringtone(track: TrackInfo) -> int:
-    return 1 if _media_kind(track) == MEDIA_KIND_RINGTONE else 0
-
-
-def _strip_article(name: str) -> str:
-    """Strip leading articles (A, An, The) for sort field generation.
-
-    iTunes auto-generates sort_title/sort_album/etc. by stripping common
-    English leading articles.  We replicate this behaviour so that iPod
-    browsing order matches what iTunes would produce.
-    """
-    if not name:
-        return name
-    lower = name.lower()
-    for article in ('the ', 'a ', 'an '):
-        if lower.startswith(article):
-            return name[len(article):]
-    return name
-
-
-def _s64(val: int) -> int:
-    """Convert unsigned 64-bit int to signed for SQLite INTEGER storage.
-
-    SQLite INTEGER is signed 64-bit (max 2^63-1).  iPod db_ids and PIDs
-    are unsigned 64-bit values that may exceed this limit.
-    """
-    if val >= (1 << 63):
-        return val - (1 << 64)
-    return val
+def _insert_container(
+    cur, *, pid: int, name: str, name_order: int,
+    date_created: int, date_modified: int,
+    distinguished_kind: int = 0,
+    media_kinds: int = 1,
+    is_hidden: int = 0,
+    smart_is_folder: int = 0,
+    smart_is_dynamic=None,
+    smart_is_filtered=None,
+    smart_is_limited=None,
+    smart_limit_kind=None,
+    smart_limit_order=None,
+    smart_evaluation_order=None,
+    smart_limit_value=None,
+    smart_reverse_limit_order=None,
+    smart_criteria=None,
+) -> None:
+    """Insert a single row into the container table."""
+    cur.execute(_CONTAINER_INSERT_SQL, {
+        'pid': _s64(pid),
+        'distinguished_kind': distinguished_kind,
+        'date_created': date_created,
+        'date_modified': date_modified,
+        'name': name,
+        'name_order': name_order,
+        'media_kinds': media_kinds,
+        'is_hidden': is_hidden,
+        'smart_is_folder': smart_is_folder,
+        'smart_is_dynamic': smart_is_dynamic,
+        'smart_is_filtered': smart_is_filtered,
+        'smart_is_limited': smart_is_limited,
+        'smart_limit_kind': smart_limit_kind,
+        'smart_limit_order': smart_limit_order,
+        'smart_evaluation_order': smart_evaluation_order,
+        'smart_limit_value': smart_limit_value,
+        'smart_reverse_limit_order': smart_reverse_limit_order,
+        'smart_criteria': smart_criteria,
+    })
 
 
 # ── Schema DDL ─────────────────────────────────────────────────────────
@@ -521,7 +513,7 @@ def _sort_key(name: Optional[str]) -> str:
     """
     if not name:
         return ""
-    return _strip_article(name).lower()
+    return strip_article(name).lower()
 
 
 def _compute_sort_orders(tracks: list[TrackInfo]) -> dict:
@@ -576,7 +568,7 @@ def write_library_itdb(
     master_playlist_name: str = "iPod",
     db_pid: int = 0,
     tz_offset: int = 0,
-) -> None:
+) -> list[int]:
     """Write Library.itdb SQLite database.
 
     Args:
@@ -587,16 +579,11 @@ def write_library_itdb(
         master_playlist_name: Name for the master playlist.
         db_pid: Database persistent ID (from mhbd db_id).
         tz_offset: Timezone offset in seconds (positive = east of UTC).
-    """
-    import os
-    if os.path.exists(path):
-        os.remove(path)
 
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute("PRAGMA encoding='UTF-8'")
-    cur = conn.cursor()
+    Returns:
+        List of playlist PIDs in order: [master_pid, *playlist_pids, *smart_playlist_pids].
+    """
+    conn, cur = open_db(path, extra_pragmas=["encoding='UTF-8'"])
 
     # Create schema
     cur.executescript(_LIBRARY_SCHEMA)
@@ -759,7 +746,7 @@ def write_library_itdb(
     # Compute album sort orders: name_order = rank by sort_name, sort_order = same
     album_sort_names: dict[tuple[str, str], str] = {}
     for key in album_map:
-        album_sort_names[key] = _strip_article(key[0]) if key[0] else key[0]
+        album_sort_names[key] = strip_article(key[0]) if key[0] else key[0]
     album_sorted = sorted(album_map.keys(),
                           key=lambda k: _sort_key(k[0]))
     album_name_orders: dict[tuple[str, str], int] = {
@@ -802,7 +789,7 @@ def write_library_itdb(
     for artist_name, a_pid in artist_map.items():
         is_unknown = 1 if not artist_name else 0
         a_name_order = artist_name_orders.get(artist_name, 0)
-        a_sort_name = _strip_article(artist_name) if artist_name else None
+        a_sort_name = strip_article(artist_name) if artist_name else None
         cur.execute(
             "INSERT INTO artist (pid, kind, artwork_status, artwork_album_pid, "
             "name, name_order, sort_name, is_unknown, has_songs, has_music_videos) "
@@ -819,7 +806,7 @@ def write_library_itdb(
     for ta_name, ta_pid in track_artist_map.items():
         is_unknown = 1 if not ta_name else 0
         ta_name_order = ta_name_orders.get(ta_name, 0)
-        ta_sort_name = _strip_article(ta_name) if ta_name else None
+        ta_sort_name = strip_article(ta_name) if ta_name else None
         cur.execute(
             "INSERT INTO track_artist (pid, name, name_order, sort_name, "
             "has_songs, has_music_videos, has_non_compilation_tracks, "
@@ -837,7 +824,7 @@ def write_library_itdb(
     for comp_name, comp_pid in composer_map.items():
         is_unknown = 1 if not comp_name else 0
         c_name_order = comp_name_orders.get(comp_name, 0)
-        c_sort_name = _strip_article(comp_name) if comp_name else None
+        c_sort_name = strip_article(comp_name) if comp_name else None
         cur.execute(
             "INSERT INTO composer (pid, name, name_order, sort_name, "
             "is_unknown, has_music) "
@@ -893,13 +880,13 @@ def write_library_itdb(
         has_lyrics = 1 if (track.has_lyrics or track.lyrics) else 0
 
         # Sort fields: fall back to article-stripped name (matches iTunes/libgpod)
-        sort_title = track.sort_name or _strip_article(track.title) if track.title else None
-        sort_artist = track.sort_artist or _strip_article(track.artist) if track.artist else None
-        sort_album = track.sort_album or _strip_article(track.album) if track.album else None
-        sort_aa = (track.sort_album_artist or _strip_article(track.album_artist)
+        sort_title = track.sort_name or strip_article(track.title) if track.title else None
+        sort_artist = track.sort_artist or strip_article(track.artist) if track.artist else None
+        sort_album = track.sort_album or strip_article(track.album) if track.album else None
+        sort_aa = (track.sort_album_artist or strip_article(track.album_artist)
                    if track.album_artist else
-                   (track.sort_artist or _strip_article(track.artist) if track.artist else None))
-        sort_composer = track.sort_composer or _strip_article(track.composer) if track.composer else None
+                   (track.sort_artist or strip_article(track.artist) if track.artist else None))
+        sort_composer = track.sort_composer or strip_article(track.composer) if track.composer else None
 
         # Order ranks from pre-computed sort orders
         title_order = _lookup_order(orders, 'title', track.sort_name or track.title)
@@ -975,9 +962,7 @@ def write_library_itdb(
             )""",
             (
                 _s64(track.db_id), media_kind,
-                _is_song(track), _is_audio_book(track), _is_music_video(track), _is_movie(track),
-                _is_tv_show(track), _is_ringtone(track),
-                _is_podcast(track),
+                *_media_kind_flags(media_kind),
                 date_mod, track.year,
                 track.explicit_flag,
                 1 if track.compilation else 0, 1 if track.checked else 0,
@@ -1036,7 +1021,7 @@ def write_library_itdb(
         )
 
         # ── podcast_info (podcast tracks only) ────────────────────────
-        if _is_podcast(track):
+        if media_kind == MEDIA_KIND_PODCAST:
             cur.execute(
                 """INSERT INTO podcast_info (
                     item_pid, date_released, external_guid,
@@ -1062,21 +1047,10 @@ def write_library_itdb(
     # Master playlist: distinguished_kind=0, is_hidden=1 (SQLite schema), smart fields=NULL
     # (matches iTunes reference — NOT distinguished_kind=2)
     container_pos = 0
-    cur.execute(
-        """INSERT INTO container (
-            pid, distinguished_kind, date_created, date_modified,
-            name, name_order, parent_pid, media_kinds,
-            workout_template_id, is_hidden,
-            smart_is_folder, smart_is_dynamic, smart_is_filtered,
-            smart_is_genius, smart_enabled_only, smart_is_limited,
-            smart_limit_kind, smart_limit_order, smart_evaluation_order,
-            smart_limit_value, smart_reverse_limit_order,
-            smart_criteria, description
-        ) VALUES (?, 0, ?, ?, ?, ?, 0, 1, 0, 1,
-                  0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                  NULL, NULL, NULL, NULL)""",
-        (_s64(master_pid), now_cd, now_cd, master_playlist_name,
-         (container_pos + 1) * 100)
+    _insert_container(
+        cur, pid=master_pid, name=master_playlist_name,
+        name_order=(container_pos + 1) * 100,
+        date_created=now_cd, date_modified=now_cd, is_hidden=1,
     )
     container_pos += 1
 
@@ -1089,26 +1063,17 @@ def write_library_itdb(
         )
 
     # User playlists
+    all_playlist_pids: list[int] = [master_pid]
     playlist_pid_counter = master_pid + 1
     for pl in (playlists or []):
         pl_pid = playlist_pid_counter
         playlist_pid_counter += 1
+        all_playlist_pids.append(pl_pid)
 
-        cur.execute(
-            """INSERT INTO container (
-                pid, distinguished_kind, date_created, date_modified,
-                name, name_order, parent_pid, media_kinds,
-                workout_template_id, is_hidden,
-                smart_is_folder, smart_is_dynamic, smart_is_filtered,
-                smart_is_genius, smart_enabled_only, smart_is_limited,
-                smart_limit_kind, smart_limit_order, smart_evaluation_order,
-                smart_limit_value, smart_reverse_limit_order,
-                smart_criteria, description
-            ) VALUES (?, 0, ?, ?, ?, ?, 0, 1, 0, 0,
-                      0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                      NULL, NULL, NULL, NULL)""",
-            (_s64(pl_pid), now_cd, now_cd, pl.name,
-             (container_pos + 1) * 100)
+        _insert_container(
+            cur, pid=pl_pid, name=pl.name,
+            name_order=(container_pos + 1) * 100,
+            date_created=now_cd, date_modified=now_cd,
         )
         container_pos += 1
 
@@ -1124,6 +1089,7 @@ def write_library_itdb(
     for spl in (smart_playlists or []):
         spl_pid = playlist_pid_counter
         playlist_pid_counter += 1
+        all_playlist_pids.append(spl_pid)
 
         # Determine smart playlist SQLite fields from SmartPlaylistPrefs
         spl_is_limited = 0
@@ -1166,25 +1132,20 @@ def write_library_itdb(
         #     master=True → is_hidden=1.  This matches Apple's reference
         #     SQLite databases where system categories are hidden.
         #   - For regular user smart playlists, master=False → is_hidden=0.
-        cur.execute(
-            """INSERT INTO container (
-                pid, distinguished_kind, date_created, date_modified,
-                name, name_order, parent_pid, media_kinds,
-                workout_template_id, is_hidden,
-                smart_is_folder, smart_is_dynamic, smart_is_filtered,
-                smart_is_genius, smart_enabled_only, smart_is_limited,
-                smart_limit_kind, smart_limit_order, smart_evaluation_order,
-                smart_limit_value, smart_reverse_limit_order,
-                smart_criteria, description
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?,
-                      0, 1, 1, 0, 0, ?, ?, ?, ?, ?, ?,
-                      ?, NULL)""",
-            (_s64(spl_pid), dk, now_cd, now_cd, spl.name,
-             (container_pos + 1) * 100, spl_media_kinds,
-             1 if spl.master else 0,
-             spl_is_limited, spl_limit_kind, spl_limit_order,
-             spl_eval_order, spl_limit_value, spl_reverse,
-             spl_criteria)
+        _insert_container(
+            cur, pid=spl_pid, name=spl.name,
+            name_order=(container_pos + 1) * 100,
+            date_created=now_cd, date_modified=now_cd,
+            distinguished_kind=dk, media_kinds=spl_media_kinds,
+            is_hidden=1 if spl.master else 0,
+            smart_is_dynamic=1, smart_is_filtered=1,
+            smart_is_limited=spl_is_limited,
+            smart_limit_kind=spl_limit_kind,
+            smart_limit_order=spl_limit_order,
+            smart_evaluation_order=spl_eval_order,
+            smart_limit_value=spl_limit_value,
+            smart_reverse_limit_order=spl_reverse,
+            smart_criteria=spl_criteria,
         )
         container_pos += 1
 
@@ -1208,3 +1169,5 @@ def write_library_itdb(
                 len(tracks), len(album_map), len(artist_map),
                 len(composer_map), len(genre_map),
                 1 + len(playlists or []) + len(smart_playlists or []))
+
+    return all_playlist_pids

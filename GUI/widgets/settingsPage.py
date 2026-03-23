@@ -835,13 +835,20 @@ class SettingsPage(QWidget):
             current="Off",
         )
 
+        self.font_scale = ComboRow(
+            "Font Size",
+            "Scale text size across the interface for accessibility.",
+            options=["75%", "90%", "100%", "110%", "125%", "150%"],
+            current="100%",
+        )
+
         self.show_art = ToggleRow(
             "Track List Artwork",
             "Show album art thumbnails next to tracks in the list view.",
             checked=True,
         )
 
-        from ..settings import get_version
+        from settings import get_version
         self.version_row = ActionRow(
             f"iOpenPod v{get_version()}",
             "Check for a newer version of iOpenPod.",
@@ -863,7 +870,7 @@ class SettingsPage(QWidget):
         return self._make_page(
             "General",
             "Appearance",
-            _SettingsCard(self.theme_combo, self.high_contrast, self.show_art),
+            _SettingsCard(self.theme_combo, self.high_contrast, self.font_scale, self.show_art),
             "About",
             _SettingsCard(self.version_row, self.bug_report_row),
         )
@@ -1129,7 +1136,7 @@ class SettingsPage(QWidget):
 
     def load_from_settings(self):
         """Populate UI controls from the current AppSettings."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         self.music_folder.value = s.music_folder
@@ -1174,6 +1181,11 @@ class SettingsPage(QWidget):
         idx = self.high_contrast.combo.findText(hc_text)
         if idx >= 0:
             self.high_contrast.combo.setCurrentIndex(idx)
+
+        # Font scale
+        idx = self.font_scale.combo.findText(s.font_scale)
+        if idx >= 0:
+            self.font_scale.combo.setCurrentIndex(idx)
 
         self.transcode_cache_dir.value = s.transcode_cache_dir
         # Max cache size combo
@@ -1257,6 +1269,7 @@ class SettingsPage(QWidget):
             self.show_art.changed.connect(self._save)
             self.theme_combo.changed.connect(self._save)
             self.high_contrast.changed.connect(self._save)
+            self.font_scale.changed.connect(self._save)
             self.transcode_cache_dir.changed.connect(self._save)
             self.max_cache_size.changed.connect(self._save)
             self.settings_dir.changed.connect(self._save)
@@ -1270,7 +1283,7 @@ class SettingsPage(QWidget):
 
     def _save(self, *_args):
         """Read all controls back into AppSettings and persist."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         s.music_folder = self.music_folder.value
@@ -1362,11 +1375,20 @@ class SettingsPage(QWidget):
         sw_text = self.sync_workers.value
         s.sync_workers = int(sw_text) if sw_text and sw_text != "Auto" else 0
 
+        # Font scale
+        scale_keys = {
+            "75%": "75%", "90%": "90%", "100%": "100%",
+            "110%": "110%", "125%": "125%", "150%": "150%",
+        }
+        old_scale = s.font_scale
+        s.font_scale = scale_keys.get(self.font_scale.value, "100%")
+
         s.save()
 
-        # If theme or contrast changed, apply immediately and notify
-        if s.theme != old_theme or s.high_contrast != old_hc:
+        # If theme, contrast, or font scale changed, apply immediately and notify
+        if s.theme != old_theme or s.high_contrast != old_hc or s.font_scale != old_scale:
             Colors.apply_theme(s.theme, s.high_contrast)
+            Metrics.apply_font_scale(s.font_scale)
             self.theme_changed.emit()
 
     # ── Event handlers ──────────────────────────────────────────────────────
@@ -1613,7 +1635,7 @@ class SettingsPage(QWidget):
 
     def _on_listenbrainz_token_changed(self, token: str):
         """Handle ListenBrainz token save/clear."""
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
 
         if not token:
@@ -1653,7 +1675,7 @@ class SettingsPage(QWidget):
             self.listenbrainz_token_row.set_error("Invalid token")
             return
 
-        from ..settings import get_settings
+        from settings import get_settings
         s = get_settings()
         s.listenbrainz_token = token
         s.listenbrainz_username = username

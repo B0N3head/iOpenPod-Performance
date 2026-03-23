@@ -65,6 +65,7 @@ import os
 import shutil
 import time
 import logging
+import zlib
 from typing import List, Optional
 
 from .mhlt_writer import write_mhlt
@@ -76,8 +77,9 @@ from .mhsd_writer import (
 from .mhlp_writer import write_mhlp_with_playlists, write_mhlp_smart
 from .mhla_writer import write_mhla
 from .mhli_writer import write_mhli
+from dataclasses import replace as _dc_replace
 from .mhit_writer import TrackInfo
-from .mhyp_writer import PlaylistInfo
+from .mhyp_writer import PlaylistInfo, generate_playlist_id
 from ipod_models import ChecksumType, DeviceCapabilities
 from device_info import detect_checksum_type
 from .hash58 import write_hash58
@@ -98,6 +100,24 @@ logger = logging.getLogger(__name__)
 # For older devices, callers should pass `db_version` from
 # ``ipod_models.DeviceCapabilities.db_version``.
 DATABASE_VERSION_DEFAULT = 0x4F
+
+
+def _maybe_decompress_cdb(itdb_data: bytes) -> bytes:
+    """Decompress an iTunesCDB payload if the compressed indicator is set.
+
+    Returns the full (header + decompressed children) bytes if the data
+    is a compressed iTunesCDB, or the original bytes unchanged otherwise.
+    """
+    hdr_len = struct.unpack('<I', itdb_data[4:8])[0]
+    if (len(itdb_data) > hdr_len + 2
+            and struct.unpack('<H', itdb_data[0xA8:0xAA])[0] == 1
+            and itdb_data[hdr_len] == 0x78):
+        try:
+            decompressed = zlib.decompress(itdb_data[hdr_len:])
+            return itdb_data[:hdr_len] + decompressed
+        except zlib.error:
+            pass
+    return itdb_data
 
 
 def extract_db_info(itdb_path: str) -> dict:
@@ -150,16 +170,7 @@ def extract_preserved_mhsd_blobs(itdb_data: bytes) -> list[bytes]:
 
     # Decompress iTunesCDB payload if needed — the MHSD children are in
     # the zlib-compressed payload, so we can't walk them without this.
-    if (len(itdb_data) > header_length + 2
-            and struct.unpack('<H', itdb_data[0xA8:0xAA])[0] == 1
-            and itdb_data[header_length] == 0x78):
-        try:
-            import zlib as _zlib
-            decompressed = _zlib.decompress(itdb_data[header_length:])
-            itdb_data = itdb_data[:header_length] + decompressed
-            logger.debug("extract_preserved_mhsd_blobs: decompressed CDB payload")
-        except Exception:
-            pass  # Fall through — loop will find no mhsd magic and return []
+    itdb_data = _maybe_decompress_cdb(itdb_data)
 
     children_count = struct.unpack('<I', itdb_data[0x14:0x18])[0]
 
@@ -310,10 +321,8 @@ def write_mhbd(
     # write_mhlt.  We build new PlaylistInfo copies with remapped IDs instead
     # of mutating the caller's objects — if write_mhbd() were retried (e.g.
     # after an I/O error) the original db_id-based track_ids must still be intact.
-    from dataclasses import replace as _dc_replace
-
     def _remap_playlist(pl: PlaylistInfo) -> PlaylistInfo:
-        """Return a copy of pl with thee db_ids translated to track IDs."""
+        """Return a copy of pl with the db_ids translated to track IDs."""
         new_ids: list[int] = []
         new_meta: list | None = [] if pl.item_metadata is not None else None
 
@@ -335,7 +344,6 @@ def write_mhbd(
     # Generate a single master playlist_id shared by DS2 and DS3 so that
     # the GUI dedup logic (by playlist_id) correctly collapses the two
     # copies of the master playlist into one.
-    from .mhyp_writer import generate_playlist_id
     master_playlist_id = generate_playlist_id()
 
     remapped_playlists_type2 = [_remap_playlist(pl) for pl in (playlists_type2 or [])]
@@ -687,24 +695,10 @@ def write_itunesdb(
     reference_info = None
     source_itdb = reference_itdb or existing_itdb
     if source_itdb and source_itdb[:4] == b'mhbd' and len(source_itdb) >= 244:
-        # Decompress iTunesCDB payload if needed — the MHBD header is always
-        # uncompressed, but MHSD children (needed for type extraction) are
-        # in the zlib-compressed payload.
-        source_itdb_full = source_itdb  # uncompressed view for MHSD parsing
+        # Decompress iTunesCDB payload if needed — the MHSD children
+        # (needed for type extraction) are in the zlib-compressed payload.
+        source_itdb_full = _maybe_decompress_cdb(source_itdb)
         hdr_len_ref = struct.unpack('<I', source_itdb[4:8])[0]
-        # Check if unk_0xA8 == 1 (compressed indicator) and payload starts with
-        # zlib header (0x78) — if so, decompress for structural inspection.
-        if (len(source_itdb) > hdr_len_ref + 2
-                and struct.unpack('<H', source_itdb[0xA8:0xAA])[0] == 1
-                and source_itdb[hdr_len_ref] == 0x78):
-            try:
-                import zlib as _zlib
-                decompressed = _zlib.decompress(source_itdb[hdr_len_ref:])
-                source_itdb_full = source_itdb[:hdr_len_ref] + decompressed
-                logger.debug("Decompressed reference iTunesCDB for structural inspection: "
-                             "%d → %d bytes", len(source_itdb), len(source_itdb_full))
-            except Exception as e:
-                logger.debug("Could not decompress reference CDB: %s", e)
 
         try:
             # Use read_fields() for MHBD header extraction (field_defs names)
@@ -734,21 +728,21 @@ def write_itunesdb(
             reference_info['mhsd_order'] = ref_mhsd_order
 
             # Extract reference MHIT header size for matching
-            _off = ref_hdr_len
-            for _j in range(ref_cc):
-                if _off + 16 > len(source_itdb_full):
+            mhsd_off = ref_hdr_len
+            for _ in range(ref_cc):
+                if mhsd_off + 16 > len(source_itdb_full):
                     break
-                _stotal = struct.unpack('<I', source_itdb_full[_off + 8:_off + 12])[0]
-                _dtype = struct.unpack('<I', source_itdb_full[_off + 12:_off + 16])[0]
-                if _dtype == 1:  # tracks dataset
-                    _mhlt_off = _off + struct.unpack('<I', source_itdb_full[_off + 4:_off + 8])[0]
-                    _mhlt_hdr = struct.unpack('<I', source_itdb_full[_mhlt_off + 4:_mhlt_off + 8])[0]
-                    _tc = struct.unpack('<I', source_itdb_full[_mhlt_off + 8:_mhlt_off + 12])[0]
-                    if _tc > 0:
-                        _mhit_off = _mhlt_off + _mhlt_hdr
-                        reference_info['mhit_header_size'] = struct.unpack('<I', source_itdb_full[_mhit_off + 4:_mhit_off + 8])[0]
+                mhsd_total = struct.unpack('<I', source_itdb_full[mhsd_off + 8:mhsd_off + 12])[0]
+                mhsd_type = struct.unpack('<I', source_itdb_full[mhsd_off + 12:mhsd_off + 16])[0]
+                if mhsd_type == 1:  # tracks dataset
+                    mhlt_off = mhsd_off + struct.unpack('<I', source_itdb_full[mhsd_off + 4:mhsd_off + 8])[0]
+                    mhlt_hdr_len = struct.unpack('<I', source_itdb_full[mhlt_off + 4:mhlt_off + 8])[0]
+                    track_count = struct.unpack('<I', source_itdb_full[mhlt_off + 8:mhlt_off + 12])[0]
+                    if track_count > 0:
+                        mhit_off = mhlt_off + mhlt_hdr_len
+                        reference_info['mhit_header_size'] = struct.unpack('<I', source_itdb_full[mhit_off + 4:mhit_off + 8])[0]
                     break
-                _off += _stotal
+                mhsd_off += mhsd_total
 
             logger.debug("Using reference database fields: db_id_2=%016X, lib_pid=%016X, "
                          "version=0x%X, mhsd_types=%s, mhit_hdr=%s",
@@ -882,7 +876,6 @@ def write_itunesdb(
     #   patched to the compressed file size.  unk_0xA8 is set to 1.
     uncompressed_size = len(itdb_data)
     if db_filename == "iTunesCDB":
-        import zlib
         hdr_len = struct.unpack_from('<I', itdb_data, 4)[0]
         payload = bytes(itdb_data[hdr_len:])
         compressed = zlib.compress(payload, 1)  # Z_BEST_SPEED — matches libgpod/iTunes
@@ -899,6 +892,7 @@ def write_itunesdb(
     # Detect checksum type (or use forced type)
     # Use reference or existing database as the source for hash extraction
     source_itdb = reference_itdb or existing_itdb
+    hash_error: str | None = None  # set on fatal hash failure
 
     if force_checksum is not None:
         checksum_type = force_checksum
@@ -1001,7 +995,6 @@ def write_itunesdb(
         struct.pack_into('<H', itdb_data, MHBD_OFFSET_HASHING_SCHEME, 2)
 
         # Write HASH72 signature
-        hash72_ok = False
         if hash_info is None:
             # Try to extract from reference database
             source_itdb = reference_itdb or existing_itdb
@@ -1015,7 +1008,6 @@ def write_itunesdb(
                     signature = _hash_generate(sha1, hash_dict['iv'], hash_dict['rndpart'])
                     itdb_data[0x72:0x72 + 46] = signature
                     logger.info("HASH72 signature written successfully")
-                    hash72_ok = True
                 else:
                     logger.warning("Could not extract hash info from reference database")
             else:
@@ -1025,7 +1017,6 @@ def write_itunesdb(
             signature = _hash_generate(sha1, hash_info.iv, hash_info.rndpart)
             itdb_data[0x72:0x72 + 46] = signature
             logger.info("HASH72 signature written from HashInfo file")
-            hash72_ok = True
 
         # Nano 5G uses HASH72 only — do NOT write hash58.
         # libgpod itdb_hash72_write_hash only computes hash72 (hashing_scheme=2).
@@ -1050,43 +1041,34 @@ def write_itunesdb(
                 logger.info("HASHAB signature computed with FireWire ID: %s",
                             firewire_id.hex())
             except ImportError as e:
-                logger.error("HASHAB dependency missing: %s", e)
-                if pending_artwork:
-                    pending_artwork.abort()
-                return False
+                hash_error = f"HASHAB dependency missing: {e}"
             except FileNotFoundError as e:
-                logger.error("HASHAB WASM module missing: %s", e)
-                if pending_artwork:
-                    pending_artwork.abort()
-                return False
+                hash_error = f"HASHAB WASM module missing: {e}"
         else:
-            logger.error(
+            hash_error = (
                 "No FireWire ID available — cannot compute HASHAB. "
                 "Ensure the iPod is connected so the FireWire GUID can be "
                 "read from USB serial number."
             )
-            if pending_artwork:
-                pending_artwork.abort()
-            return False
 
     elif checksum_type == ChecksumType.UNSUPPORTED:
-        logger.error("Device requires an unsupported hashing scheme")
-        if pending_artwork:
-            pending_artwork.abort()
-        return False
+        hash_error = "Device requires an unsupported hashing scheme"
     elif checksum_type == ChecksumType.UNKNOWN:
-        logger.error(
+        hash_error = (
             "Cannot write iTunesDB: device checksum type is UNKNOWN. "
             "The device was not fully identified — the iPod will reject "
             "this database. Please report this as a bug."
         )
-        if pending_artwork:
-            pending_artwork.abort()
-        return False
 
     else:
         # ChecksumType.NONE — pre-2007 devices that need no hash
         struct.pack_into('<H', itdb_data, MHBD_OFFSET_HASHING_SCHEME, 0)
+
+    if hash_error:
+        logger.error(hash_error)
+        if pending_artwork:
+            pending_artwork.abort()
+        return False
 
     # Backup existing file(s)
     if backup:

@@ -42,17 +42,20 @@ from ._parsing import UINT16_LE, UINT32_LE, ParseResult
 
 logger = logging.getLogger(__name__)
 
+# ── Local layout constants ─────────────────────────────────────────
+# Binary offsets not already defined in iTunesDB_Shared.mhod_defs.
+# Each is derived from the layout documented in the per-type docstrings.
 
-# ────────────────────────────────────────────────────────────────────
-# Common MHOD header (24 bytes at +0x00..+0x18)
-# ────────────────────────────────────────────────────────────────────
+# MHOD52 (sorted index): sort_type(4) + count(4) + padding(40) = 48
+_MHOD52_INDICES_OFFSET = 48
 
-def _parse_mhod_header(
-    data: bytes | bytearray,
-    offset: int,
-) -> dict[str, Any]:
-    """Parse the common 24-byte MHOD header fields."""
-    return idb.read_fields(data, offset, "mhod")
+# MHOD53 (jump table): sort_type(4) + count(4) + padding(8) = 16
+_MHOD53_ENTRIES_OFFSET = 16
+_MHOD53_ENTRY_SIZE = 12  # letter(2) + pad(2) + start(4) + count(4)
+
+# MHOD100: bodies ≤ 20 bytes are MHIP-context (position);
+# larger bodies are MHYP-context (playlist display preferences).
+_MHOD100_MHIP_MAX_BODY = 20
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -66,7 +69,7 @@ def parse_mhod(
     chunk_length: int,
 ) -> ParseResult:
     """Parse a complete MHOD chunk, dispatching by type to the appropriate decoder."""
-    mhod: dict[str, Any] = _parse_mhod_header(data, offset)
+    mhod: dict[str, Any] = idb.read_fields(data, offset, "mhod")
     mhod_type: int = mhod["mhod_type"]
 
     if mhod_type in idb.mhod_defs.NON_STRING_MHOD_TYPES:
@@ -182,7 +185,8 @@ def _parse_mhod50(
         +0x0D  reverseSort    (u8)  — optional
     """
     if body_length < 12:
-        return {"error": "SPLPref too short"}
+        logger.warning("MHOD50 (SPLPref) body too short: %d bytes", body_length)
+        return {}
 
     defs = idb.mhod_defs
     result: dict[str, Any] = {
@@ -217,11 +221,13 @@ def _parse_mhod51(
     integers — the only part of the iTunesDB that does so.
     """
     if body_length < 16:
-        return {"error": "SPLRules too short"}
+        logger.warning("MHOD51 (SPLRules) body too short: %d bytes", body_length)
+        return {}
 
     slst_magic = idb.mhod_defs.mhod_slst_magic(data, body_offset)
     if slst_magic != b'SLst':
-        return {"error": f"Expected SLst magic, got {slst_magic!r}"}
+        logger.warning("MHOD51: expected SLst magic, got %r", slst_magic)
+        return {}
 
     defs = idb.mhod_defs
     rule_count = defs.mhod_slst_rule_count(data, body_offset)
@@ -267,8 +273,7 @@ def _parse_spl_rule(
     data_length = defs.mhod_spl_rule_data_length(data, rule_offset)
     rule["data_length"] = data_length
 
-    # Rule data starts at rule_offset + 0x38 (56 bytes header).
-    data_offset = rule_offset + 0x38
+    data_offset = rule_offset + defs.SPL_RULE_HEADER_SIZE
 
     field_type = defs.spl_get_field_type(field_id)
 
@@ -316,7 +321,8 @@ def _parse_mhod52(
         +0x30  indices    (count x u32 LE) — sorted track positions
     """
     if body_length < 8:
-        return {"error": "MHOD52 too short"}
+        logger.warning("MHOD52 (sorted index) body too short: %d bytes", body_length)
+        return {}
 
     defs = idb.mhod_defs
     count = defs.mhod52_count(data, body_offset)
@@ -325,8 +331,7 @@ def _parse_mhod52(
         "count": count,
     }
 
-    # Indices start at body_offset + 48 (sort_type + count + 40 padding).
-    indices_start = body_offset + 48
+    indices_start = body_offset + _MHOD52_INDICES_OFFSET
     indices: list[int] = []
     for i in range(count):
         pos = indices_start + i * 4
@@ -357,7 +362,8 @@ def _parse_mhod53(
                letter (u16 LE) + pad(2) + start(u32 LE) + count(u32 LE)
     """
     if body_length < 8:
-        return {"error": "MHOD53 too short"}
+        logger.warning("MHOD53 (jump table) body too short: %d bytes", body_length)
+        return {}
 
     defs = idb.mhod_defs
     count = defs.mhod53_count(data, body_offset)
@@ -366,12 +372,11 @@ def _parse_mhod53(
         "count": count,
     }
 
-    # Jump entries start at body_offset + 16.
-    entries_start = body_offset + 16
+    entries_start = body_offset + _MHOD53_ENTRIES_OFFSET
     entries: list[dict[str, int]] = []
     for i in range(count):
-        pos = entries_start + i * 12
-        if pos + 12 <= body_offset + body_length:
+        pos = entries_start + i * _MHOD53_ENTRY_SIZE
+        if pos + _MHOD53_ENTRY_SIZE <= body_offset + body_length:
             letter_code = UINT16_LE.unpack_from(data, pos)[0]
             start = UINT32_LE.unpack_from(data, pos + 4)[0]
             entry_count = UINT32_LE.unpack_from(data, pos + 8)[0]
@@ -401,7 +406,7 @@ def _parse_mhod100(
     """Parse playlist position or preferences from MHOD type 100."""
     result: dict[str, Any] = {}
 
-    if body_length <= 20:
+    if body_length <= _MHOD100_MHIP_MAX_BODY:
         # MHIP context: simple position field.
         if body_length >= 4:
             result["position"] = idb.mhod_defs.mhod100_position(data, body_offset)
@@ -534,7 +539,8 @@ def _parse_chapter_data(
     result: dict[str, Any] = {}
 
     if body_length < defs.CHAPTER_PREAMBLE_SIZE:
-        result["error"] = "Chapter data too short for preamble"
+        logger.warning("MHOD17 (chapter data) too short for preamble: %d bytes", body_length)
+        result["chapters"] = []
         return result
 
     # Read 12-byte preamble (little-endian, like the rest of iTunesDB).

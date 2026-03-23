@@ -6,21 +6,13 @@ and container_ui (playlist UI state like play order, repeat, shuffle).
 Reference: libgpod itdb_sqlite.c mk_Dynamic()
 """
 
-import sqlite3
 import logging
 from typing import Optional
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
-from iTunesDB_Writer.mhyp_writer import PlaylistInfo
+from ._helpers import s64 as _s64, unix_to_coredata, open_db
 
 logger = logging.getLogger(__name__)
-
-
-def _s64(val: int) -> int:
-    """Convert unsigned 64-bit int to signed for SQLite INTEGER storage."""
-    if val >= (1 << 63):
-        return val - (1 << 64)
-    return val
 
 
 _DYNAMIC_SCHEMA = """
@@ -66,16 +58,11 @@ CREATE TABLE IF NOT EXISTS rental_info (
 );
 """
 
-# Core Data epoch offset
-CORE_DATA_EPOCH = 978307200
-
 
 def write_dynamic_itdb(
     path: str,
     tracks: list[TrackInfo],
-    playlists: Optional[list[PlaylistInfo]] = None,
-    smart_playlists: Optional[list[PlaylistInfo]] = None,
-    master_pid: int = 0,
+    playlist_pids: Optional[list[int]] = None,
     tz_offset: int = 0,
 ) -> None:
     """Write Dynamic.itdb SQLite database.
@@ -83,19 +70,12 @@ def write_dynamic_itdb(
     Args:
         path: Output file path.
         tracks: List of TrackInfo objects.
-        playlists: User playlists (for container_ui entries).
-        smart_playlists: Smart playlists.
-        master_pid: PID of the master playlist (for container_ui).
+        playlist_pids: All playlist PIDs (master + user + smart), as returned
+                       by ``write_library_itdb()``.  One ``container_ui`` row
+                       is written per PID.
         tz_offset: Timezone offset in seconds.
     """
-    import os
-    if os.path.exists(path):
-        os.remove(path)
-
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    cur = conn.cursor()
+    conn, cur = open_db(path)
 
     cur.executescript(_DYNAMIC_SCHEMA)
 
@@ -103,14 +83,8 @@ def write_dynamic_itdb(
     for track in tracks:
         has_been_played = 1 if track.play_count > 0 else 0
 
-        # Convert timestamps to Core Data (0 must stay 0)
-        date_played = 0
-        if track.last_played and track.last_played > 0:
-            date_played = track.last_played - CORE_DATA_EPOCH - tz_offset
-
-        date_skipped = 0
-        if track.last_skipped and track.last_skipped > 0:
-            date_skipped = track.last_skipped - CORE_DATA_EPOCH - tz_offset
+        date_played = unix_to_coredata(track.last_played or 0, tz_offset)
+        date_skipped = unix_to_coredata(track.last_skipped or 0, tz_offset)
 
         cur.execute(
             """INSERT INTO item_stats (
@@ -134,37 +108,17 @@ def write_dynamic_itdb(
         )
 
     # ── container_ui ───────────────────────────────────────────────────
-    # One row per playlist
-    if master_pid:
+    # One row per playlist PID (master + user + smart)
+    for pid in (playlist_pids or []):
         cur.execute(
             "INSERT INTO container_ui (container_pid, play_order, is_reversed, "
             "album_field_order, repeat_mode, shuffle_items, has_been_shuffled) "
             "VALUES (?, 0, 0, 1, 0, 0, 0)",
-            (_s64(master_pid),)
+            (_s64(pid),)
         )
-
-    pl_pid = master_pid + 1 if master_pid else 2
-    for pl in (playlists or []):
-        cur.execute(
-            "INSERT INTO container_ui (container_pid, play_order, is_reversed, "
-            "album_field_order, repeat_mode, shuffle_items, has_been_shuffled) "
-            "VALUES (?, 0, 0, 1, 0, 0, 0)",
-            (_s64(pl_pid),)
-        )
-        pl_pid += 1
-
-    for spl in (smart_playlists or []):
-        cur.execute(
-            "INSERT INTO container_ui (container_pid, play_order, is_reversed, "
-            "album_field_order, repeat_mode, shuffle_items, has_been_shuffled) "
-            "VALUES (?, 0, 0, 1, 0, 0, 0)",
-            (_s64(pl_pid),)
-        )
-        pl_pid += 1
 
     conn.commit()
     conn.close()
 
     logger.info("Wrote Dynamic.itdb: %d item_stats, %d container_ui",
-                len(tracks),
-                1 + len(playlists or []) + len(smart_playlists or []))
+                len(tracks), len(playlist_pids or []))

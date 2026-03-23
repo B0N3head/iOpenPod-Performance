@@ -42,7 +42,7 @@ def get_version() -> str:
         return "1.0.30"
 
 
-def _default_data_dir() -> str:
+def default_data_dir() -> str:
     """Base directory for iOpenPod user data (logs, backups).
 
     On Linux, follows XDG Base Directory Specification:
@@ -71,7 +71,7 @@ def _default_data_dir() -> str:
         return os.path.join(base, "iOpenPod")
 
 
-def _default_cache_dir() -> str:
+def default_cache_dir() -> str:
     """Base directory for iOpenPod cache data (transcode cache).
 
     On Linux: $XDG_CACHE_HOME/iOpenPod  (default: ~/.cache/iOpenPod)
@@ -109,7 +109,7 @@ def _default_settings_dir() -> str:
     return os.path.join(base, "iOpenPod")
 
 
-def _get_settings_dir() -> str:
+def get_settings_dir() -> str:
     """
     Resolve the active settings directory.
 
@@ -135,7 +135,7 @@ def _get_settings_dir() -> str:
 
 
 def _get_settings_path() -> str:
-    return os.path.join(_get_settings_dir(), "settings.json")
+    return os.path.join(get_settings_dir(), "settings.json")
 
 
 @dataclass
@@ -147,7 +147,7 @@ class AppSettings:
     # Changing this moves settings storage to the new location.
     settings_dir: str = ""
 
-    # Custom transcode cache directory (empty = platform default via _default_cache_dir).
+    # Custom transcode cache directory (empty = platform default via default_cache_dir).
     transcode_cache_dir: str = ""
 
     # Maximum transcode cache size in gigabytes.  0.0 = unlimited.
@@ -155,11 +155,11 @@ class AppSettings:
     # used entries are evicted first.
     max_cache_size_gb: float = 5.0
 
-    # Custom log directory (empty = platform default via _default_data_dir/logs).
+    # Custom log directory (empty = platform default via default_data_dir/logs).
     # Covers both app logs and crash reports.
     log_dir: str = ""
 
-    # Custom backup directory (empty = platform default via _default_data_dir/backups).
+    # Custom backup directory (empty = platform default via default_data_dir/backups).
     backup_dir: str = ""
 
     # ── Sync ────────────────────────────────────────────────────────────────
@@ -239,6 +239,9 @@ class AppSettings:
     theme: str = "dark"
     # Increased contrast: "off", "on", or "system" (follow OS accessibility).
     high_contrast: str = "off"
+    # Font scale factor: "75%", "90%", "100%", "110%", "125%", "150%".
+    font_scale: str = "100%"
+
     # Remembered window dimensions (not exposed in settings UI).
     window_width: int = 1280
     window_height: int = 720

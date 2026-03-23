@@ -26,6 +26,7 @@ import struct
 import unicodedata
 from typing import TYPE_CHECKING
 
+from iTunesDB_Shared.field_base import strip_article
 from iTunesDB_Shared.mhod_defs import (
     MHOD_HEADER_SIZE,
     MHOD52_BODY_HEADER_SIZE,
@@ -60,15 +61,12 @@ def _sort_key(s: str) -> str:
     """
     Create a case-insensitive sort key for a string.
 
-    Strips leading "The " for sorting (matching iTunes behavior),
+    Strips leading articles (A, An, The) for sorting (matching iTunes behavior),
     normalizes unicode, and lowercases.
     """
     if not s:
         return ""
-    # Strip leading "The " for English sorting (iTunes convention)
-    lower = s.lower()
-    if lower.startswith("the "):
-        s = s[4:]
+    s = strip_article(s)
     # Normalize unicode for consistent comparison
     return unicodedata.normalize('NFKD', s).casefold()
 
@@ -89,7 +87,7 @@ def _jump_table_letter(s: str) -> int:
         if ch.isalnum():
             if ch.isdigit():
                 return ord('0')
-            return ord(ch.upper())
+            return ord(ch.upper()[0])
 
     return ord('0')
 
@@ -110,9 +108,9 @@ def _get_sort_fields(track: "TrackInfo", sort_type: int) -> tuple:
     album = _sort_key(track.sort_album or track.album or "")
     artist = _sort_key(track.sort_artist or track.artist or "")
     genre = _sort_key(track.genre or "")
-    composer = _sort_key(track.sort_composer or getattr(track, 'composer', None) or "")
-    track_nr = getattr(track, 'track_number', 0) or 0
-    cd_nr = getattr(track, 'disc_number', 0) or 0
+    composer = _sort_key(track.sort_composer or track.composer or "")
+    track_nr = track.track_number or 0
+    cd_nr = track.disc_number or 0
 
     if sort_type == SORT_TITLE:
         return (title,)
@@ -125,24 +123,24 @@ def _get_sort_fields(track: "TrackInfo", sort_type: int) -> tuple:
     elif sort_type == SORT_COMPOSER:
         return (composer, album, cd_nr, track_nr, title)
     elif sort_type == SORT_SHOW:
-        show = _sort_key(getattr(track, 'sort_show', None) or getattr(track, 'show_name', None) or "")
-        season = getattr(track, 'season_number', 0) or 0
-        episode = getattr(track, 'episode_number', 0) or 0
+        show = _sort_key(track.sort_show or track.show_name or "")
+        season = track.season_number or 0
+        episode = track.episode_number or 0
         return (show, season, episode, title)
     elif sort_type == SORT_SEASON:
-        season = getattr(track, 'season_number', 0) or 0
-        episode = getattr(track, 'episode_number', 0) or 0
-        show = _sort_key(getattr(track, 'sort_show', None) or getattr(track, 'show_name', None) or "")
+        season = track.season_number or 0
+        episode = track.episode_number or 0
+        show = _sort_key(track.sort_show or track.show_name or "")
         return (season, episode, show, title)
     elif sort_type == SORT_EPISODE:
-        episode = getattr(track, 'episode_number', 0) or 0
-        season = getattr(track, 'season_number', 0) or 0
-        show = _sort_key(getattr(track, 'sort_show', None) or getattr(track, 'show_name', None) or "")
+        episode = track.episode_number or 0
+        season = track.season_number or 0
+        show = _sort_key(track.sort_show or track.show_name or "")
         return (episode, season, show, title)
     elif sort_type == SORT_ALBUM_ARTIST:
         album_artist = _sort_key(
-            getattr(track, 'sort_album_artist', None)
-            or getattr(track, 'album_artist', None)
+            track.sort_album_artist
+            or track.album_artist
             or track.sort_artist or track.artist or ""
         )
         return (album_artist, album, cd_nr, track_nr, title)
@@ -165,19 +163,19 @@ def _get_jump_letter(track: "TrackInfo", sort_type: int) -> int:
     elif sort_type == SORT_GENRE:
         return _jump_table_letter(track.genre or "")
     elif sort_type == SORT_COMPOSER:
-        return _jump_table_letter(track.sort_composer or getattr(track, 'composer', None) or "")
+        return _jump_table_letter(track.sort_composer or track.composer or "")
     elif sort_type == SORT_SHOW:
-        return _jump_table_letter(getattr(track, 'sort_show', None) or getattr(track, 'show_name', None) or "")
+        return _jump_table_letter(track.sort_show or track.show_name or "")
     elif sort_type == SORT_SEASON:
-        n = getattr(track, 'season_number', 0) or 0
+        n = track.season_number or 0
         return _jump_table_letter(str(n)) if n else ord('0')
     elif sort_type == SORT_EPISODE:
-        n = getattr(track, 'episode_number', 0) or 0
+        n = track.episode_number or 0
         return _jump_table_letter(str(n)) if n else ord('0')
     elif sort_type == SORT_ALBUM_ARTIST:
         s = (
-            getattr(track, 'sort_album_artist', None)
-            or getattr(track, 'album_artist', None)
+            track.sort_album_artist
+            or track.album_artist
             or track.sort_artist or track.artist or ""
         )
         return _jump_table_letter(s)

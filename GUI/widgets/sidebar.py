@@ -1,7 +1,7 @@
 from PyQt6.QtCore import pyqtSignal, Qt, QRegularExpression, QSize, QTimer
 from PyQt6.QtWidgets import (
     QFrame, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLabel, QWidget, QProgressBar, QLineEdit, QScrollArea
+    QLabel, QWidget, QProgressBar, QLineEdit
 )
 from PyQt6.QtGui import QFont, QCursor, QFontMetrics, QRegularExpressionValidator
 from .formatters import format_size, format_duration_human as format_duration
@@ -161,19 +161,24 @@ class DeviceInfoCard(QFrame):
         sep = make_separator()
         layout.addWidget(sep)
 
-        # Stats grid
+        # Stats lines (compact inline text, no column overflow)
         stats_widget = QWidget()
         stats_widget.setStyleSheet("background: transparent; border: none;")
-        stats_layout = QHBoxLayout(stats_widget)
-        stats_layout.setContentsMargins(0, (6), 0, (2))
-        stats_layout.setSpacing((8))
+        stats_layout = QVBoxLayout(stats_widget)
+        stats_layout.setContentsMargins(0, (4), 0, (2))
+        stats_layout.setSpacing((2))
 
-        self.items_stat = StatWidget("0", "items")
-        self.size_stat = StatWidget("0 GB", "music")
-        self.duration_stat = StatWidget("0h", "playtime")
-        stats_layout.addWidget(self.items_stat)
-        stats_layout.addWidget(self.size_stat)
-        stats_layout.addWidget(self.duration_stat)
+        self._stats_line1 = QLabel("—")
+        self._stats_line1.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._stats_line1.setStyleSheet(LABEL_PRIMARY())
+        self._stats_line1.setWordWrap(True)
+        stats_layout.addWidget(self._stats_line1)
+
+        self._stats_line2 = QLabel("")
+        self._stats_line2.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._stats_line2.setStyleSheet(LABEL_SECONDARY())
+        self._stats_line2.setWordWrap(True)
+        stats_layout.addWidget(self._stats_line2)
 
         layout.addWidget(stats_widget)
 
@@ -444,18 +449,23 @@ class DeviceInfoCard(QFrame):
     def update_stats(self, tracks: int, albums: int, size_bytes: int, duration_ms: int,
                      videos: int = 0, podcasts: int = 0, audiobooks: int = 0):
         """Update library statistics."""
-        total_items = tracks + videos + podcasts + audiobooks
-        self.items_stat.setValue(f"{total_items:,}")
-        self.size_stat.setValue(format_size(size_bytes))
-        self.duration_stat.setValue(format_duration(duration_ms))
-
-        # Build items description
-        parts = []
+        # Line 1: item counts
+        parts: list[str] = []
         if tracks > 0:
-            parts.append(f"{tracks:,} tracks")
-        if albums > 0:
-            parts.append(f"{albums:,} albums")
-        self.items_stat.desc_label.setText("items")
+            parts.append(f"{tracks:,} songs")
+        if videos > 0:
+            parts.append(f"{videos:,} videos")
+        if podcasts > 0:
+            parts.append(f"{podcasts:,} podcasts")
+        if audiobooks > 0:
+            parts.append(f"{audiobooks:,} audiobooks")
+        self._stats_line1.setText(" · ".join(parts) if parts else "No tracks")
+
+        # Line 2: size and playtime
+        size_str = format_size(size_bytes)
+        dur_str = format_duration(duration_ms)
+        line2_parts = [p for p in (size_str, dur_str) if p]
+        self._stats_line2.setText(" · ".join(line2_parts))
 
     def show_save_indicator(self, state: str) -> None:
         """Show a brief status indicator after a quick metadata write.
@@ -489,9 +499,8 @@ class DeviceInfoCard(QFrame):
         self.name_label.setText("No Device")
         self._fit_name_font("No Device")
         self.model_label.setText("Press Select to choose your iPod")
-        self.items_stat.setValue("—")
-        self.size_stat.setValue("—")
-        self.duration_stat.setValue("—")
+        self._stats_line1.setText("—")
+        self._stats_line2.setText("")
         self.storage_bar.hide()
         self._save_label.hide()
         self._save_hide_timer.stop()

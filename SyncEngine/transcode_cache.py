@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 
 def _resolve_default_cache_dir() -> Path:
     try:
-        from settings import _default_cache_dir
-        return Path(_default_cache_dir())
+        from settings import default_cache_dir
+        return Path(default_cache_dir())
     except Exception:
         return Path.home() / "iOpenPod" / "cache"
 

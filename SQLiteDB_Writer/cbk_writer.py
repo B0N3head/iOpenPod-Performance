@@ -18,6 +18,7 @@ Reference: libgpod itdb_sqlite.c mk_Locations_cbk()
 
 import hashlib
 import logging
+import os
 
 from ipod_models import ChecksumType
 
@@ -128,7 +129,6 @@ def write_locations_cbk(
         # Fallback: extract from existing iTunesCDB on device
         if hash_info is None and ipod_path:
             try:
-                import os
                 from device_info import resolve_itdb_path
                 itdb_path = resolve_itdb_path(ipod_path)
                 if itdb_path:

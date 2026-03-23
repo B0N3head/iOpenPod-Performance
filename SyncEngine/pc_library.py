@@ -12,6 +12,14 @@ Uses mutagen for metadata extraction. Supports:
 - Opus (.opus)
 """
 
+from ._formats import (
+    AUDIO_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    MEDIA_EXTENSIONS,
+    NEEDS_TRANSCODING,
+    VIDEO_ALWAYS_TRANSCODE,
+    VIDEO_PROBE_CONTAINERS,
+)
 import os
 import json
 from pathlib import Path
@@ -382,75 +390,6 @@ def probe_gapless_info(path) -> dict:
         return {}
 
 
-# Supported audio extensions
-AUDIO_EXTENSIONS = {
-    ".mp3",
-    ".m4a",
-    ".m4p",
-    ".aac",
-    ".m4b",
-    ".flac",
-    ".wav",
-    ".aif",
-    ".aiff",
-    ".ogg",
-    ".opus",
-    ".wma",
-}
-
-# Supported video extensions (iPod Video 5G+, Classic, Nano 3G+)
-VIDEO_EXTENSIONS = {
-    ".m4v",
-    ".mp4",
-    ".mov",
-    ".mkv",
-    ".avi",
-}
-
-# All supported media extensions (audio + video)
-MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
-
-# Formats that need transcoding for iPod
-NEEDS_TRANSCODING = {
-    ".flac",
-    ".wav",
-    ".aif",
-    ".aiff",
-    ".ogg",
-    ".opus",
-    ".wma",
-}
-
-# Video formats that always need transcoding (non-iPod containers)
-VIDEO_ALWAYS_TRANSCODE = {
-    ".mov",
-    ".mkv",
-    ".avi",
-}
-
-# Video containers that MIGHT be iPod-native (need ffprobe to confirm)
-# These are only truly native if they contain H.264 Baseline ≤640x480, 8-bit, stereo AAC
-VIDEO_PROBE_CONTAINERS = {
-    ".m4v",
-    ".mp4",
-}
-
-# Formats iPod can play natively
-IPOD_NATIVE = {
-    ".mp3",
-    ".m4a",
-    ".m4p",
-    ".m4b",
-    ".aac",
-}
-
-# Video formats iPod can play natively (only if codec is compatible — use probe)
-IPOD_NATIVE_VIDEO = {
-    ".m4v",
-    ".mp4",
-}
-
-
 @dataclass
 class PCTrack:
     """A media track on the PC (audio, video, podcast, or audiobook)."""
@@ -504,8 +443,14 @@ class PCTrack:
     sample_count: int = 0  # Total decoded sample count
     gapless_data: int = 0  # Opaque iTunes gapless data (leave 0 for new tracks)
 
+    # Gapless track flag (set when the file is part of a gapless album)
+    gapless_track_flag: int = 0
+
     # VBR flag (auto-detected from mutagen bitrate_mode)
     vbr: bool = False
+
+    # Play count (written back from iPod, round-tripped via mapping/sync)
+    play_count: int = 0
 
     # Release date (Unix timestamp, 0 = not set)
     date_released: int = 0

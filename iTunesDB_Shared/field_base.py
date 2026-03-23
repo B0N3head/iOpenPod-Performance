@@ -124,6 +124,35 @@ def decode_soundcheck(raw: int) -> float:
     return -10.0 * math.log10(raw / 1000.0)
 
 
+def filetype_to_string(val: int) -> str:
+    """Convert a u32 filetype code to its ASCII representation.
+
+    e.g. 0x4D503320 → "MP3", 0x4D344120 → "M4A"
+    """
+    if not isinstance(val, int) or val <= 0:
+        return ""
+    try:
+        return val.to_bytes(4, "big").decode("ascii").rstrip("\x00").strip()
+    except (OverflowError, UnicodeDecodeError):
+        return str(val)
+
+
+def strip_article(name: str) -> str:
+    """Strip leading English articles (A, An, The) for sort field generation.
+
+    iTunes auto-generates sort_title/sort_album/etc. by stripping common
+    English leading articles.  Used by both the binary iTunesDB writer
+    (MHOD type 52 jump tables) and the SQLite writer (sort key columns).
+    """
+    if not name:
+        return name
+    lower = name.lower()
+    for article in ('the ', 'a ', 'an '):
+        if lower.startswith(article):
+            return name[len(article):]
+    return name
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  3. FieldDef Dataclass
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -53,11 +53,11 @@ class PlayCountEntry:
     """Delta values for a single track from the Play Counts file."""
 
     play_count: int = 0
-    last_played: int = 0        # Mac timestamp (0 = not played)
+    last_played_mac: int = 0    # Mac epoch timestamp (0 = not played)
     bookmark_time: int = 0
     rating: int = -1            # -1 = no change; 0-100 = new rating
     skip_count: int = 0
-    last_skipped: int = 0       # Mac timestamp (0 = not skipped)
+    last_skipped_mac: int = 0   # Mac epoch timestamp (0 = not skipped)
 
     # Convenience: is there any delta data in this entry?
     @property
@@ -71,16 +71,16 @@ class PlayCountEntry:
     @property
     def last_played_unix(self) -> int:
         """Last-played as Unix timestamp (0 if never played)."""
-        if self.last_played == 0:
+        if self.last_played_mac == 0:
             return 0
-        return self.last_played - MAC_EPOCH_OFFSET
+        return self.last_played_mac - MAC_EPOCH_OFFSET
 
     @property
     def last_skipped_unix(self) -> int:
         """Last-skipped as Unix timestamp (0 if never skipped)."""
-        if self.last_skipped == 0:
+        if self.last_skipped_mac == 0:
             return 0
-        return self.last_skipped - MAC_EPOCH_OFFSET
+        return self.last_skipped_mac - MAC_EPOCH_OFFSET
 
 
 def parse_playcounts(path: str | Path) -> Optional[list[PlayCountEntry]]:
@@ -140,7 +140,7 @@ def parse_playcounts(path: str | Path) -> Optional[list[PlayCountEntry]]:
         entry.play_count = UINT32_LE.unpack_from(data, offset)[0]
 
         if entry_len >= 8:
-            entry.last_played = UINT32_LE.unpack_from(data, offset + 4)[0]
+            entry.last_played_mac = UINT32_LE.unpack_from(data, offset + 4)[0]
 
         if entry_len >= 12:
             entry.bookmark_time = UINT32_LE.unpack_from(data, offset + 8)[0]
@@ -167,7 +167,7 @@ def parse_playcounts(path: str | Path) -> Optional[list[PlayCountEntry]]:
             entry.skip_count = UINT32_LE.unpack_from(data, offset + 20)[0]
 
         if entry_len >= 28:
-            entry.last_skipped = UINT32_LE.unpack_from(data, offset + 24)[0]
+            entry.last_skipped_mac = UINT32_LE.unpack_from(data, offset + 24)[0]
 
         entries.append(entry)
 
@@ -235,16 +235,16 @@ def merge_playcounts(
             track["bookmark_time"] = entry.bookmark_time
 
         # --- Timestamps (use more-recent value) ---
-        # IMPORTANT: track["last_played"] is a Unix timestamp (converted by
-        # _load_data from Mac), but entry.last_played is a raw Mac timestamp.
-        # Use the .last_played_unix / .last_skipped_unix properties to
-        # compare in the same unit and avoid double-conversion downstream.
-        if entry.last_played > 0:
+        # track["last_played"] is a Unix timestamp (converted from Mac
+        # epoch during iTunesDB parsing).  entry.last_played_mac is raw
+        # Mac epoch.  Use the .last_played_unix property to compare in
+        # the same unit and avoid double-conversion downstream.
+        if entry.last_played_mac > 0:
             unix_ts = entry.last_played_unix
             if unix_ts > track.get("last_played", 0):
                 track["last_played"] = unix_ts
 
-        if entry.last_skipped > 0:
+        if entry.last_skipped_mac > 0:
             unix_ts = entry.last_skipped_unix
             if unix_ts > track.get("last_skipped", 0):
                 track["last_skipped"] = unix_ts

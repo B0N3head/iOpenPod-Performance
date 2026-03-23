@@ -12,7 +12,6 @@ The executor takes a SyncPlan (from FingerprintDiffEngine) and:
 The database is always fully rewritten (not patched incrementally).
 """
 
-import base64
 import errno
 import logging
 import os
@@ -32,18 +31,12 @@ from .itunes_prefs import protect_from_itunes
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Shared.constants import (
-    MEDIA_TYPE_AUDIO,
-    MEDIA_TYPE_AUDIOBOOK,
     MEDIA_TYPE_MUSIC_VIDEO,
-    MEDIA_TYPE_PODCAST,
     MEDIA_TYPE_TV_SHOW,
     MEDIA_TYPE_VIDEO,
     MEDIA_TYPE_VIDEO_PODCAST,
 )
-from iTunesDB_Writer.mhyp_writer import PlaylistInfo, PlaylistItemMeta
-from iTunesDB_Writer.mhod_spl_writer import (
-    prefs_from_parsed, rules_from_parsed,
-)
+from iTunesDB_Writer.mhyp_writer import PlaylistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +305,152 @@ class SyncExecutor:
         ctx.result.success = not ctx.result.has_errors
         return ctx.result
 
+    def quick_write_playlists(
+        self,
+        user_playlists: list[dict],
+        progress_callback: Optional[Callable[["SyncProgress"], None]] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> SyncResult:
+        """Rewrite the iPod database with only playlist changes (no file ops).
+
+        Reads the existing database, merges *user_playlists* into the existing
+        playlist lists, rebuilds every track as-is, and writes the DB in one
+        shot.  Much faster than a full sync because no fingerprinting,
+        transcoding, or file copying is involved.
+        """
+        result = SyncResult(success=True)
+
+        def _progress(stage, cur, total, message=""):
+            if progress_callback:
+                progress_callback(SyncProgress(stage, cur, total, message=message))
+
+        _progress("playlist_sync", 0, 3, "Reading iPod database…")
+
+        # 1. Read existing DB
+        existing_db = self._read_existing_database()
+        tracks_data = existing_db["tracks"]
+        playlists_raw = existing_db["playlists"]
+        smart_raw = existing_db["smart_playlists"]
+
+        if not tracks_data:
+            result.success = False
+            result.errors.append(("playlist_sync", "No existing database found on iPod"))
+            return result
+
+        # 2. Convert existing tracks to TrackInfo (unchanged)
+        all_tracks: list[TrackInfo] = []
+        for t in tracks_data:
+            ti = self._track_dict_to_info(t)
+            if ti.db_id:
+                all_tracks.append(ti)
+
+        _progress("playlist_sync", 1, 3, "Merging playlists…")
+
+        # 3. Merge user playlists into existing raw lists
+        for upl in user_playlists:
+            if upl.get("master_flag"):
+                continue
+            pid = upl.get("playlist_id", 0)
+            is_new = upl.get("_isNew", False)
+            if is_new:
+                playlists_raw.append(upl)
+            else:
+                replaced = False
+                for i, epl in enumerate(playlists_raw):
+                    if epl.get("playlist_id") == pid:
+                        playlists_raw[i] = upl
+                        replaced = True
+                        break
+                if not replaced:
+                    for i, epl in enumerate(smart_raw):
+                        if epl.get("playlist_id") == pid:
+                            smart_raw[i] = upl
+                            replaced = True
+                            break
+                if not replaced:
+                    playlists_raw.append(upl)
+
+        # 4. Build PlaylistInfo objects
+        from ._playlist_builder import build_and_evaluate_playlists
+        master_name, playlists, smart_playlists = build_and_evaluate_playlists(
+            tracks_data, playlists_raw, smart_raw, all_tracks, user_playlists,
+        )
+
+        _progress("playlist_sync", 2, 3, "Writing database…")
+
+        # 5. Write DB (no artwork pc_file_paths needed — tracks unchanged)
+        db_ok = self._write_database(
+            all_tracks,
+            playlists=playlists,
+            smart_playlists=smart_playlists,
+            master_playlist_name=master_name,
+        )
+
+        if not db_ok:
+            result.success = False
+            result.errors.append(("playlist_sync", "Database write failed"))
+            return result
+
+        # 6. iTunes protection + cleanup
+        try:
+            self._apply_itunes_protections_from_tracks(all_tracks)
+        except Exception as e:
+            logger.warning("iTunesPrefs protection failed (non-fatal): %s", e)
+
+        if on_complete:
+            try:
+                on_complete()
+            except Exception:
+                pass
+
+        _progress("playlist_sync", 3, 3, "Playlists synced")
+        result.success = True
+        return result
+
+    def _apply_itunes_protections_from_tracks(self, all_tracks: list[TrackInfo]) -> None:
+        """Lightweight iTunesPrefs update from a track list (no _SyncContext)."""
+        from .itunes_prefs import protect_from_itunes
+
+        _MEDIA_BUCKETS = [
+            (0x04, "podcast"), (0x08, "audiobook"), (0x40, "tv"),
+            (0x20, "mv"), (0x02, "video"),
+        ]
+        totals: dict[str, list[int]] = {
+            k: [0, 0, 0] for k in ("music", "video", "podcast", "audiobook", "tv", "mv")
+        }
+        for t in all_tracks:
+            mt = t.media_type
+            bucket = "music"
+            for mask, label in _MEDIA_BUCKETS:
+                if mt & mask:
+                    bucket = label
+                    break
+            totals[bucket][0] += t.size
+            totals[bucket][1] += t.length // 1000
+            totals[bucket][2] += 1
+
+        protect_from_itunes(
+            self.ipod_path,
+            track_count=totals["music"][2],
+            total_music_bytes=totals["music"][0],
+            total_music_seconds=totals["music"][1],
+            video_tracks=totals["video"][2],
+            video_bytes=totals["video"][0],
+            video_seconds=totals["video"][1],
+            podcast_tracks=totals["podcast"][2],
+            podcast_bytes=totals["podcast"][0],
+            podcast_seconds=totals["podcast"][1],
+            audiobook_tracks=totals["audiobook"][2],
+            audiobook_bytes=totals["audiobook"][0],
+            audiobook_seconds=totals["audiobook"][1],
+            tv_show_tracks=totals["tv"][2],
+            tv_show_bytes=totals["tv"][0],
+            tv_show_seconds=totals["tv"][1],
+            music_video_tracks=totals["mv"][2],
+            music_video_bytes=totals["mv"][0],
+            music_video_seconds=totals["mv"][1],
+        )
+
     # ── Pre-flight & Loading ────────────────────────────────────────────────
 
     def _preflight_checks(self, ctx: _SyncContext) -> bool:
@@ -513,7 +652,7 @@ class SyncExecutor:
                     source_mtime=source_mtime,
                     was_transcoded=was_transcoded,
                     source_path_hint=pc_track.relative_path,
-                    art_hash=getattr(pc_track, "art_hash", None),
+                    art_hash=pc_track.art_hash,
                 )
 
     def _update_podcast_subscriptions(self, ctx: _SyncContext) -> None:
@@ -1031,14 +1170,12 @@ class SyncExecutor:
         for item in ctx.plan.to_add:
             if item.pc_track is None:
                 continue
-            if not getattr(item.pc_track, "is_podcast", False):
+            if not item.pc_track.is_podcast:
                 continue
             source = Path(item.pc_track.path) if item.pc_track.path else None
             if source and source.exists():
                 continue
-            # Needs downloading
-            enc_url = getattr(item.pc_track, "podcast_enclosure_url", "")
-            if enc_url:
+            if item.pc_track.podcast_enclosure_url:
                 pending.append(item)
 
         if not pending:
@@ -1049,8 +1186,8 @@ class SyncExecutor:
             message=f"Downloading {len(pending)} podcast episodes...",
         )
 
-        from PodcastManager.downloader import download_episode, embed_feed_artwork
-        from PodcastManager.models import PodcastEpisode
+        from PodcastManager.downloader import download_and_probe_episode
+        from ._formats import IPOD_NATIVE_AUDIO
 
         failed_items: list[SyncItem] = []
 
@@ -1069,13 +1206,6 @@ class SyncExecutor:
                 item, f"Downloading {title}",
             )
 
-            # Build a minimal PodcastEpisode for the downloader
-            ep = PodcastEpisode(
-                guid=enc_url,
-                title=title,
-                audio_url=enc_url,
-            )
-
             # Determine download destination directory
             dest_dir = str(Path(pc.path).parent) if pc.path else ""
             if not dest_dir:
@@ -1087,51 +1217,44 @@ class SyncExecutor:
                 except Exception:
                     base = ""
                 if not base:
-                    from settings import _default_cache_dir
-                    base = _default_cache_dir()
+                    from settings import default_cache_dir
+                    base = default_cache_dir()
                 dest_dir = str(Path(base) / "podcasts" / url_hash)
 
+            # Look up feed artwork URL from the subscription store
+            artwork_url = ""
             try:
-                path = download_episode(ep, dest_dir)
-                # Embed feed artwork — look up the artwork URL from the
-                # subscription store using the feed URL.
-                try:
-                    from PodcastManager.subscription_store import SubscriptionStore
-                    # Try to find the store via the iPod path
-                    if self.ipod_path:
-                        _store = SubscriptionStore(str(self.ipod_path))
-                        _feed = _store.get_feed(feed_url)
-                        if _feed and _feed.artwork_url:
-                            embed_feed_artwork(path, _feed.artwork_url)
-                except Exception:
-                    pass
+                from PodcastManager.subscription_store import SubscriptionStore
+                if self.ipod_path:
+                    _store = SubscriptionStore(str(self.ipod_path))
+                    _feed = _store.get_feed(feed_url)
+                    if _feed and _feed.artwork_url:
+                        artwork_url = _feed.artwork_url
+            except Exception:
+                pass
+
+            try:
+                info = download_and_probe_episode(
+                    audio_url=enc_url,
+                    title=title,
+                    dest_dir=dest_dir,
+                    artwork_url=artwork_url,
+                )
 
                 # Update the PCTrack with real file info
-                real_path = Path(path)
-                pc.path = str(real_path)
-                pc.size = real_path.stat().st_size
-                pc.mtime = real_path.stat().st_mtime
-                pc.filename = real_path.name
-                pc.relative_path = real_path.name
-                pc.extension = real_path.suffix.lower()
-
-                # Re-probe audio metadata from the actual file
-                try:
-                    from mutagen import File as MutagenFile  # type: ignore[import-untyped]
-                    audio = MutagenFile(path)
-                    if audio and audio.info:
-                        if hasattr(audio.info, 'bitrate') and audio.info.bitrate:
-                            pc.bitrate = int(audio.info.bitrate / 1000)
-                        if hasattr(audio.info, 'sample_rate') and audio.info.sample_rate:
-                            pc.sample_rate = audio.info.sample_rate
-                        if hasattr(audio.info, 'length') and audio.info.length:
-                            pc.duration_ms = int(audio.info.length * 1000)
-                except Exception:
-                    pass
-
-                # Update transcoding flag based on actual extension
-                native = {".mp3", ".m4a", ".m4b", ".aac", ".wav", ".aif", ".aiff"}
-                pc.needs_transcoding = pc.extension not in native
+                pc.path = info.path
+                pc.size = info.size
+                pc.mtime = info.mtime
+                pc.filename = Path(info.path).name
+                pc.relative_path = Path(info.path).name
+                pc.extension = info.extension
+                if info.bitrate is not None:
+                    pc.bitrate = info.bitrate
+                if info.sample_rate is not None:
+                    pc.sample_rate = info.sample_rate
+                if info.duration_ms is not None:
+                    pc.duration_ms = info.duration_ms
+                pc.needs_transcoding = pc.extension not in IPOD_NATIVE_AUDIO
 
                 logger.info("Downloaded podcast: %s", title)
 
@@ -1691,686 +1814,51 @@ class SyncExecutor:
     # ── Track Conversion ────────────────────────────────────────────────────
 
     def _read_existing_database(self) -> dict:
-        """Read existing tracks, playlists, and smart playlists from iTunesDB.
-
-        Also reads the Play Counts file (if present) and merges per-track
-        deltas into the track dicts.  After merging:
-        - ``play_count_1`` / ``skip_count`` are the new cumulative values
-        - ``recent_playcount`` / ``recent_skipcount`` are the deltas
-        - ``rating`` may be overridden if the user rated on the iPod
-        """
-        from iTunesDB_Parser import parse_itunesdb
-        from iTunesDB_Parser.playcounts import parse_playcounts, merge_playcounts
-        from iTunesDB_Shared.constants import (
-            extract_datasets, extract_mhod_strings, extract_playlist_extras,
-            filetype_to_string, sample_rate_to_hz,
-        )
-
-        empty = {"tracks": [], "playlists": [], "smart_playlists": []}
-        from device_info import resolve_itdb_path
-        _resolved = resolve_itdb_path(str(self.ipod_path))
-        itdb_path = Path(_resolved) if _resolved else self.ipod_path / "iPod_Control" / "iTunes" / "iTunesDB"
-        if not itdb_path.exists():
-            return empty
-
-        try:
-            raw = parse_itunesdb(str(itdb_path))
-            data = extract_datasets(raw)
-            tracks = data.get("mhlt", [])
-
-            # Flatten MHOD strings and convert values for each track
-            for t in tracks:
-                children = t.pop("children", [])
-                t.update(extract_mhod_strings(children))
-                if "filetype" in t:
-                    t["filetype"] = filetype_to_string(t["filetype"])
-                if "sample_rate_1" in t:
-                    t["sample_rate_1"] = sample_rate_to_hz(t["sample_rate_1"])
-
-            # ── Merge Play Counts file (iPod-generated deltas) ──────────
-            pc_path = self.ipod_path / "iPod_Control" / "iTunes" / "Play Counts"
-            pc_entries = parse_playcounts(pc_path)
-            if pc_entries is not None:
-                merge_playcounts(tracks, pc_entries)
-            else:
-                # No Play Counts file → zero deltas for all tracks
-                for t in tracks:
-                    t.setdefault("recent_playcount", 0)
-                    t.setdefault("recent_skipcount", 0)
-
-            # NOTE: GUI track edits (rating, flags, etc.) are no longer
-            # silently applied here.  They flow through the diff engine as
-            # proper SyncItems so they appear in the sync review UI.
-
-            def _process_playlist_list(pl_list):
-                for pl in pl_list:
-                    mhod_children = pl.pop("mhod_children", [])
-                    pl.update(extract_mhod_strings(mhod_children))
-                    pl.update(extract_playlist_extras(mhod_children))
-                    mhip_children = pl.pop("mhip_children", [])
-                    pl["items"] = mhip_children
-
-            # Dataset 2: regular + user playlists (mhlp)
-            # libgpod prefers DS3 over DS2 and only reads ONE.  We prefer
-            # DS2 when present, but fall back to DS3 ("mhlp_podcast") when
-            # DS2 is empty — some devices (Nano 5G+) only write type 3.
-            all_playlists = data.get("mhlp", [])
-            if not all_playlists:
-                all_playlists = data.get("mhlp_podcast", [])
-            _process_playlist_list(all_playlists)
-            # Deduplicate by playlist_id
-            seen_ids: set[int] = set()
-            playlists: list[dict] = []
-            for pl in all_playlists:
-                pid = pl.get("playlist_id", 0)
-                if pid not in seen_ids:
-                    seen_ids.add(pid)
-                    playlists.append(pl)
-
-            # Dataset 5: smart playlists for browsing (mhlp_smart)
-            smart_playlists = data.get("mhlp_smart", [])
-            _process_playlist_list(smart_playlists)
-
-            logger.info(
-                "Parsed iPod database: %d tracks, %d playlists, %d smart playlists",
-                len(tracks), len(playlists), len(smart_playlists),
-            )
-            return {
-                "tracks": tracks,
-                "playlists": playlists,
-                "smart_playlists": smart_playlists,
-            }
-        except Exception as e:
-            logger.error("Failed to parse iTunesDB: %s", e)
-            return empty
-
-    # Filetype string → writer filetype code.  Checked in order; first
-    # substring match wins.  Falls back to "mp3".
-    _FILETYPE_MAP: list[tuple[str, str]] = [
-        ("AAC", "m4a"), ("M4A", "m4a"), ("Lossless", "m4a"),
-        ("Protected", "m4p"), ("Audiobook", "m4b"),
-        ("WAV", "wav"), ("AIFF", "aiff"),
-        ("M4V", "m4v"), ("MP4", "mp4"),
-    ]
+        """Read existing tracks, playlists, and smart playlists from iTunesDB."""
+        from ._db_io import read_existing_database
+        return read_existing_database(self.ipod_path)
 
     def _track_dict_to_info(self, t: dict) -> TrackInfo:
         """Convert parsed track dict to TrackInfo for writing."""
-        filetype = t.get("filetype", "MP3")
-        filetype_code = "mp3"
-        for needle, code in self._FILETYPE_MAP:
-            if needle in filetype:
-                filetype_code = code
-                break
-
-        return TrackInfo(
-            title=t.get("Title", "Unknown"),
-            location=t.get("Location", ""),
-            size=t.get("size", 0),
-            length=t.get("length", 0),
-            filetype=filetype_code,
-            bitrate=t.get("bitrate", 0),
-            sample_rate=t.get("sample_rate_1", 44100),
-            vbr=bool(t.get("vbr_flag", 0)),
-            artist=t.get("Artist"),
-            album=t.get("Album"),
-            album_artist=t.get("Album Artist"),
-            genre=t.get("Genre"),
-            composer=t.get("Composer"),
-            comment=t.get("Comment"),
-            grouping=t.get("Grouping"),
-            year=t.get("year", 0),
-            track_number=t.get("track_number", 0),
-            total_tracks=t.get("total_tracks", 0),
-            disc_number=t.get("disc_number", 1),
-            total_discs=t.get("total_discs", 1),
-            bpm=t.get("bpm", 0),
-            compilation=bool(t.get("compilation_flag", 0)),
-            skip_when_shuffling=bool(t.get("skip_when_shuffling", 0)),
-            remember_position=bool(t.get("remember_position", 0)),
-            rating=t.get("rating", 0),
-            # play_count_1 already includes the Play Counts file delta
-            # (merged by merge_playcounts in _read_existing_database).
-            play_count=t.get("play_count_1", 0),
-            skip_count=t.get("skip_count", 0),
-            volume=t.get("volume", 0),
-            start_time=t.get("start_time", 0),
-            stop_time=t.get("stop_time", 0),
-            sound_check=t.get("sound_check", 0),
-            bookmark_time=t.get("bookmark_time", 0),
-            checked=t.get("checked_flag", 0),
-            gapless_data=t.get("gapless_audio_payload_size", 0),
-            gapless_track_flag=t.get("gapless_track_flag", 0),
-            gapless_album_flag=t.get("gapless_album_flag", 0),
-            pregap=t.get("pregap", 0),
-            postgap=t.get("postgap", 0),
-            sample_count=t.get("sample_count", 0),
-            encoder_flag=t.get("encoder", 0),
-            explicit_flag=t.get("explicit_flag", 0),
-            has_lyrics=bool(t.get("lyrics_flag", 0)),
-            lyrics=t.get("Lyrics"),
-            eq_setting=t.get("EQ Setting"),
-            date_added=t.get("date_added", 0),
-            date_released=t.get("date_released", 0),
-            last_played=t.get("last_played", 0),
-            last_skipped=t.get("last_skipped", 0),
-            last_modified=t.get("last_modified", 0),
-            db_id=t.get("db_id", 0),
-            media_type=t.get("media_type", 1),
-            movie_file_flag=t.get("movie_flag", 0),
-            season_number=t.get("season_number", 0),
-            episode_number=t.get("episode_number", 0),
-            artwork_count=t.get("artwork_count", 0),
-            artwork_size=t.get("artwork_size", 0),
-            mhii_link=t.get("artwork_id_ref", 0),
-            sort_artist=t.get("Sort Artist"),
-            sort_name=t.get("Sort Name"),
-            sort_album=t.get("Sort Album"),
-            sort_album_artist=t.get("Sort Album Artist"),
-            sort_composer=t.get("Sort Composer"),
-            filetype_desc=t.get("filetype"),
-            # Video string fields from parsed MHOD types
-            show_name=t.get("Show"),
-            episode_id=t.get("Episode"),
-            description=t.get("Description Text"),
-            subtitle=t.get("Subtitle"),
-            network_name=t.get("TV Network"),
-            sort_show=t.get("Sort Show"),
-            show_locale=t.get("Show Locale"),
-            keywords=t.get("Track Keywords"),
-            # Podcast/audiobook fields from parsed track
-            podcast_enclosure_url=t.get("Podcast Enclosure URL"),
-            podcast_rss_url=t.get("Podcast RSS URL"),
-            category=t.get("Category"),
-            played_mark=t.get("not_played_flag", -1),
-            podcast_flag=t.get("use_podcast_now_playing_flag", 0),
-            # Round-trip fields (preserved from existing iPod database)
-            user_id=t.get("user_id", 0),
-            app_rating=t.get("app_rating", 0),
-            mpeg_audio_type=t.get("unk144", 0),
-        )
+        from ._track_conversion import track_dict_to_info
+        return track_dict_to_info(t)
 
     def _pc_track_to_info(self, pc_track, ipod_location: str, was_transcoded: bool,
                           ipod_file_path: Optional[Path] = None) -> TrackInfo:
-        """Convert PCTrack to TrackInfo for writing.
-
-        Args:
-            pc_track: Source track metadata from PC.
-            ipod_location: iPod-style colon-separated path.
-            was_transcoded: Whether the file was format-converted.
-            ipod_file_path: Actual file on iPod (for accurate size after transcode).
-        """
-        ext = Path(ipod_location.replace(":", "/")).suffix.lower().lstrip(".")
-        if ext in ("m4a", "aac", "alac"):
-            filetype = "m4a"
-        elif ext == "mp3":
-            filetype = "mp3"
-        else:
-            filetype = ext
-
-        # Rating: PCTrack already stores 0-100 (stars × 20), same as iPod
-        rating = pc_track.rating or 0
-
-        # File size: use actual iPod file size (especially important after transcode)
-        if ipod_file_path and ipod_file_path.exists():
-            file_size = ipod_file_path.stat().st_size
-        else:
-            file_size = pc_track.size or 0
-
-        # Bitrate/sample_rate: use source values for direct copies,
-        # but for transcodes we should probe the actual file.
-        # As a practical default, use AAC 256kbps for transcoded AAC.
-        bitrate = pc_track.bitrate or 0
-        sample_rate = pc_track.sample_rate or 44100
-        if was_transcoded:
-            # Lossless sources (.flac, .wav, .aif, .aiff) transcode to ALAC —
-            # keep the source bitrate.  Lossy sources (.ogg, .opus, .wma) go
-            # to AAC — use the user-configured bitrate.
-            source_ext = pc_track.extension.lower().lstrip(".")
-            is_lossless_source = source_ext in ("flac", "wav", "aif", "aiff")
-            if filetype == "m4a" and not is_lossless_source:
-                from .transcoder import quality_to_nominal_bitrate
-                bitrate = quality_to_nominal_bitrate(self._aac_quality)
-            # Transcoded audio is capped at IPOD_MAX_SAMPLE_RATE; reflect that
-            # in the stored sample_rate so iTunesDB is consistent with the file.
-            if filetype == "m4a":
-                from .transcoder import IPOD_MAX_SAMPLE_RATE as _MAX_SR
-                sample_rate = min(sample_rate, _MAX_SR)
-
-        # ── Media type auto-detection ────────────────────────────────
-        is_video = getattr(pc_track, "is_video", False)
-        video_kind = getattr(pc_track, "video_kind", "") or ""
-        is_podcast = getattr(pc_track, "is_podcast", False)
-        is_audiobook = getattr(pc_track, "is_audiobook", False)
-        movie_file_flag = 0
-        media_type = MEDIA_TYPE_AUDIO
-        podcast_flag = 0
-        skip_when_shuffling = False
-        remember_position = False
-
-        if is_video:
-            movie_file_flag = 1
-            if is_podcast:
-                media_type = MEDIA_TYPE_VIDEO_PODCAST
-                podcast_flag = 1
-                skip_when_shuffling = True
-                remember_position = True
-            elif video_kind == "tv_show":
-                media_type = MEDIA_TYPE_TV_SHOW
-            elif video_kind == "music_video":
-                media_type = MEDIA_TYPE_MUSIC_VIDEO
-            else:
-                # Default to movie for generic video files
-                media_type = MEDIA_TYPE_VIDEO
-        elif is_podcast:
-            media_type = MEDIA_TYPE_PODCAST
-            podcast_flag = 1
-            skip_when_shuffling = True
-            remember_position = True
-        elif is_audiobook:
-            media_type = MEDIA_TYPE_AUDIOBOOK
-            skip_when_shuffling = True
-            remember_position = True
-
-        # ── Gapless & encoder flags ──────────────────────────────────
-        pregap = getattr(pc_track, "pregap", 0) or 0
-        postgap = getattr(pc_track, "postgap", 0) or 0
-        sample_count = getattr(pc_track, "sample_count", 0) or 0
-        gapless_data = getattr(pc_track, "gapless_data", 0) or 0
-        if was_transcoded:
-            # Prefer probing the actual output file — it gives us values at the
-            # correct sample rate with no floating-point error, and for files
-            # encoded by Apple's Core Audio (aac_at on macOS) we also get exact
-            # pregap/postgap from the iTunSMPB atom.
-            if ipod_file_path and ipod_file_path.exists():
-                from .pc_library import probe_gapless_info
-                probed = probe_gapless_info(ipod_file_path)
-                if probed.get("sample_rate"):
-                    sample_rate = probed["sample_rate"]
-                if probed.get("sample_count"):
-                    sample_count = probed["sample_count"]
-                    pregap = probed.get("pregap", 0)
-                    postgap = probed.get("postgap", 0)
-            else:
-                # Fallback: the output file isn't available yet (dry-run, etc.).
-                # Scale source values to the output sample rate to avoid the
-                # early-cutoff bug described in the transcoder fix.
-                src_sr = pc_track.sample_rate or 44100
-                if src_sr != sample_rate:
-                    ratio = sample_rate / src_sr
-                    if sample_count:
-                        sample_count = round(sample_count * ratio)
-                    if pregap:
-                        pregap = round(pregap * ratio)
-                    if postgap:
-                        postgap = round(postgap * ratio)
-        # Gapless playback flag is OFF by default.
-        # Only enable it when explicitly provided by metadata/user intent.
-        gapless_track_flag = int(getattr(pc_track, "gapless_track_flag", 0) or 0)
-        # encoder_flag: set to 1 for MP3 (iPod needs this for LAME gapless)
-        encoder_flag = 1 if filetype == "mp3" else 0
-        # VBR detection from mutagen bitrate_mode
-        vbr = getattr(pc_track, "vbr", False)
-
-        return TrackInfo(
-            title=pc_track.title or Path(pc_track.path).stem,
-            location=ipod_location,
-            size=file_size,
-            length=pc_track.duration_ms or 0,
-            filetype=filetype,
-            bitrate=bitrate,
-            sample_rate=sample_rate,
-            vbr=vbr,
-            artist=pc_track.artist,
-            album=pc_track.album,
-            album_artist=pc_track.album_artist,
-            genre=pc_track.genre,
-            composer=getattr(pc_track, "composer", None),
-            comment=getattr(pc_track, "comment", None),
-            grouping=getattr(pc_track, "grouping", None),
-            year=pc_track.year or 0,
-            track_number=pc_track.track_number or 0,
-            total_tracks=getattr(pc_track, "track_total", None) or 0,
-            disc_number=pc_track.disc_number or 1,
-            total_discs=getattr(pc_track, "disc_total", None) or 1,
-            bpm=getattr(pc_track, "bpm", None) or 0,
-            rating=rating,
-            play_count=getattr(pc_track, "play_count", 0) or 0,
-            compilation=getattr(pc_track, "compilation", False),
-            sound_check=getattr(pc_track, "sound_check", 0) or 0,
-            pregap=pregap,
-            postgap=postgap,
-            sample_count=sample_count,
-            gapless_data=gapless_data,
-            gapless_track_flag=gapless_track_flag,
-            encoder_flag=encoder_flag,
-            explicit_flag=getattr(pc_track, "explicit_flag", 0) or 0,
-            has_lyrics=getattr(pc_track, "has_lyrics", False),
-            lyrics=getattr(pc_track, "lyrics", None),
-            date_released=getattr(pc_track, "date_released", 0) or 0,
-            subtitle=getattr(pc_track, "subtitle", None),
-            sort_artist=getattr(pc_track, "sort_artist", None),
-            sort_name=getattr(pc_track, "sort_name", None),
-            sort_album=getattr(pc_track, "sort_album", None),
-            sort_album_artist=getattr(pc_track, "sort_album_artist", None),
-            sort_composer=getattr(pc_track, "sort_composer", None),
-            # Video fields
-            media_type=media_type,
-            movie_file_flag=movie_file_flag,
-            season_number=getattr(pc_track, "season_number", None) or 0,
-            episode_number=getattr(pc_track, "episode_number", None) or 0,
-            show_name=getattr(pc_track, "show_name", None),
-            episode_id=getattr(pc_track, "episode_id", None),
-            description=getattr(pc_track, "description", None),
-            network_name=getattr(pc_track, "network_name", None),
-            sort_show=getattr(pc_track, "sort_show", None),
-            # Podcast/audiobook flags
-            podcast_flag=podcast_flag,
-            skip_when_shuffling=skip_when_shuffling,
-            remember_position=remember_position,
-            category=getattr(pc_track, "category", None),
-            podcast_rss_url=getattr(pc_track, "podcast_url", None),
-            podcast_enclosure_url=getattr(pc_track, "podcast_enclosure_url", None),
-            chapter_data={"chapters": pc_track.chapters} if getattr(pc_track, "chapters", None) else None,
+        """Convert PCTrack to TrackInfo for writing."""
+        from ._track_conversion import pc_track_to_info
+        return pc_track_to_info(
+            pc_track, ipod_location, was_transcoded,
+            ipod_file_path=ipod_file_path,
+            aac_quality=self._aac_quality,
         )
 
     @staticmethod
     def _decode_raw_blob(value) -> Optional[bytes]:
-        """Decode a raw MHOD blob from parsed playlist data.
-
-        The parser stores bytes, but mhbd_parser's replace_bytes_with_base64()
-        converts them to base64 strings for JSON serialization. This method
-        handles both cases.
-        """
-        if value is None:
-            return None
-        if isinstance(value, bytes):
-            return value
-        if isinstance(value, str):
-            try:
-                return base64.b64decode(value)
-            except Exception:
-                return None
-        return None
+        """Decode a raw MHOD blob from parsed playlist data."""
+        from ._playlist_builder import decode_raw_blob
+        return decode_raw_blob(value)
 
     def _build_and_evaluate_playlists(
         self,
         ctx: _SyncContext,
         all_track_infos: list[TrackInfo],
     ) -> tuple[str, list[PlaylistInfo], list[PlaylistInfo]]:
-        """Build PlaylistInfo lists and evaluate smart playlist rules.
-
-        Returns (master_playlist_name, regular_playlists, smart_playlists)
-        ready for write_itunesdb().
-        """
-        from .spl_evaluator import spl_update
-
-        old_tid_to_db_id: dict[int, int] = {}
-        for t in ctx.existing_tracks_data:
-            tid = t.get("track_id", 0)
-            db_id = t.get("db_id", 0)
-            if tid and db_id:
-                old_tid_to_db_id[tid] = db_id
-
-        valid_db_ids: set[int] = {t.db_id for t in all_track_infos if t.db_id}
-        eval_tracks = [self._trackinfo_to_eval_dict(t) for t in all_track_infos]
-
-        master_name, master_id, playlists = self._build_regular_playlists(
-            ctx, old_tid_to_db_id, valid_db_ids, eval_tracks, spl_update,
+        """Build PlaylistInfo lists and evaluate smart playlist rules."""
+        from ._playlist_builder import build_and_evaluate_playlists
+        return build_and_evaluate_playlists(
+            ctx.existing_tracks_data,
+            ctx.existing_playlists_raw,
+            ctx.existing_smart_raw,
+            all_track_infos,
+            ctx.user_playlists,
         )
-        self._sanitize_playlists(playlists, master_id)
-        self._rebuild_podcast_playlist(playlists, all_track_infos)
-
-        smart_playlists = self._build_smart_playlists(
-            ctx, valid_db_ids, eval_tracks, spl_update,
-        )
-
-        self._reevaluate_live_update(
-            playlists, smart_playlists, valid_db_ids, eval_tracks, spl_update,
-        )
-
-        return master_name, playlists, smart_playlists
-
-    def _build_regular_playlists(
-        self,
-        ctx: _SyncContext,
-        old_tid_to_db_id: dict[int, int],
-        valid_db_ids: set[int],
-        eval_tracks: list[dict],
-        spl_update,
-    ) -> tuple[str, int | None, list[PlaylistInfo]]:
-        """Build dataset-2 playlists, returning (master_name, master_id, playlists)."""
-        master_playlist_name = "iPod"
-        master_playlist_id: int | None = None
-        playlists: list[PlaylistInfo] = []
-
-        for pl in ctx.existing_playlists_raw:
-            if pl.get("master_flag"):
-                master_playlist_name = pl.get("Title", "iPod")
-                master_playlist_id = pl.get("playlist_id")
-                continue
-
-            items = pl.get("items", [])
-            track_ids = []
-            item_meta = []
-            for item in items:
-                tid = item.get("track_id", 0)
-                db_id = old_tid_to_db_id.get(tid, 0)
-                if db_id in valid_db_ids:
-                    track_ids.append(db_id)
-                    item_meta.append(PlaylistItemMeta(
-                        podcast_group_flag=item.get("podcast_group_flag", 0),
-                        group_id=item.get("group_id", 0),
-                        podcast_group_ref=item.get("group_id_ref", 0),
-                    ))
-
-            info = PlaylistInfo(
-                name=pl.get("Title", "Untitled"),
-                track_ids=track_ids,
-                playlist_id=pl.get("playlist_id"),
-                master=False,
-                sortorder=pl.get("sort_order", 0),
-                podcast_flag=pl.get("podcast_flag", 0),
-                raw_mhod100=self._decode_raw_blob(pl.get("playlist_prefs")),
-                raw_mhod102=self._decode_raw_blob(pl.get("playlist_settings")),
-                item_metadata=item_meta if item_meta else None,
-            )
-
-            # Evaluate smart playlist rules (dataset 2 smart playlists)
-            prefs_data = pl.get("smart_playlist_data")
-            rules_data = pl.get("smart_playlist_rules")
-            if prefs_data and rules_data:
-                info.smart_prefs = prefs_from_parsed(prefs_data)
-                info.smart_rules = rules_from_parsed(rules_data)
-                matched_db_ids = spl_update(
-                    info.smart_prefs, info.smart_rules, eval_tracks,
-                )
-                info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
-                info.item_metadata = None
-                logger.debug("SPL (ds2) '%s': %d tracks matched",
-                             info.name, len(info.track_ids))
-
-            playlists.append(info)
-
-        logger.info("Prepared %d user playlists for writing", len(playlists))
-        return master_playlist_name, master_playlist_id, playlists
-
-    @staticmethod
-    def _sanitize_playlists(playlists: list[PlaylistInfo],
-                            master_playlist_id: int | None) -> None:
-        """Remove master duplicates and strip rogue master flags."""
-        if master_playlist_id is not None:
-            before = len(playlists)
-            playlists[:] = [p for p in playlists
-                            if p.playlist_id != master_playlist_id]
-            dropped = before - len(playlists)
-            if dropped:
-                logger.warning("Dropped %d playlist(s) with master playlist_id=0x%X",
-                               dropped, master_playlist_id)
-
-        master_count = sum(1 for p in playlists if p.master)
-        if master_count:
-            logger.warning("Stripped master flag from %d user playlist(s) — "
-                           "master is auto-generated", master_count)
-            for p in playlists:
-                p.master = False
-
-    @staticmethod
-    def _rebuild_podcast_playlist(playlists: list[PlaylistInfo],
-                                  all_track_infos: list[TrackInfo]) -> None:
-        """Ensure the Podcasts playlist reflects all current podcast tracks."""
-        podcast_db_ids = [t.db_id for t in all_track_infos if t.media_type & 0x04]
-        existing_podcast_pl = next((p for p in playlists if p.podcast_flag), None)
-
-        if podcast_db_ids:
-            if existing_podcast_pl is not None:
-                existing_podcast_pl.track_ids = podcast_db_ids
-                existing_podcast_pl.item_metadata = None
-                logger.info("Rebuilt 'Podcasts' playlist with %d tracks",
-                            len(podcast_db_ids))
-            else:
-                from iTunesDB_Writer.mhyp_writer import generate_playlist_id
-                playlists.append(PlaylistInfo(
-                    name="Podcasts",
-                    track_ids=podcast_db_ids,
-                    playlist_id=generate_playlist_id(),
-                    podcast_flag=1,
-                ))
-                logger.info("Auto-created 'Podcasts' playlist with %d tracks",
-                            len(podcast_db_ids))
-        elif existing_podcast_pl is not None:
-            playlists.remove(existing_podcast_pl)
-            logger.info("Removed empty 'Podcasts' playlist (no podcast tracks)")
-
-    def _build_smart_playlists(
-        self,
-        ctx: _SyncContext,
-        valid_db_ids: set[int],
-        eval_tracks: list[dict],
-        spl_update,
-    ) -> list[PlaylistInfo]:
-        """Build dataset-5 smart playlists."""
-        smart_playlists: list[PlaylistInfo] = []
-        for pl in ctx.existing_smart_raw:
-            prefs_data = pl.get("smart_playlist_data")
-            rules_data = pl.get("smart_playlist_rules")
-
-            info = PlaylistInfo(
-                name=pl.get("Title", "Untitled"),
-                playlist_id=pl.get("playlist_id"),
-                master=bool(pl.get("master_flag", 0)),  # Respect the original master flag
-                sortorder=pl.get("sort_order", 0),
-                mhsd5_type=pl.get("mhsd5_type", 0),
-                raw_mhod100=self._decode_raw_blob(pl.get("playlist_prefs")),
-                raw_mhod102=self._decode_raw_blob(pl.get("playlist_settings")),
-            )
-
-            if prefs_data and rules_data:
-                info.smart_prefs = prefs_from_parsed(prefs_data)
-                info.smart_rules = rules_from_parsed(rules_data)
-                matched_db_ids = spl_update(
-                    info.smart_prefs, info.smart_rules, eval_tracks,
-                )
-
-                if info.mhsd5_type:
-                    info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
-                    info.item_metadata = None
-                    logger.debug("SPL (ds5) '%s': %d tracks matched and assigned",
-                                 info.name, len(info.track_ids))
-                elif info.smart_prefs.live_update:
-                    info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
-                    info.item_metadata = None
-                    logger.debug("SPL (ds5) '%s': %d tracks matched (live_update)",
-                                 info.name, len(info.track_ids))
-                else:
-                    logger.debug("SPL (ds5) '%s': %d tracks would match "
-                                 "(live_update=False, keeping existing)",
-                                 info.name, len(matched_db_ids))
-
-            smart_playlists.append(info)
-
-        logger.info("Prepared %d smart playlists (dataset 5) for writing",
-                    len(smart_playlists))
-        return smart_playlists
-
-    @staticmethod
-    def _reevaluate_live_update(
-        playlists: list[PlaylistInfo],
-        smart_playlists: list[PlaylistInfo],
-        valid_db_ids: set[int],
-        eval_tracks: list[dict],
-        spl_update,
-    ) -> None:
-        """Re-evaluate all live-update SPLs against the final track list."""
-        for info in list(playlists) + [s for s in smart_playlists if not s.mhsd5_type]:
-            if info.smart_prefs and info.smart_rules and info.smart_prefs.live_update:
-                matched_db_ids = spl_update(
-                    info.smart_prefs, info.smart_rules, eval_tracks,
-                )
-                new_ids = [d for d in matched_db_ids if d in valid_db_ids]
-                if new_ids != info.track_ids:
-                    logger.info("SPL live-update '%s': %d → %d tracks after "
-                                "final re-evaluation",
-                                info.name, len(info.track_ids), len(new_ids))
-                    info.track_ids = new_ids
-                    info.item_metadata = None
 
     @staticmethod
     def _trackinfo_to_eval_dict(t: TrackInfo) -> dict:
-        """Convert a TrackInfo to a dict the SPL evaluator can consume.
-
-        The evaluator expects parsed-track-style dicts with keys matching
-        the accessor maps in spl_evaluator.py.  We use db_id as the
-        track_id so that spl_update() returns db_ids directly.
-        """
-        d: dict = {
-            # Use db_id as track_id so evaluator returns db_ids
-            "track_id": t.db_id,
-            # String fields
-            "Title": t.title or "",
-            "Album": t.album or "",
-            "Artist": t.artist or "",
-            "Genre": t.genre or "",
-            "filetype": t.filetype_desc or t.filetype or "",
-            "Comment": t.comment or "",
-            "Composer": t.composer or "",
-            "Album Artist": t.album_artist or "",
-            "Sort Title": t.sort_name or "",
-            "Sort Album": t.sort_album or "",
-            "Sort Artist": t.sort_artist or "",
-            "Sort Album Artist": t.sort_album_artist or "",
-            "Sort Composer": t.sort_composer or "",
-            "Grouping": t.grouping or "",
-            # Integer fields
-            "bitrate": t.bitrate,
-            "sample_rate_1": t.sample_rate,
-            "year": t.year,
-            "track_number": t.track_number,
-            "size": t.size,
-            "length": t.length,
-            "play_count_1": t.play_count,
-            "disc_number": t.disc_number,
-            "rating": t.rating,
-            "bpm": t.bpm,
-            "skip_count": t.skip_count,
-            # Date fields (Unix timestamps)
-            "date_added": t.date_added,
-            "last_played": t.last_played,
-            "last_skipped": t.last_skipped,
-            # Boolean fields
-            "compilation_flag": 1 if t.compilation else 0,
-            # Binary AND fields
-            "media_type": t.media_type,
-            # Checked flag (0=checked, 1=unchecked in iPod convention)
-            "checked_flag": t.checked,
-            # Video fields for smart playlist evaluation
-            "season_number": t.season_number,
-            "Show": t.show_name or "",
-            # Podcast/audiobook fields for smart playlist evaluation
-            "Description Text": t.description or "",
-            "Category": t.category or "",
-            "podcast_flag": t.podcast_flag,
-        }
-        return d
+        """Convert a TrackInfo to a dict the SPL evaluator can consume."""
+        from ._track_conversion import trackinfo_to_eval_dict
+        return trackinfo_to_eval_dict(t)
 
     def _write_database(
         self,
@@ -2380,106 +1868,12 @@ class SyncExecutor:
         smart_playlists: Optional[list[PlaylistInfo]] = None,
         master_playlist_name: str = "iPod",
     ) -> bool:
-        """Write tracks to iTunesDB (and ArtworkDB if pc_file_paths provided).
-
-        Automatically detects device capabilities from the centralized store
-        and passes them to the writer for db_version, gapless/video filtering,
-        and conditional podcast MHSD inclusion.
-
-        For devices with ``uses_sqlite_db`` (Nano 6G/7G), also writes the
-        SQLite databases to ``iTunes Library.itlp/``.  The firmware on those
-        devices reads the SQLite databases exclusively.
-        """
-        from iTunesDB_Writer import write_itunesdb
-
-        logger.debug("ART: _write_database called with %d tracks, pc_file_paths=%s",
-                     len(tracks), 'None' if pc_file_paths is None else len(pc_file_paths))
-        logger.debug(
-            "DB: playlists=%s, smart_playlists=%s",
-            len(playlists) if playlists else 0,
-            len(smart_playlists) if smart_playlists else 0,
+        """Write tracks to iTunesDB (and ArtworkDB/SQLite if applicable)."""
+        from ._db_io import write_database
+        return write_database(
+            self.ipod_path, tracks,
+            pc_file_paths=pc_file_paths,
+            playlists=playlists,
+            smart_playlists=smart_playlists,
+            master_playlist_name=master_playlist_name,
         )
-
-        # Resolve capabilities once for the writer
-        capabilities = None
-        try:
-            from device_info import get_current_device
-            from ipod_models import capabilities_for_family_gen
-            dev = get_current_device()
-            if dev and dev.model_family:
-                capabilities = capabilities_for_family_gen(
-                    dev.model_family, dev.generation or "",
-                )
-        except Exception as exc:
-            logger.debug("Could not load device capabilities: %s", exc)
-
-        try:
-            ok = write_itunesdb(
-                str(self.ipod_path),
-                tracks,
-                pc_file_paths=pc_file_paths,
-                playlists=playlists,
-                smart_playlists=smart_playlists,
-                capabilities=capabilities,
-                master_playlist_name=master_playlist_name,
-            )
-        except Exception as e:
-            logger.exception("Failed to write iTunesDB: %s", e)
-            return False
-
-        # ── SQLite databases (Nano 5G/6G/7G) ─────────────────────────
-        # Write SQLite databases if the device declares uses_sqlite_db OR
-        # if the iTunes Library.itlp directory already exists (e.g. Nano 5G
-        # where iTunes created the directory but the capability flag is off).
-        itlp_dir = os.path.join(str(self.ipod_path), "iPod_Control", "iTunes", "iTunes Library.itlp")
-        has_itlp = os.path.isdir(itlp_dir)
-        if (capabilities and capabilities.uses_sqlite_db) or has_itlp:
-            logger.info("Writing SQLite databases to iTunes Library.itlp/ "
-                        "(uses_sqlite_db=%s, itlp_exists=%s)",
-                        capabilities.uses_sqlite_db if capabilities else False,
-                        has_itlp)
-            try:
-                from SQLiteDB_Writer import write_sqlite_databases
-                import struct as _struct
-
-                # Extract db_pid from the CDB we just wrote so SQLite databases
-                # use the same persistent ID — firmware cross-references both.
-                db_pid = 0
-                try:
-                    from device_info import resolve_itdb_path
-                    cdb_path = resolve_itdb_path(str(self.ipod_path))
-                    if cdb_path:
-                        with open(cdb_path, "rb") as _f:
-                            _hdr = _f.read(0x20)
-                        if len(_hdr) >= 0x20 and _hdr[:4] == b"mhbd":
-                            db_pid = _struct.unpack_from('<Q', _hdr, 0x18)[0]
-                            logger.debug("Extracted db_pid=%016X from CDB for SQLite", db_pid)
-                except Exception as exc:
-                    logger.warning("Could not extract db_pid from CDB: %s", exc)
-
-                # Get FireWire ID for cbk signing
-                firewire_id = None
-                try:
-                    from device_info import get_firewire_id
-                    firewire_id = get_firewire_id(str(self.ipod_path))
-                except Exception as e:
-                    logger.warning("Could not get FireWire ID for SQLite cbk: %s", e)
-
-                sqlite_ok = write_sqlite_databases(
-                    ipod_path=str(self.ipod_path),
-                    tracks=tracks,
-                    playlists=playlists,
-                    smart_playlists=smart_playlists,
-                    master_playlist_name=master_playlist_name,
-                    db_pid=db_pid,
-                    capabilities=capabilities,
-                    firewire_id=firewire_id,
-                )
-                if not sqlite_ok:
-                    logger.error("SQLite database write failed")
-                    return False
-            except Exception as e:
-                logger.exception("Failed to write SQLite databases: %s", e)
-                return False
-
-        return ok

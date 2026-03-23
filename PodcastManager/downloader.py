@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 from urllib.parse import urlparse, unquote
@@ -187,6 +188,77 @@ def embed_feed_artwork(file_path: str, artwork_url: str) -> bool:
     except Exception as exc:
         log.debug("Failed to embed artwork into %s: %s", file_path, exc)
         return False
+
+
+@dataclass
+class DownloadedEpisodeInfo:
+    """Metadata returned by download_and_probe_episode."""
+    path: str
+    size: int
+    mtime: float
+    extension: str
+    bitrate: Optional[int] = None
+    sample_rate: Optional[int] = None
+    duration_ms: Optional[int] = None
+
+
+def download_and_probe_episode(
+    audio_url: str,
+    title: str,
+    dest_dir: str,
+    *,
+    feed_url: str = "",
+    artwork_url: str = "",
+) -> DownloadedEpisodeInfo:
+    """Download an episode, embed artwork, and probe its audio metadata.
+
+    This is the high-level entry point used by the sync executor.  It
+    combines download_episode + embed_feed_artwork + mutagen probing
+    into a single call.
+
+    Args:
+        audio_url: Enclosure URL for the episode audio.
+        title: Episode title (used for filename).
+        dest_dir: Directory to save the file into.
+        feed_url: Feed URL (unused here, reserved for future use).
+        artwork_url: Feed artwork URL to embed into the file.
+
+    Returns:
+        DownloadedEpisodeInfo with file info and probed metadata.
+
+    Raises:
+        Same exceptions as download_episode.
+    """
+    ep = PodcastEpisode(guid=audio_url, title=title, audio_url=audio_url)
+    path = download_episode(ep, dest_dir)
+
+    if artwork_url:
+        embed_feed_artwork(path, artwork_url)
+
+    real_path = Path(path)
+    st = real_path.stat()
+    info = DownloadedEpisodeInfo(
+        path=path,
+        size=st.st_size,
+        mtime=st.st_mtime,
+        extension=real_path.suffix.lower(),
+    )
+
+    # Probe audio metadata
+    try:
+        from mutagen import File as MutagenFile  # type: ignore[import-untyped]
+        audio = MutagenFile(path)
+        if audio and audio.info:
+            if hasattr(audio.info, 'bitrate') and audio.info.bitrate:
+                info.bitrate = int(audio.info.bitrate / 1000)
+            if hasattr(audio.info, 'sample_rate') and audio.info.sample_rate:
+                info.sample_rate = audio.info.sample_rate
+            if hasattr(audio.info, 'length') and audio.info.length:
+                info.duration_ms = int(audio.info.length * 1000)
+    except Exception:
+        pass
+
+    return info
 
 
 def extract_chapters(file_path: str) -> list[dict] | None:

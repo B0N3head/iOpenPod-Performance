@@ -7,19 +7,9 @@ information.
 
 from __future__ import annotations
 
-from typing import Any
-
 import iTunesDB_Shared as idb
-from ._parsing import ParseResult, parse_children
-
-
-def _parse_mhip_header(
-    data: bytes | bytearray,
-    offset: int,
-    header_length: int,
-) -> dict[str, Any]:
-    """Extract MHIP header fields."""
-    return idb.read_fields(data, offset, "mhip", header_length)
+from ._parsing import ParseResult
+from .chunk_parser import parse_children
 
 
 def parse_playlist_item(
@@ -29,7 +19,7 @@ def parse_playlist_item(
     chunk_length: int,
 ) -> ParseResult:
     """Parse an MHIP (Playlist Item) chunk and its MHOD children."""
-    mhip = _parse_mhip_header(data, offset, header_length)
+    mhip = idb.read_fields(data, offset, "mhip", header_length)
     mhip["children"], _ = parse_children(
         data, offset + header_length, mhip["child_count"],
     )

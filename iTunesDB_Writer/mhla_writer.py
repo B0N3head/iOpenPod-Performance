@@ -36,6 +36,13 @@ from iTunesDB_Shared.field_base import (
     write_generic_header,
 )
 from iTunesDB_Shared.mhia_defs import MHIA_HEADER_SIZE
+from iTunesDB_Shared.constants import (
+    MHOD_TYPE_ALBUM_ALBUM,
+    MHOD_TYPE_ALBUM_ARTIST_ITEM,
+    MHOD_TYPE_ALBUM_SORT_ARTIST,
+    MHOD_TYPE_ALBUM_PODCAST_URL,
+    MHOD_TYPE_ALBUM_SHOW,
+)
 from .mhod_writer import write_mhod_string
 
 
@@ -50,7 +57,7 @@ def _album_key(track: "TrackInfo") -> tuple[str, str]:
     so that two artists who each have a "Greatest Hits" album remain separate.
     """
     album_name = track.album or ""
-    if getattr(track, "compilation", False):
+    if track.compilation:
         return (album_name, "")
     album_artist = track.album_artist or track.artist or ""
     return (album_name, album_artist)
@@ -81,29 +88,24 @@ def write_mhia(album_id: int, album_name: str, album_artist: str,
     children = bytearray()
     child_count = 0
 
-    # MHOD type 200 = album name (for album items, not type 3 which is for tracks)
     if album_name:
-        children.extend(write_mhod_string(200, album_name))
+        children.extend(write_mhod_string(MHOD_TYPE_ALBUM_ALBUM, album_name))
         child_count += 1
 
-    # MHOD type 201 = artist (for album items, not type 22 which is for tracks)
     if album_artist:
-        children.extend(write_mhod_string(201, album_artist))
+        children.extend(write_mhod_string(MHOD_TYPE_ALBUM_ARTIST_ITEM, album_artist))
         child_count += 1
 
-    # MHOD type 202 = sort artist (per libgpod mk_mhia, uses sort_albumartist or sort_artist)
     if sort_album_artist:
-        children.extend(write_mhod_string(202, sort_album_artist))
+        children.extend(write_mhod_string(MHOD_TYPE_ALBUM_SORT_ARTIST, sort_album_artist))
         child_count += 1
 
-    # MHOD type 203 = podcast RSS URL (album-level, mirrors track MHOD type 16)
     if podcast_url:
-        children.extend(write_mhod_string(203, podcast_url))
+        children.extend(write_mhod_string(MHOD_TYPE_ALBUM_PODCAST_URL, podcast_url))
         child_count += 1
 
-    # MHOD type 204 = show name (album-level, mirrors track MHOD type 19)
     if show_name:
-        children.extend(write_mhod_string(204, show_name))
+        children.extend(write_mhod_string(MHOD_TYPE_ALBUM_SHOW, show_name))
         child_count += 1
 
     # Total chunk length
@@ -159,15 +161,15 @@ def write_mhla(tracks: list["TrackInfo"], starting_index_for_album_id) -> tuple[
         key = _album_key(track)
         if key not in album_sort_artists:
             # Use sort_albumartist from track first, fall back to sort_artist (per libgpod mk_mhia)
-            sort_artist = getattr(track, 'sort_album_artist', None) or getattr(track, 'sort_artist', None) or ""
+            sort_artist = track.sort_album_artist or track.sort_artist or ""
             if sort_artist:
                 album_sort_artists[key] = sort_artist
         if key not in album_podcast_urls:
-            podcast_url = getattr(track, 'podcast_rss_url', None) or ""
+            podcast_url = track.podcast_rss_url or ""
             if podcast_url:
                 album_podcast_urls[key] = podcast_url
         if key not in album_show_names:
-            show_name = getattr(track, 'show_name', None) or ""
+            show_name = track.show_name or ""
             if show_name:
                 album_show_names[key] = show_name
 
@@ -179,12 +181,12 @@ def write_mhla(tracks: list["TrackInfo"], starting_index_for_album_id) -> tuple[
         show_name = album_show_names.get((album_name, album_artist), "")
         # Album is a compilation if any track in it has compilation=True
         is_compilation = any(
-            getattr(t, "compilation", False)
+            t.compilation
             for t in album_tracks[(album_name, album_artist)]
         )
         # Use first track's db_id as the representative track for this album
         rep_tracks = album_tracks[(album_name, album_artist)]
-        rep_db_id = getattr(rep_tracks[0], "db_id", 0) if rep_tracks else 0
+        rep_db_id = rep_tracks[0].db_id if rep_tracks else 0
         album_items.extend(write_mhia(
             album_id, album_name, album_artist, sort_artist,
             podcast_url=podcast_url, show_name=show_name,

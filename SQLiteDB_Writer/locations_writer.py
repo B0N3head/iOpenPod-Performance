@@ -9,24 +9,14 @@ Schema:
 Reference: libgpod itdb_sqlite.c mk_Locations()
 """
 
-import sqlite3
 import time
 import logging
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Shared.constants import FILETYPE_CODES
+from ._helpers import s64 as _s64, unix_to_coredata, open_db
 
 logger = logging.getLogger(__name__)
-
-# Core Data epoch offset (same as library_writer)
-CORE_DATA_EPOCH = 978307200
-
-
-def _s64(val: int) -> int:
-    """Convert unsigned 64-bit int to signed for SQLite INTEGER storage."""
-    if val >= (1 << 63):
-        return val - (1 << 64)
-    return val
 
 
 # location_type = 0x46494C45 = "FILE" as big-endian int
@@ -113,14 +103,7 @@ def write_locations_itdb(
         tracks: List of TrackInfo objects (with db_id and location set).
         tz_offset: Timezone offset in seconds (positive = east of UTC).
     """
-    import os
-    if os.path.exists(path):
-        os.remove(path)
-
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    cur = conn.cursor()
+    conn, cur = open_db(path)
 
     cur.executescript(_LOCATIONS_SCHEMA)
 
@@ -140,7 +123,7 @@ def write_locations_itdb(
 
         # date_created: Core Data timestamp of when the file was added
         date_added = track.date_added or now
-        date_cd = date_added - CORE_DATA_EPOCH - tz_offset if date_added else 0
+        date_cd = unix_to_coredata(date_added, tz_offset)
 
         cur.execute(
             """INSERT INTO location (

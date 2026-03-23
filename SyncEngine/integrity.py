@@ -26,6 +26,7 @@ C. Filesystem → iTunesDB  (orphan detection)
    Orphans are deleted to reclaim space.
 """
 
+from ._formats import MEDIA_EXTENSIONS as _MEDIA_EXTS
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,13 +35,6 @@ from typing import Optional, Callable
 from .mapping import MappingFile
 
 logger = logging.getLogger(__name__)
-
-# Media extensions the iPod can contain (audio + video)
-_MEDIA_EXTS = frozenset({
-    ".mp3", ".m4a", ".m4b", ".m4p", ".mp4",
-    ".aac", ".wav", ".aif", ".aiff", ".alac",
-    ".m4v",  # iPod video format
-})
 
 
 @dataclass

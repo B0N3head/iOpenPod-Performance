@@ -19,19 +19,9 @@ Binary layout (offsets relative to chunk start)::
 
 from __future__ import annotations
 
-from typing import Any
-
 import iTunesDB_Shared as idb
-from ._parsing import ParseResult, parse_children
-
-
-def _parse_mhbd_header(
-    data: bytes | bytearray,
-    offset: int,
-    header_length: int,
-) -> dict[str, Any]:
-    """Extract all MHBD header fields into a flat dict."""
-    return idb.read_fields(data, offset, "mhbd", header_length)
+from ._parsing import ParseResult
+from .chunk_parser import parse_children
 
 
 def parse_db(
@@ -41,7 +31,7 @@ def parse_db(
     chunk_length: int,
 ) -> ParseResult:
     """Parse an MHBD (Database) chunk and its MHSD children."""
-    mhbd = _parse_mhbd_header(data, offset, header_length)
+    mhbd = idb.read_fields(data, offset, "mhbd", header_length)
     mhbd["children"], _ = parse_children(
         data, offset + header_length, mhbd["child_count"],
     )

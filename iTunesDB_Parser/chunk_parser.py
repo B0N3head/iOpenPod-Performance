@@ -13,6 +13,11 @@ then dispatches to the appropriate ``mh*_parser`` module.
 Every parser returns::
 
     {"next_offset": int, "data": dict | list}
+
+Child-iteration helpers (:func:`parse_children`, :func:`parse_child_list`)
+also live here so that the recursive ``parse_chunk → parser → parse_children
+→ parse_chunk`` loop stays within one module, eliminating the circular import
+that previously existed between ``_parsing`` and ``chunk_parser``.
 """
 
 from __future__ import annotations
@@ -20,9 +25,53 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._parsing import read_generic_header
+from ._parsing import ParseResult, read_generic_header
 
 logger = logging.getLogger(__name__)
+
+
+# ── Child-iteration helpers ──────────────────────────────────────────
+
+
+def parse_children(
+    data: bytes | bytearray,
+    offset: int,
+    child_count: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Parse *child_count* consecutive child chunks starting at *offset*.
+
+    Returns:
+        Tuple of ``(children_list, next_offset)`` where each child is
+        ``{"chunk_type": str, "data": <parsed>}``.
+    """
+    children: list[dict[str, Any]] = []
+    current = offset
+    for _ in range(child_count):
+        parsed, chunk_type = parse_chunk(data, current)
+        current = parsed["next_offset"]
+        children.append({"chunk_type": chunk_type, "data": parsed["data"]})
+    return children, current
+
+
+def _parse_child_list(
+    data: bytes | bytearray,
+    offset: int,
+    header_length: int,
+    child_count: int,
+) -> ParseResult:
+    """Parse a pure-list container (mhlt, mhla, mhli, mhlp).
+
+    These chunks consist solely of a thin header followed by *child_count*
+    sub-chunks with no additional header fields.
+
+    Returns:
+        ``{"next_offset": int, "data": list[...]}``
+    """
+    children, next_offset = parse_children(data, offset + header_length, child_count)
+    return {"next_offset": next_offset, "data": children}
+
+
+# ── Top-level dispatcher ────────────────────────────────────────────
 
 
 def parse_chunk(
@@ -48,15 +97,14 @@ def parse_chunk(
         case "mhsd":
             from .mhsd_parser import parse_dataset
             result = parse_dataset(data, offset, header_length, length_or_children)
-        case "mhlt":
-            from .mhlt_parser import parse_track_list
-            result = parse_track_list(data, offset, header_length, length_or_children)
+
+        # Pure-list containers — no dedicated parser needed.
+        case "mhlt" | "mhla" | "mhli" | "mhlp":
+            result = _parse_child_list(data, offset, header_length, length_or_children)
+
         case "mhit":
             from .mhit_parser import parse_track_item
             result = parse_track_item(data, offset, header_length, length_or_children)
-        case "mhlp":
-            from .mhlp_parser import parse_playlist_list
-            result = parse_playlist_list(data, offset, header_length, length_or_children)
         case "mhyp":
             from .mhyp_parser import parse_playlist
             result = parse_playlist(data, offset, header_length, length_or_children)
@@ -66,15 +114,9 @@ def parse_chunk(
         case "mhod":
             from .mhod_parser import parse_mhod
             result = parse_mhod(data, offset, header_length, length_or_children)
-        case "mhla":
-            from .mhla_parser import parse_album_list
-            result = parse_album_list(data, offset, header_length, length_or_children)
         case "mhia":
             from .mhia_parser import parse_album_item
             result = parse_album_item(data, offset, header_length, length_or_children)
-        case "mhli":
-            from .mhli_parser import parse_artist_list
-            result = parse_artist_list(data, offset, header_length, length_or_children)
         case "mhii":
             # NOTE: shares the 'mhii' magic with ArtworkDB image items,
             # but in iTunesDB context this is an artist item.
@@ -97,12 +139,5 @@ def parse_chunk(
                     "body": bytes(data[offset + header_length:offset + length_or_children]),
                 },
             }, chunk_type
-
-    # Attach raw header bytes for data-collection / analysis of
-    # uninspected regions.  Only for dict-shaped results (item/container
-    # chunks); list-shaped results (mhlt, mhlp, mhla, mhli) have
-    # trivial 12-byte headers already fully described by the generic header.
-    if isinstance(result.get("data"), dict):
-        result["data"]["_raw_header"] = bytes(data[offset:offset + header_length])
 
     return result, chunk_type

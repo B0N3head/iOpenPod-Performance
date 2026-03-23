@@ -3,13 +3,15 @@ Content-Addressable Backup Manager for iPod devices.
 
 Creates git-like snapshots of the ENTIRE iPod filesystem. Each snapshot is
 a manifest listing every file and its SHA-256 hash. Files are stored once
-by hash in a blob store — subsequent backups only store new/changed files.
+by hash in a **shared** blob store — identical files across different devices
+are stored only once, saving significant space for multi-iPod users.
 
 Storage layout on PC:
-    <backup_dir>/<device_id>/
-        blobs/<aa>/<aabbccddee...>      # Content-addressable files
-        snapshots/<timestamp>.json      # Manifest per backup
-        hashcache.json                  # Speed cache: (path,size,mtime) → hash
+    <backup_dir>/
+        blobs/<aa>/<aabbccddee...>      # Shared content-addressable files
+        <device_id>/
+            snapshots/<timestamp>.json  # Manifest per backup
+            hashcache.json              # Speed cache: (path,size,mtime) → hash
 
 Restore is a full wipe-and-replace: the iPod is returned to the exact state
 captured by the snapshot.
@@ -24,7 +26,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
@@ -36,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 def _resolve_default_backup_dir() -> str:
     try:
-        from settings import _default_data_dir
-        return os.path.join(_default_data_dir(), "backups")
+        from settings import default_data_dir
+        return os.path.join(default_data_dir(), "backups")
     except Exception:
         return os.path.join(os.path.expanduser("~"), "iOpenPod", "backups")
 
@@ -87,6 +89,8 @@ class SnapshotInfo:
     files_added: int = 0
     files_removed: int = 0
     files_changed: int = 0
+    # Device metadata (family, generation, color) for UI display
+    device_meta: dict = field(default_factory=dict)
 
     @property
     def display_date(self) -> str:
@@ -120,14 +124,19 @@ class BackupManager:
     """
 
     def __init__(self, device_id: str, backup_dir: str = "",
-                 device_name: str = "iPod"):
+                 device_name: str = "iPod",
+                 device_meta: dict | None = None):
         self.device_id = self._sanitize_id(device_id)
         self.device_name = device_name
+        self.device_meta = device_meta or {}
         self.backup_root = Path(backup_dir or _DEFAULT_BACKUP_DIR)
         self.device_dir = self.backup_root / self.device_id
-        self.blobs_dir = self.device_dir / "blobs"
+        self.blobs_dir = self.backup_root / "blobs"  # Shared across devices
         self.snapshots_dir = self.device_dir / "snapshots"
         self.hashcache_path = self.device_dir / "hashcache.json"
+
+        # One-time migration: move per-device blobs to the shared store
+        self._migrate_device_blobs()
 
     @staticmethod
     def _sanitize_id(device_id: str) -> str:
@@ -332,11 +341,12 @@ class BackupManager:
             manifest_path = self.snapshots_dir / f"{timestamp}.json"
 
         manifest = {
-            "version": 1,
+            "version": 2,
             "id": timestamp,
             "timestamp": now.isoformat(),
             "device_id": self.device_id,
             "device_name": self.device_name,
+            "device_meta": self.device_meta,
             "file_count": len(manifest_files),
             "total_size": total_size,
             "files": manifest_files,
@@ -790,6 +800,7 @@ class BackupManager:
                 device_name=data.get("device_name", "iPod"),
                 file_count=data.get("file_count", 0),
                 total_size=data.get("total_size", 0),
+                device_meta=data.get("device_meta", {}),
             )
 
             # Delta: compare *previous* SnapshotInfo (newer) against this one
@@ -831,16 +842,45 @@ class BackupManager:
         return True
 
     def get_backup_size(self) -> int:
-        """Get total size of all backup data (blobs + manifests) in bytes."""
+        """Get total size of this device's backup data.
+
+        Counts manifest/cache files directly, plus the size of all blobs
+        referenced by this device's snapshots (shared blobs counted in full
+        since they are required for restore).
+        """
         if not self.device_dir.exists():
             return 0
+
         total = 0
+        # Manifests + hash cache
         for root, _dirs, files in os.walk(self.device_dir):
             for f in files:
                 try:
                     total += os.path.getsize(os.path.join(root, f))
                 except OSError:
                     pass
+
+        # Referenced blobs
+        referenced: set[str] = set()
+        if self.snapshots_dir.exists():
+            for mf in self.snapshots_dir.glob("*.json"):
+                try:
+                    with open(mf, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                for file_info in data.get("files", {}).values():
+                    h = file_info.get("hash")
+                    if h:
+                        referenced.add(h)
+
+        for h in referenced:
+            bp = self._blob_path(h)
+            try:
+                total += bp.stat().st_size
+            except OSError:
+                pass
+
         return total
 
     def has_snapshots(self) -> bool:
@@ -854,7 +894,8 @@ class BackupManager:
         """List all devices that have backups, without requiring a connected device.
 
         Returns a list of dicts:
-            [{"device_id": str, "device_name": str, "snapshot_count": int}]
+            [{"device_id": str, "device_name": str, "snapshot_count": int,
+              "device_meta": dict}]
         """
         root = Path(backup_dir or _DEFAULT_BACKUP_DIR)
         if not root.exists():
@@ -864,6 +905,9 @@ class BackupManager:
         for child in sorted(root.iterdir()):
             if not child.is_dir():
                 continue
+            # Skip the shared blobs directory
+            if child.name == "blobs":
+                continue
             snap_dir = child / "snapshots"
             if not snap_dir.is_dir():
                 continue
@@ -871,12 +915,14 @@ class BackupManager:
             if not manifests:
                 continue
 
-            # Read device_name from the latest manifest
+            # Read device_name and device_meta from the latest manifest
             device_name = child.name
+            device_meta: dict = {}
             try:
                 with open(manifests[0], "r", encoding="utf-8") as f:
                     data = json.load(f)
                 device_name = data.get("device_name", child.name)
+                device_meta = data.get("device_meta", {})
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
 
@@ -884,6 +930,7 @@ class BackupManager:
                 "device_id": child.name,
                 "device_name": device_name,
                 "snapshot_count": len(manifests),
+                "device_meta": device_meta,
             })
 
         return devices
@@ -1027,23 +1074,87 @@ class BackupManager:
             except OSError:
                 pass
 
+    def _migrate_device_blobs(self):
+        """One-time migration: move per-device blobs to the shared store.
+
+        Old layout had blobs at <device_dir>/blobs/. If that directory exists,
+        move all blobs to <backup_root>/blobs/ and remove the old directory.
+        """
+        old_blobs = self.device_dir / "blobs"
+        if not old_blobs.exists() or not old_blobs.is_dir():
+            return
+
+        # Ensure shared blobs dir exists
+        self.blobs_dir.mkdir(parents=True, exist_ok=True)
+        migrated = 0
+
+        for prefix_dir in old_blobs.iterdir():
+            if not prefix_dir.is_dir():
+                continue
+            dest_prefix = self.blobs_dir / prefix_dir.name
+            dest_prefix.mkdir(parents=True, exist_ok=True)
+            for blob_file in prefix_dir.iterdir():
+                dest = dest_prefix / blob_file.name
+                if dest.exists():
+                    # Already in shared store (e.g. another device had it)
+                    try:
+                        blob_file.unlink()
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.replace(str(blob_file), str(dest))
+                        migrated += 1
+                    except OSError:
+                        # Cross-device move: copy + delete
+                        try:
+                            shutil.copy2(str(blob_file), str(dest))
+                            blob_file.unlink()
+                            migrated += 1
+                        except OSError as e:
+                            logger.warning(f"Blob migration failed for {blob_file.name}: {e}")
+            # Remove empty prefix dir
+            try:
+                prefix_dir.rmdir()
+            except OSError:
+                pass
+
+        # Remove old blobs directory
+        try:
+            old_blobs.rmdir()
+        except OSError:
+            pass
+
+        if migrated:
+            logger.info(f"Migrated {migrated} blobs from {self.device_id}/blobs/ to shared store")
+
     def _gc_blobs(self):
-        """Garbage-collect blobs not referenced by any remaining snapshot."""
+        """Garbage-collect blobs not referenced by any device's snapshots.
+
+        Since the blob store is shared across all devices, we must scan
+        every device's manifests before deciding a blob is unreferenced.
+        """
         if not self.blobs_dir.exists():
             return
 
-        # Build set of all referenced hashes
+        # Build set of all referenced hashes across ALL devices
         referenced: set[str] = set()
-        for mf in self.snapshots_dir.glob("*.json"):
-            try:
-                with open(mf, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        for device_dir in self.backup_root.iterdir():
+            if not device_dir.is_dir() or device_dir.name == "blobs":
                 continue
-            for file_info in data.get("files", {}).values():
-                h = file_info.get("hash")
-                if h:
-                    referenced.add(h)
+            snap_dir = device_dir / "snapshots"
+            if not snap_dir.is_dir():
+                continue
+            for mf in snap_dir.glob("*.json"):
+                try:
+                    with open(mf, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                for file_info in data.get("files", {}).values():
+                    h = file_info.get("hash")
+                    if h:
+                        referenced.add(h)
 
         # Walk blobs and delete unreferenced ones
         removed = 0

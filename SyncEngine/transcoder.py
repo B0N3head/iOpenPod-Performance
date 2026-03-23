@@ -13,6 +13,12 @@ iPod hardware limits enforced on every output:
   Bit depth    ≤ 16-bit   (ALAC only — AAC/MP3 are inherently ≤16-bit)
 """
 
+from ._formats import (
+    IPOD_NATIVE_FORMATS,
+    NON_NATIVE_LOSSLESS as _NON_NATIVE_LOSSLESS_EXTS,
+    NON_NATIVE_LOSSY as _NON_NATIVE_LOSSY_EXTS,
+    NON_NATIVE_VIDEO as _NON_NATIVE_VIDEO_EXTS,
+)
 import json as _json
 import logging
 import shutil
@@ -51,13 +57,6 @@ class TranscodeTarget(Enum):
     AAC = "aac"
     VIDEO_H264 = "video_h264"
     COPY = "copy"
-
-
-# Extension sets — used by the target-resolution logic
-_NON_NATIVE_LOSSLESS_EXTS = frozenset({".flac", ".wav", ".aif", ".aiff"})
-_NON_NATIVE_LOSSY_EXTS = frozenset({".ogg", ".opus", ".wma"})
-_NON_NATIVE_VIDEO_EXTS = frozenset({".mov", ".mkv", ".avi"})
-IPOD_NATIVE_FORMATS = frozenset({".mp3", ".mp4", ".aac", ".m4a", ".m4b", ".m4p", ".m4v"})
 
 
 _OUTPUT_EXT: dict[TranscodeTarget, str] = {
@@ -622,6 +621,7 @@ def _cmd_video(
         "-ar", str(IPOD_MAX_SAMPLE_RATE),
         "-b:a", "160k",
         "-movflags", "+faststart",
+        "-f", "ipod",
         "-y", dst,
     ]
 

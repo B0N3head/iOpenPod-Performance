@@ -256,8 +256,8 @@ def write_mhit(track: TrackInfo, track_id: int, db_id_2: int = 0,
     if track.date_added == 0:
         track.date_added = int(time.time())
 
-    filetype_code = FILETYPE_CODES.get(track.filetype.lower(), FILETYPE_CODES['mp3'])
     ft = track.filetype.lower()
+    filetype_code = FILETYPE_CODES.get(ft, FILETYPE_CODES['mp3'])
     media_type = _resolve_media_type(track, capabilities)
     has_lyrics = track.has_lyrics or bool(track.lyrics)
 

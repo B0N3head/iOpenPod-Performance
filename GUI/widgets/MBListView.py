@@ -496,6 +496,135 @@ class MusicBrowserList(QFrame):
         self._columns = value
 
     # -------------------------------------------------------------------------
+    # Playlist reorder helpers
+    # -------------------------------------------------------------------------
+
+    def _is_reorderable_playlist(self) -> bool:
+        """True when showing a regular playlist with manual sort order."""
+        if not self._is_playlist_mode or not self._current_playlist:
+            return False
+        pl = self._current_playlist
+        if pl.get("master_flag"):
+            return False
+        if pl.get("smart_playlist_data") or pl.get("_source") in ("smart", "podcast"):
+            return False
+        if pl.get("podcast_flag", 0) == 1:
+            return False
+        # Only allow manual reorder when sort_order is Manual (1) or Default (0)
+        sort_order = pl.get("sort_order", 0)
+        if sort_order not in (0, 1):
+            return False
+        return True
+
+    def _move_selected_rows(self, direction: int) -> None:
+        """Move selected rows up (-1) or down (+1) within a reorderable playlist.
+
+        Swaps table cells in-place (no full repopulate), updates ``_tracks``
+        and the playlist items list, then schedules a debounced quick sync.
+        """
+        if not self._is_reorderable_playlist():
+            return
+
+        selected_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        if not selected_rows:
+            return
+
+        n = self.table.rowCount()
+        if direction < 0 and selected_rows[0] <= 0:
+            return  # already at top
+        if direction > 0 and selected_rows[-1] >= n - 1:
+            return  # already at bottom
+
+        # Process in the right order so swaps don't collide
+        if direction < 0:
+            for row in selected_rows:
+                self._swap_adjacent_rows(row, row - 1)
+        else:
+            for row in reversed(selected_rows):
+                self._swap_adjacent_rows(row, row + 1)
+
+        # Update selection to follow the moved rows
+        new_rows = [r + direction for r in selected_rows]
+        self.table.clearSelection()
+        for r in new_rows:
+            if 0 <= r < n:
+                self.table.selectRow(r)
+
+        self._commit_playlist_reorder()
+
+    def _swap_adjacent_rows(self, row_a: int, row_b: int) -> None:
+        """Swap two adjacent rows in both the table widget and _tracks list."""
+        n = len(self._tracks)
+        if not (0 <= row_a < n and 0 <= row_b < n):
+            return
+
+        # Swap in _tracks
+        self._tracks[row_a], self._tracks[row_b] = self._tracks[row_b], self._tracks[row_a]
+
+        # Swap every cell in the table
+        col_count = self.table.columnCount()
+        for col in range(col_count):
+            item_a = self.table.takeItem(row_a, col)
+            item_b = self.table.takeItem(row_b, col)
+            if item_a:
+                self.table.setItem(row_b, col, item_a)
+            if item_b:
+                self.table.setItem(row_a, col, item_b)
+
+        # Swap row heights (matters when artwork column is shown)
+        ha = self.table.rowHeight(row_a)
+        hb = self.table.rowHeight(row_b)
+        if ha != hb:
+            self.table.setRowHeight(row_a, hb)
+            self.table.setRowHeight(row_b, ha)
+
+        # Update _pl_pos cells and original-index anchors
+        first_data_col = 1 if self._show_art else 0
+        pl_pos_col = self._pl_pos_column()
+        for row in (row_a, row_b):
+            if pl_pos_col >= 0:
+                cell = self.table.item(row, pl_pos_col)
+                if cell:
+                    cell.setText(str(row + 1))
+                    cell.setData(Qt.ItemDataRole.UserRole, row + 1)
+            anchor = self.table.item(row, first_data_col)
+            if anchor:
+                anchor.setData(Qt.ItemDataRole.UserRole + 1, row)
+
+    def _pl_pos_column(self) -> int:
+        """Return the visual column index of _pl_pos, or -1 if absent."""
+        col_offset = 1 if self._show_art else 0
+        for i, key in enumerate(self._columns):
+            if key == "_pl_pos":
+                return i + col_offset
+        return -1
+
+    def _commit_playlist_reorder(self) -> None:
+        """Persist the current _tracks order into the playlist and schedule sync."""
+        playlist = self._current_playlist
+        if not playlist:
+            return
+
+        old_items = playlist.get("items", [])
+        tid_to_item: dict[int, dict] = {}
+        for item in old_items:
+            tid = item.get("track_id", 0)
+            if tid:
+                tid_to_item[tid] = item
+
+        playlist["items"] = [
+            tid_to_item.get(t.get("track_id", 0), {"track_id": t.get("track_id")})
+            for t in self._tracks
+            if t.get("track_id") is not None
+        ]
+        playlist.setdefault("_source", "regular")
+
+        from ..app import iTunesDBCache
+        cache = iTunesDBCache.get_instance()
+        cache.save_user_playlist(playlist)
+        cache.playlist_quick_sync.emit()
+
+    # -------------------------------------------------------------------------
     # Table Setup
     # -------------------------------------------------------------------------
 
@@ -630,7 +759,7 @@ class MusicBrowserList(QFrame):
 
     def filterByPlaylist(self, track_ids: list[int], track_id_index: dict[int, dict],
                          playlist: dict | None = None) -> None:
-        """Show tracks belonging to a playlist, in playlist order.
+        """Show tracks belonging to a playlist, sorted by its sort_order.
 
         Args:
             track_ids: Ordered list of trackIDs from MHIP items.
@@ -646,6 +775,14 @@ class MusicBrowserList(QFrame):
             track = track_id_index.get(tid)
             if track:
                 self._tracks.append(track)
+
+        # Apply sort order (Manual / Default leave the list as-is)
+        if playlist:
+            sort_order = playlist.get("sort_order", 0)
+            if sort_order not in (0, 1):
+                from SyncEngine._playlist_builder import sort_tracks_by_order
+                self._tracks = sort_tracks_by_order(self._tracks, sort_order)
+
         self._setup_columns()
         self._populate_table()
 
@@ -756,7 +893,7 @@ class MusicBrowserList(QFrame):
                 self._save_user_widths()
 
             # Check artwork setting
-            from ..settings import get_settings
+            from settings import get_settings
             self._show_art = get_settings().show_art_in_tracklist
 
             # Capture state for this load
@@ -914,7 +1051,8 @@ class MusicBrowserList(QFrame):
     def _finish_population(self) -> None:
         """Complete table population - enable sorting, apply column widths, load art."""
         try:
-            self.table.setSortingEnabled(True)
+            # Reorderable playlists: keep sorting OFF so rows stay in manual order
+            self.table.setSortingEnabled(not self._is_reorderable_playlist())
 
             # Defensively re-hide vertical header (row numbers) — Qt can
             # re-show it after setSortingEnabled / insertRow cycles.
@@ -1552,6 +1690,19 @@ class MusicBrowserList(QFrame):
             if remove_act:
                 remove_act.triggered.connect(self._remove_selected_from_playlist)
 
+        # ── "Move Up / Move Down" (reorderable playlists only) ──
+        if self._is_reorderable_playlist():
+            selected_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+            menu.addSeparator()
+            up_act = menu.addAction("Move Up\tCtrl+\u2191")
+            if up_act:
+                up_act.setEnabled(bool(selected_rows) and selected_rows[0] > 0)
+                up_act.triggered.connect(lambda: self._move_selected_rows(-1))
+            down_act = menu.addAction("Move Down\tCtrl+\u2193")
+            if down_act:
+                down_act.setEnabled(bool(selected_rows) and selected_rows[-1] < self.table.rowCount() - 1)
+                down_act.triggered.connect(lambda: self._move_selected_rows(1))
+
         # ── Track Flags ──
         menu.addSeparator()
         self._build_flag_menu(menu, menu_style, selected, cache)
@@ -1904,6 +2055,7 @@ class MusicBrowserList(QFrame):
         playlist.setdefault("_source", "regular")
 
         cache.save_user_playlist(playlist)
+        cache.playlist_quick_sync.emit()
 
         title = playlist.get("Title", "Untitled")
         log.info("Added %d track(s) to playlist '%s' (id=0x%X)",
@@ -1936,6 +2088,7 @@ class MusicBrowserList(QFrame):
         playlist["items"] = new_items
         playlist.setdefault("_source", "regular")
         cache.save_user_playlist(playlist)
+        cache.playlist_quick_sync.emit()
 
         # Refresh the displayed track list
         track_id_index = cache.get_track_id_index()
@@ -1960,10 +2113,17 @@ class MusicBrowserList(QFrame):
     # -------------------------------------------------------------------------
 
     def keyPressEvent(self, a0: QKeyEvent | None) -> None:
-        """Handle keyboard shortcuts (Ctrl+C to copy selected rows)."""
-        if a0 and a0.key() == Qt.Key.Key_C and a0.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self._copy_selection()
-            return
+        """Handle keyboard shortcuts."""
+        if a0 and a0.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if a0.key() == Qt.Key.Key_C:
+                self._copy_selection()
+                return
+            if a0.key() == Qt.Key.Key_Up:
+                self._move_selected_rows(-1)
+                return
+            if a0.key() == Qt.Key.Key_Down:
+                self._move_selected_rows(1)
+                return
         super().keyPressEvent(a0)
 
     def _copy_selection(self) -> None:

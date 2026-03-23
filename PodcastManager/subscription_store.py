@@ -179,6 +179,6 @@ class SubscriptionStore:
         except Exception:
             base = ""
         if not base:
-            from settings import _default_cache_dir
-            base = _default_cache_dir()
+            from settings import default_cache_dir
+            base = default_cache_dir()
         return os.path.join(base, "podcasts", url_hash)

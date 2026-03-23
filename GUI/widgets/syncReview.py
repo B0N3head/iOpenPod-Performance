@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QFrame, QStackedWidget, QMessageBox,
-    QFileDialog, QDialog, QScrollArea, QCheckBox,
+    QFileDialog, QDialog, QCheckBox,
 )
 from PyQt6.QtGui import QFont, QColor, QPainter
 from pathlib import Path
@@ -110,7 +110,7 @@ class SyncExecuteWorker(QThread):
         try:
             from SyncEngine.sync_executor import SyncExecutor, SyncProgress
             from SyncEngine.mapping import MappingManager
-            from ..settings import get_settings
+            from settings import get_settings
 
             settings = get_settings()
 
@@ -130,10 +130,21 @@ class SyncExecuteWorker(QThread):
                     )
                     device_name = get_device_display_name(device.discovered_ipod)
 
+                    ipod = device.discovered_ipod
+                    device_meta = {}
+                    if ipod:
+                        device_meta = {
+                            "family": getattr(ipod, "model_family", ""),
+                            "generation": getattr(ipod, "generation", ""),
+                            "color": getattr(ipod, "color", ""),
+                            "display_name": getattr(ipod, "display_name", ""),
+                        }
+
                     manager = BackupManager(
                         device_id=device_id,
                         backup_dir=settings.backup_dir,
                         device_name=device_name,
+                        device_meta=device_meta,
                     )
 
                     def on_backup_progress(prog):
@@ -203,6 +214,40 @@ class SyncExecuteWorker(QThread):
             )
 
             self.finished.emit(result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
+class QuickPlaylistSyncWorker(QThread):
+    """Background worker for instant playlist-only database rewrite."""
+    progress = pyqtSignal(str)   # status message
+    completed = pyqtSignal(object)  # SyncResult
+    error = pyqtSignal(str)
+
+    def __init__(self, ipod_path: str, user_playlists: list[dict],
+                 on_complete: Callable[[], None] | None = None):
+        super().__init__()
+        self.ipod_path = ipod_path
+        self.user_playlists = user_playlists
+        self.on_complete = on_complete
+
+    def run(self):
+        try:
+            from SyncEngine.sync_executor import SyncExecutor, SyncProgress
+
+            executor = SyncExecutor(self.ipod_path)
+
+            def on_progress(prog: SyncProgress):
+                self.progress.emit(prog.message)
+
+            result = executor.quick_write_playlists(
+                user_playlists=self.user_playlists,
+                progress_callback=on_progress,
+                on_complete=self.on_complete,
+            )
+            self.completed.emit(result)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1733,7 +1778,7 @@ class SyncReviewWidget(QWidget):
                 "average": "Ratings are averaged",
             }
             try:
-                from ..settings import get_settings
+                from settings import get_settings
                 strat = get_settings().rating_conflict_strategy
             except Exception:
                 strat = "ipod_wins"
@@ -2294,7 +2339,7 @@ class SyncReviewWidget(QWidget):
             if pl_remove:
                 msg_parts.append(f"Remove {pl_remove} playlists")
 
-        if has_integrity_fixes:
+        if has_integrity_fixes and self._plan:
             n = len(self._plan._integrity_removals)
             msg_parts.append(f"Clean {n} ghost tracks (missing files) from database")
 
@@ -2365,7 +2410,7 @@ class SyncReviewWidget(QWidget):
             return
 
         # Decide backup strategy based on setting
-        from ..settings import get_settings
+        from settings import get_settings
         settings = get_settings()
 
         self._pending_sync_items = selected_items

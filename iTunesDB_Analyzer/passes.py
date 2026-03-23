@@ -20,13 +20,13 @@ from typing import Optional
 from .field_schema import FieldStatus, fields_for_chunk
 from .hypothesis_db import HypothesisDB
 from .models import ParsedDatabase, ValueObservation
+from iTunesDB_Shared.field_base import MAC_EPOCH_OFFSET as _MAC_EPOCH_OFFSET
 
 logger = logging.getLogger(__name__)
 
 # HFS+ timestamp range for sanity checks (~2001-01-01 to ~2030-01-01).
 _MAC_TS_MIN = 3_061_152_000   # 2001-01-01
 _MAC_TS_MAX = 3_976_300_800   # 2030-01-01
-_MAC_EPOCH_OFFSET = 2_082_844_800
 
 
 def run_all(dbs: list[ParsedDatabase], hdb: HypothesisDB) -> None:

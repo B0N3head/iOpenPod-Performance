@@ -12,7 +12,8 @@ from __future__ import annotations
 from typing import Any
 
 import iTunesDB_Shared as idb
-from ._parsing import ParseResult, parse_children
+from ._parsing import ParseResult
+from .chunk_parser import parse_children
 
 
 def parse_dataset(

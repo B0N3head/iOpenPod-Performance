@@ -37,10 +37,8 @@ from iTunesDB_Shared.field_base import (
     write_generic_header,
 )
 from iTunesDB_Shared.mhii_defs import MHII_HEADER_SIZE
+from iTunesDB_Shared.constants import MHOD_TYPE_ARTIST_NAME
 from .mhod_writer import write_mhod_string
-
-# MHOD type for artist name on artist items (from libgpod: MHOD_ID_ALBUM_ARTIST_MHII = 300)
-MHOD_TYPE_ARTIST_NAME = 300
 
 
 def write_mhii_artist(artist_id: int, artist_name: str) -> bytes:

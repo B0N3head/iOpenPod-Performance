@@ -20,6 +20,7 @@ Usage:
 """
 
 import os
+import random
 import shutil
 import time
 import logging
@@ -103,11 +104,7 @@ def write_sqlite_databases(
 
     # Generate db_pid if not provided
     if not db_pid:
-        import random
         db_pid = random.getrandbits(64)
-
-    # Master playlist PID = db_pid (matches libgpod convention)
-    master_pid = db_pid
 
     # Backup existing databases
     if backup:
@@ -126,7 +123,7 @@ def write_sqlite_databases(
         try:
             # 1. Library.itdb (tracks, albums, artists, playlists, …)
             lib_path = os.path.join(tmp_dir, "Library.itdb")
-            write_library_itdb(
+            playlist_pids = write_library_itdb(
                 path=lib_path,
                 tracks=tracks,
                 playlists=playlists,
@@ -149,9 +146,7 @@ def write_sqlite_databases(
             write_dynamic_itdb(
                 path=dyn_path,
                 tracks=tracks,
-                playlists=playlists,
-                smart_playlists=smart_playlists,
-                master_pid=master_pid,
+                playlist_pids=playlist_pids,
                 tz_offset=tz_offset,
             )
 

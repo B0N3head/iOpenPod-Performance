@@ -40,6 +40,7 @@ _ICON_REGULAR = "annotation-dots"
 _ICON_SMART = "filter"
 _ICON_PODCAST = "broadcast"
 _ICON_MASTER = "home"
+_ICON_CATEGORY = "grid"
 
 
 # =============================================================================
@@ -179,6 +180,7 @@ class PlaylistInfoCard(QFrame):
         is_master = bool(playlist.get("master_flag"))
         is_smart = bool(playlist.get("smart_playlist_data"))
         is_podcast = playlist.get("podcast_flag", 0) == 1
+        is_category = playlist.get("_source") == "smart"
         source = playlist.get("_source", "regular")
 
         # ── Title ──
@@ -187,6 +189,8 @@ class PlaylistInfoCard(QFrame):
         # ── Type badge ──
         if is_master:
             self.type_label.setText("Master Library Playlist")
+        elif is_category:
+            self.type_label.setText("iPod Browsing Playlist")
         elif is_smart:
             self.type_label.setText("Smart Playlist")
         elif is_podcast or source == "podcast":
@@ -194,14 +198,13 @@ class PlaylistInfoCard(QFrame):
         else:
             self.type_label.setText("Playlist")
 
-        # Show edit button for user-created playlists (smart or regular, not iPod browsing-category ones)
-        editable = not is_master and source != "smart" and not is_podcast
+        # Edit/delete: allowed for user playlists, blocked for master/category/podcast
+        editable = not is_master and not is_category and not is_podcast
         self.edit_btn.setVisible(editable)
-        # Delete button for user-deletable playlists (not master, not iPod browsing-category)
-        deletable = not is_master and source != "smart"
+        deletable = not is_master and not is_category
         self.delete_btn.setVisible(deletable)
-        # Show evaluate button for any smart playlist (except master)
-        self.evaluate_btn.setVisible(is_smart and not is_master)
+        # Show evaluate button for any smart playlist (except master and categories)
+        self.evaluate_btn.setVisible(is_smart and not is_master and not is_category)
         self._current_playlist = playlist
 
         self._populate_stats(playlist, resolved_tracks, source)
@@ -489,13 +492,17 @@ class PlaylistListPanel(QFrame):
         # Categorize
         regular: list[dict] = []
         smart: list[dict] = []
+        category: list[dict] = []
         podcast: list[dict] = []
         master: dict | None = None
 
         for pl in playlists:
             if pl.get("master_flag"):
                 master = pl
-            elif pl.get("smart_playlist_data") or pl.get("_source") == "smart":
+            elif pl.get("_source") == "smart":
+                # All dataset 5 playlists are iPod browsing categories
+                category.append(pl)
+            elif pl.get("smart_playlist_data"):
                 smart.append(pl)
             elif pl.get("podcast_flag", 0) == 1 or pl.get("_source") == "podcast":
                 podcast.append(pl)
@@ -512,6 +519,11 @@ class PlaylistListPanel(QFrame):
             self._add_section("SMART PLAYLISTS")
             for pl in smart:
                 self._add_playlist_button(pl, _ICON_SMART)
+
+        if category:
+            self._add_section("iPod CATEGORIES")
+            for pl in category:
+                self._add_playlist_button(pl, _ICON_CATEGORY, dimmed=True)
 
         if podcast:
             self._add_section("PODCASTS")
@@ -1298,10 +1310,6 @@ class _PlaylistDeleteWorker(QThread):
                 write_back_to_pc=False,
                 _is_cancelled=None,
             )
-            ctx.existing_tracks_data = existing_tracks_data
-            ctx.existing_playlists_raw = existing_playlists_raw
-            ctx.existing_smart_raw = existing_smart_raw
-
             # Remove the target playlist from the raw lists
             existing_playlists_raw = [
                 p for p in existing_playlists_raw
@@ -1311,6 +1319,10 @@ class _PlaylistDeleteWorker(QThread):
                 p for p in existing_smart_raw
                 if p.get("playlist_id") != target_pid
             ]
+
+            ctx.existing_tracks_data = existing_tracks_data
+            ctx.existing_playlists_raw = existing_playlists_raw
+            ctx.existing_smart_raw = existing_smart_raw
 
             # Convert tracks to TrackInfo objects
             all_tracks = []

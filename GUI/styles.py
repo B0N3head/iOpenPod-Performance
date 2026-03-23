@@ -593,6 +593,26 @@ class Metrics:
     FONT_ICON_LG = 40   # Grid item placeholder glyphs
     FONT_ICON_XL = 48   # Empty-state decorative glyphs
 
+    # Base values (100%) — used by apply_font_scale to recompute
+    _FONT_BASES = {
+        "FONT_XS": 8, "FONT_SM": 9, "FONT_MD": 10, "FONT_LG": 11,
+        "FONT_XL": 12, "FONT_XXL": 13, "FONT_TITLE": 14,
+        "FONT_PAGE_TITLE": 16, "FONT_HERO": 18,
+        "FONT_ICON_SM": 15, "FONT_ICON_MD": 22,
+        "FONT_ICON_LG": 40, "FONT_ICON_XL": 48,
+    }
+
+    @classmethod
+    def apply_font_scale(cls, scale_label: str = "100%") -> None:
+        """Scale all FONT_* attributes by the given percentage label."""
+        try:
+            factor = int(scale_label.replace("%", "")) / 100.0
+        except (ValueError, AttributeError):
+            factor = 1.0
+        factor = max(0.5, min(factor, 2.0))
+        for attr, base in cls._FONT_BASES.items():
+            setattr(cls, attr, max(6, round(base * factor)))
+
 
 # ── Custom proxy style for scrollbar painting ───────────────────────────────
 

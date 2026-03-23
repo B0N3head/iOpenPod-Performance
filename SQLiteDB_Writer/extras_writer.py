@@ -6,19 +6,12 @@ inserted if available.
 Reference: libgpod itdb_sqlite.c mk_Extras()
 """
 
-import sqlite3
 import logging
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
+from ._helpers import s64 as _s64, open_db
 
 logger = logging.getLogger(__name__)
-
-
-def _s64(val: int) -> int:
-    """Convert unsigned 64-bit int to signed for SQLite INTEGER storage."""
-    if val >= (1 << 63):
-        return val - (1 << 64)
-    return val
 
 
 _EXTRAS_SCHEMA = """
@@ -47,14 +40,7 @@ def write_extras_itdb(
         path: Output file path.
         tracks: List of TrackInfo objects.
     """
-    import os
-    if os.path.exists(path):
-        os.remove(path)
-
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    cur = conn.cursor()
+    conn, cur = open_db(path)
 
     cur.executescript(_EXTRAS_SCHEMA)
 

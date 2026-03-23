@@ -147,7 +147,7 @@ def episode_to_pc_track(
         url_path = episode.audio_url.split("?")[0]
         ext = Path(url_path).suffix.lower()
         if ext not in (".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".opus",
-                        ".flac", ".wav", ".wma"):
+                       ".flac", ".wav", ".wma"):
             ext = ".mp3"  # safe default
     else:
         ext = ".mp3"

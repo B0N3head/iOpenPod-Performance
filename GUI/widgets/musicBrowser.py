@@ -81,7 +81,7 @@ class MusicBrowser(QFrame):
 
         # Set initial sizes (60% grid, 40% tracks) or restore from settings
         try:
-            from ..settings import get_settings
+            from settings import get_settings
             saved = get_settings().splitter_sizes
             if isinstance(saved, list) and len(saved) == 2:
                 self.gridTrackSplitter.setSizes([int(saved[0]), int(saved[1])])
@@ -118,7 +118,7 @@ class MusicBrowser(QFrame):
     def _save_splitter_sizes(self):
         """Persist the current splitter sizes to settings."""
         try:
-            from ..settings import get_settings
+            from settings import get_settings
             s = get_settings()
             s.splitter_sizes = list(self.gridTrackSplitter.sizes())
             s.save()

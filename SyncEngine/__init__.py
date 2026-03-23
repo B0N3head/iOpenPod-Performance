@@ -43,8 +43,8 @@ from .transcoder import (
     is_ffmpeg_available,
     TranscodeTarget,
     TranscodeResult,
-    IPOD_NATIVE_FORMATS,
 )
+from ._formats import IPOD_NATIVE_FORMATS
 from .transcode_cache import TranscodeCache, CachedFile, CacheIndex
 from .backup_manager import BackupManager, SnapshotInfo, BackupProgress, get_device_identifier, get_device_display_name
 from .eta import ETATracker

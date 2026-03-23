@@ -37,13 +37,15 @@ class BackupWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, ipod_path: str, device_id: str, device_name: str,
-                 backup_dir: str, max_backups: int):
+                 backup_dir: str, max_backups: int,
+                 device_meta: dict | None = None):
         super().__init__()
         self.ipod_path = ipod_path
         self.device_id = device_id
         self.device_name = device_name
         self.backup_dir = backup_dir
         self.max_backups = max_backups
+        self.device_meta = device_meta or {}
 
     def run(self):
         try:
@@ -53,6 +55,7 @@ class BackupWorker(QThread):
                 device_id=self.device_id,
                 backup_dir=self.backup_dir,
                 device_name=self.device_name,
+                device_meta=self.device_meta,
             )
 
             def on_progress(prog):
@@ -145,11 +148,28 @@ class DeviceCard(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins((16), (16), (16), (16))
         layout.setSpacing((12))
-        # Icon TODO: replace with device photo if available (like in device picker), encode icon name into the backup folder name so we can show it here without needing to scan the device first
-        icon = QLabel("\U0001F4F1")
-        icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_MD))
+
+        # Device photo from manifest metadata, or fallback emoji
+        meta = device_info.get("device_meta", {})
+        icon = QLabel()
         icon.setStyleSheet("background: transparent; border: none;")
-        icon.setFixedWidth((36))
+        icon.setFixedWidth((48))
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        if meta.get("family") and meta.get("generation"):
+            from ..ipod_images import get_ipod_image
+            pixmap = get_ipod_image(
+                meta["family"], meta["generation"],
+                size=(44), color=meta.get("color", ""),
+            )
+            if not pixmap.isNull():
+                icon.setPixmap(pixmap)
+            else:
+                icon.setText("\U0001F4F1")
+                icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_MD))
+        else:
+            icon.setText("\U0001F4F1")
+            icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_MD))
         layout.addWidget(icon)
 
         # Info column
@@ -160,6 +180,14 @@ class DeviceCard(QFrame):
         name.setFont(QFont(FONT_FAMILY, Metrics.FONT_XL, QFont.Weight.DemiBold))
         name.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
         info.addWidget(name)
+
+        # Model subtitle (e.g. "iPod Classic · 6th Gen")
+        model_display = meta.get("display_name", "")
+        if model_display and model_display != device_info["device_name"]:
+            model_lbl = QLabel(model_display)
+            model_lbl.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+            model_lbl.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent; border: none;")
+            info.addWidget(model_lbl)
 
         count = device_info["snapshot_count"]
         sub = QLabel(f"{count} backup{'s' if count != 1 else ''}")
@@ -556,7 +584,7 @@ class BackupBrowserWidget(QWidget):
           or the single device's snapshots, or the empty state.
         """
         from ..app import DeviceManager
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import BackupManager, get_device_identifier
 
         settings = get_settings()
@@ -604,7 +632,7 @@ class BackupBrowserWidget(QWidget):
 
         Resolves whether restore is allowed (connected device must match).
         """
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import BackupManager
 
         settings = get_settings()
@@ -688,7 +716,7 @@ class BackupBrowserWidget(QWidget):
 
     def _show_device_picker(self):
         """Show the multi-device picker page."""
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import BackupManager
 
         settings = get_settings()
@@ -738,7 +766,7 @@ class BackupBrowserWidget(QWidget):
 
     def _on_open_folder(self):
         """Open the backup directory in the OS file manager."""
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import _DEFAULT_BACKUP_DIR
 
         settings = get_settings()
@@ -787,7 +815,7 @@ class BackupBrowserWidget(QWidget):
             return
 
         from ..app import DeviceManager
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import get_device_identifier, get_device_display_name
 
         device = DeviceManager.get_instance()
@@ -798,6 +826,17 @@ class BackupBrowserWidget(QWidget):
         settings = get_settings()
         device_id = get_device_identifier(device.device_path, device.discovered_ipod)
         device_name = get_device_display_name(device.discovered_ipod)
+
+        # Collect device metadata for the manifest
+        device_meta: dict = {}
+        ipod = device.discovered_ipod
+        if ipod:
+            device_meta = {
+                "family": getattr(ipod, "model_family", ""),
+                "generation": getattr(ipod, "generation", ""),
+                "color": getattr(ipod, "color", ""),
+                "display_name": getattr(ipod, "display_name", ""),
+            }
 
         # Show progress page
         self._progress_title.setText("Scanning Device")
@@ -818,6 +857,7 @@ class BackupBrowserWidget(QWidget):
             device_name=device_name,
             backup_dir=settings.backup_dir,
             max_backups=settings.max_backups,
+            device_meta=device_meta,
         )
         self._backup_worker.progress.connect(self._on_backup_progress)
         self._backup_worker.finished.connect(self._on_backup_finished)
@@ -922,7 +962,7 @@ class BackupBrowserWidget(QWidget):
             return
 
         from ..app import DeviceManager
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import BackupManager, get_device_identifier
 
         device = DeviceManager.get_instance()
@@ -1081,7 +1121,7 @@ class BackupBrowserWidget(QWidget):
         if not self._current_device_id:
             return
 
-        from ..settings import get_settings
+        from settings import get_settings
         from SyncEngine.backup_manager import BackupManager
 
         settings = get_settings()

@@ -93,7 +93,7 @@ def _platform_asset_pattern() -> re.Pattern:
 
 def _current_version() -> str:
     """Get the running version string."""
-    from GUI.settings import get_version
+    from settings import get_version
     return get_version()
 
 

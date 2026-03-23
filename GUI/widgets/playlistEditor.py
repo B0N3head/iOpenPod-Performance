@@ -187,14 +187,11 @@ def _combo_css() -> str:
     }}
     QComboBox::drop-down {{
         border: none;
-        width: {(20)}px;
+        width: 0;
     }}
     QComboBox::down-arrow {{
         image: none;
-        border-left: {(4)}px solid transparent;
-        border-right: {(4)}px solid transparent;
-        border-top: {(5)}px solid {Colors.TEXT_SECONDARY};
-        margin-right: {(6)}px;
+        width: 0; height: 0;
     }}
     QComboBox QAbstractItemView {{
         background: {Colors.DROPDOWN_BG};
@@ -244,19 +241,8 @@ def _spinbox_css() -> str:
         border-color: {Colors.ACCENT};
     }}
     QSpinBox::up-button, QSpinBox::down-button {{
-        background: {Colors.SURFACE_HOVER};
+        width: 0;
         border: none;
-        width: {(16)}px;
-    }}
-    QSpinBox::up-arrow {{
-        border-left: {(3)}px solid transparent;
-        border-right: {(3)}px solid transparent;
-        border-bottom: {(4)}px solid {Colors.TEXT_SECONDARY};
-    }}
-    QSpinBox::down-arrow {{
-        border-left: {(3)}px solid transparent;
-        border-right: {(3)}px solid transparent;
-        border-top: {(4)}px solid {Colors.TEXT_SECONDARY};
     }}
 """
 
@@ -474,13 +460,16 @@ class SmartRuleRow(QFrame):
         elif ft == SPLFT_INT:
             spins_sb: list[QSpinBox] = self._find_widgets(QSpinBox)  # type: ignore[assignment]
             if spins_sb:
-                spins_sb[0].setValue(rule.get("from_value", 0))
+                v = rule.get("from_value", 0)
+                spins_sb[0].setValue(max(spins_sb[0].minimum(), min(v, spins_sb[0].maximum())))
             if len(spins_sb) > 1:
-                spins_sb[1].setValue(rule.get("to_value", 0))
+                v2 = rule.get("to_value", 0)
+                spins_sb[1].setValue(max(spins_sb[1].minimum(), min(v2, spins_sb[1].maximum())))
         elif ft == SPLFT_DATE:
             spin_sb: QSpinBox | None = self._find_widget(QSpinBox)  # type: ignore[assignment]
             if spin_sb:
-                spin_sb.setValue(abs(rule.get("from_value", 0) or rule.get("from_date", 0)))
+                raw = abs(rule.get("from_value", 0) or rule.get("from_date", 0))
+                spin_sb.setValue(min(raw, spin_sb.maximum()))
             unit_combo = self._find_value_combo()
             if unit_combo:
                 units = rule.get("from_units", 86400) or 86400

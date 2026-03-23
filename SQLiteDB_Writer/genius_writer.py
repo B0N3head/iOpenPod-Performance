@@ -6,8 +6,9 @@ features, but the database file must exist for the firmware.
 Reference: libgpod itdb_sqlite.c mk_Genius()
 """
 
-import sqlite3
 import logging
+
+from ._helpers import open_db
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,7 @@ def write_genius_itdb(path: str) -> None:
     Args:
         path: Output file path.
     """
-    import os
-    if os.path.exists(path):
-        os.remove(path)
-
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    cur = conn.cursor()
+    conn, cur = open_db(path)
 
     cur.executescript(_GENIUS_SCHEMA)
 

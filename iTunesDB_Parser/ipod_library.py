@@ -25,7 +25,6 @@ from iTunesDB_Shared.constants import (
     extract_mhod_strings,
     extract_playlist_extras,
     filetype_to_string,
-    sample_rate_to_hz,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,8 +60,8 @@ def load_ipod_library(itunesdb_path: str,
             _merge_play_counts(data, itunesdb_path)
 
         return data
-    except Exception as e:
-        logger.error("Error parsing iTunesDB: %s", e)
+    except Exception:
+        logger.error("Error parsing iTunesDB", exc_info=True)
         return None
 
 
@@ -77,10 +76,12 @@ def _inline_track_strings(data: dict) -> None:
         ft = track.get("filetype")
         if isinstance(ft, int) and ft > 0:
             track["filetype"] = filetype_to_string(ft)
-        # sample_rate 16.16 → Hz
-        sr = track.get("sample_rate_1")
-        if isinstance(sr, int) and sr > 65535:
-            track["sample_rate_1"] = sample_rate_to_hz(sr)
+        # sample_rate_1 is already converted from 16.16 fixed-point to Hz
+        # by the read_transform (fixed_to_sample_rate) in mhit_defs.py
+        # sort_mhod_indicators raw bytes → list for JSON serialization
+        raw = track.get("sort_mhod_indicators", b"")
+        if isinstance(raw, (bytes, bytearray)):
+            track["sort_mhod_indicators"] = list(raw)
 
 
 def _inline_album_strings(data: dict) -> None:
@@ -97,13 +98,11 @@ def _inline_playlist_strings(data: dict) -> None:
             pl.update(strings)
             extras = extract_playlist_extras(mhod_children)
             pl.update(extras)
-            # Flatten MHIP children → items list
+            # Flatten MHIP children → items list.
+            # parse_children always returns {"chunk_type": ..., "data": {...}}.
             items = []
             for mhip in pl.pop("mhip_children", []):
-                mhip_data = (mhip.get("data", {})
-                             if isinstance(mhip, dict) and "data" in mhip
-                             else mhip)
-                items.append({"track_id": mhip_data.get("track_id", 0)})
+                items.append({"track_id": mhip["data"].get("track_id", 0)})
             pl["items"] = items
 
 
@@ -123,5 +122,5 @@ def _merge_play_counts(data: dict, itunesdb_path: str) -> None:
         if entries is not None:
             tracks = data.get("mhlt", [])
             _merge(tracks, entries)
-    except Exception as e:
-        logger.debug("Play Counts merge skipped: %s", e)
+    except Exception:
+        logger.debug("Play Counts merge skipped", exc_info=True)
