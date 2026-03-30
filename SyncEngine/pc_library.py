@@ -21,6 +21,7 @@ from ._formats import (
     VIDEO_PROBE_CONTAINERS,
 )
 import os
+import sys
 import json
 from pathlib import Path
 from dataclasses import dataclass
@@ -40,6 +41,10 @@ except ImportError:
 import math
 import subprocess
 
+# Suppress console flash on Windows
+_SP_KWARGS: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+)
 
 def _replaygain_to_soundcheck(gain_db: float) -> int:
     """Convert ReplayGain dB value to iPod Sound Check value.
@@ -110,6 +115,7 @@ def compute_sound_check(file_path: str, ffmpeg_path: str | None = None) -> int:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=120,
+            **_SP_KWARGS
         )
         # Parse integrated loudness from stderr
         # The line looks like: "    I:         -14.3 LUFS"
