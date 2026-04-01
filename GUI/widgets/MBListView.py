@@ -7,11 +7,12 @@ robust against rapid user interactions (spam-clicking).
 """
 
 from __future__ import annotations
+import sys as _sys
 
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -23,11 +24,17 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 from ..hidpi import scale_pixmap_for_display
 from ..styles import Colors, FONT_FAMILY, Metrics, table_css
 
 log = logging.getLogger(__name__)
+
+# Platform-correct modifier key labels for menu shortcut hints.
+_CTRL = "⌘" if _sys.platform == "darwin" else "Ctrl"
+_ALT = "⌥" if _sys.platform == "darwin" else "Alt"
+del _sys
 
 
 # =============================================================================
@@ -396,6 +403,178 @@ class _SortableItem(QTableWidgetItem):
 
 
 # =============================================================================
+# _DragProgressWidget — floating overlay showing per-track prep progress
+# =============================================================================
+
+class _DragProgressWidget(QWidget):
+    """Small frameless popup that tracks prep state for each exported file."""
+
+    def __init__(self, tracks: list[dict]) -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self._rows: list[QLabel] = []
+        self._done = 0
+        n = len(tracks)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._container = QFrame()
+        self._container.setObjectName("dpWrap")
+        inner = QVBoxLayout(self._container)
+        inner.setContentsMargins(14, 10, 14, 10)
+        inner.setSpacing(3)
+
+        self._header = QLabel(f"Preparing {n} file{'s' if n != 1 else ''}…")
+        self._header.setFont(QFont(FONT_FAMILY, 9, QFont.Weight.Bold))
+        inner.addWidget(self._header)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        inner.addWidget(sep)
+
+        for track in tracks:
+            title = track.get("Title") or "Unknown"
+            artist = track.get("Artist") or track.get("Album Artist") or ""
+            text = f"{artist} – {title}" if artist else title
+            if len(text) > 44:
+                text = text[:41] + "…"
+            lbl = QLabel(f"  ○  {text}")
+            lbl.setFont(QFont(FONT_FAMILY, 9))
+            inner.addWidget(lbl)
+            self._rows.append(lbl)
+
+        outer.addWidget(self._container)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        self._container.setStyleSheet(f"""
+            QFrame#dpWrap {{
+                background: {Colors.SURFACE_RAISED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                background: transparent;
+            }}
+            QFrame[frameShape="4"] {{
+                color: {Colors.BORDER_SUBTLE};
+                background: transparent;
+            }}
+        """)
+
+    def mark_done(self, idx: int) -> None:
+        if 0 <= idx < len(self._rows):
+            lbl = self._rows[idx]
+            lbl.setText(lbl.text().replace("  ○  ", "  ✓  "))
+            lbl.setStyleSheet(f"color: {Colors.ACCENT_LIGHT}; background: transparent;")
+            self._done += 1
+            if self._done == len(self._rows):
+                self._header.setText("Starting drag…")
+                self._header.setStyleSheet(
+                    f"color: {Colors.ACCENT_LIGHT}; background: transparent;"
+                )
+
+
+# =============================================================================
+# _FilePrepThread — background file copy + artwork embed for Alt+drag export
+# =============================================================================
+
+class _FilePrepThread(QThread):
+    """Copies selected iPod tracks to a temp dir, embeds artwork, emits URLs."""
+
+    files_ready = pyqtSignal(list)   # list[QUrl]
+    prep_failed = pyqtSignal(str)
+    track_done = pyqtSignal(int)    # index in tracks list, emitted as each finishes
+
+    def __init__(self, tracks: list, ipod_root: str, artworkdb_path: str,
+                 artwork_folder: str, temp_dir: str) -> None:
+        super().__init__()
+        self._tracks = tracks
+        self._ipod_root = ipod_root
+        self._artworkdb_path = artworkdb_path
+        self._artwork_folder = artwork_folder
+        self._temp_dir = temp_dir
+
+    def run(self) -> None:
+        import io
+        import os
+        import re
+        import shutil
+        from concurrent.futures import ThreadPoolExecutor
+        from PyQt6.QtCore import QUrl
+
+        try:
+            artworkdb_data = img_id_index = None
+            if os.path.isfile(self._artworkdb_path):
+                from ..imgMaker import get_artworkdb_cached
+                artworkdb_data, img_id_index = get_artworkdb_cached(self._artworkdb_path)
+
+            def _safe(s: str) -> str:
+                return re.sub(r'[\\/:*?"<>|]', "_", s).strip() or "Unknown"
+
+            def _prep_one(idx: int, track: dict) -> "QUrl | None":
+                """Copy one track and embed its artwork. Returns QUrl or None."""
+                location = track.get("Location", "")
+                if not location:
+                    return None
+                relative = location.replace(":", "/").lstrip("/")
+                src = os.path.join(self._ipod_root, relative)
+                if not os.path.isfile(src):
+                    return None
+                ext = os.path.splitext(src)[1].lower() or ".m4a"
+                artist = track.get("Artist") or track.get("Album Artist") or "Unknown Artist"
+                title = track.get("Title") or "Unknown Title"
+                # Include index so same-named tracks don't clobber each other
+                base = f"{_safe(artist)} - {_safe(title)}"
+                dest = os.path.join(self._temp_dir,
+                                    f"{base}{ext}" if idx == 0 else f"{base} ({idx + 1}){ext}")
+                shutil.copy2(src, dest)
+
+                img_id = track.get("artwork_id_ref") or track.get("mhii_link", 0)
+                if img_id and artworkdb_data is not None:
+                    try:
+                        from ..imgMaker import decode_image_by_img_id
+                        pil_img = decode_image_by_img_id(
+                            artworkdb_data, self._artwork_folder, img_id, img_id_index
+                        )
+                        if pil_img is not None:
+                            buf = io.BytesIO()
+                            pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
+                            _embed_artwork(dest, ext, buf.getvalue())
+                    except Exception:
+                        pass  # artwork failure is non-fatal
+
+                return QUrl.fromLocalFile(dest)
+
+            from concurrent.futures import as_completed
+            n_workers = min(len(self._tracks), 8)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(_prep_one, i, t)
+                           for i, t in enumerate(self._tracks)]
+                future_to_idx = {f: i for i, f in enumerate(futures)}
+                for done in as_completed(future_to_idx):
+                    self.track_done.emit(future_to_idx[done])
+                # All futures complete by here (executor.__exit__ ensures it)
+                urls = [r for f in futures for r in (f.result(),) if r is not None]
+
+            if urls:
+                self.files_ready.emit(urls)
+            else:
+                self.prep_failed.emit("No valid files to export")
+        except Exception as exc:
+            self.prep_failed.emit(str(exc))
+
+
+# =============================================================================
 # MusicBrowserList - Main Table Widget
 # =============================================================================
 
@@ -468,6 +647,18 @@ class MusicBrowserList(QFrame):
         self._grab_origin = QPoint()
         self._grab_h_value = 0
         self._grab_v_value = 0
+
+        # Left-mouse drag-to-OS state
+        self._drag_start_pos: QPoint | None = None
+        self._drag_start_tracks: list[dict] = []   # snapshot taken before table clears selection
+        self._drag_prep_thread: _FilePrepThread | None = None
+        self._drag_orphan_threads: list[_FilePrepThread] = []  # cancelled threads kept alive until done
+        self._drag_progress_widget: _DragProgressWidget | None = None
+
+        # Ctrl+Alt+C clipboard-copy-as-files state
+        self._clip_prep_thread: _FilePrepThread | None = None
+        self._clip_orphan_threads: list[_FilePrepThread] = []
+        self._clip_progress_widget: _DragProgressWidget | None = None
 
     # -------------------------------------------------------------------------
     # Properties for backwards compatibility
@@ -661,11 +852,13 @@ class MusicBrowserList(QFrame):
             if vp:
                 vp.installEventFilter(self)
 
-        # Install event filter on table viewport for scroll enhancements
+        # Install event filter on table viewport for scroll enhancements,
+        # and on the table itself to catch key events (table holds focus, not the frame)
         table_vp = t.viewport()
         if table_vp:
             table_vp.installEventFilter(self)
             t.setMouseTracking(True)
+        t.installEventFilter(self)
 
         t.setSortingEnabled(True)
 
@@ -907,6 +1100,7 @@ class MusicBrowserList(QFrame):
             # Minimal setup - no setRowCount to avoid blocking!
             self.table.setSortingEnabled(False)
             self.table.setRowCount(0)  # Clear existing rows (fast when going to 0)
+            self._link_to_rows = {}  # Cache artwork links to row indices for fast batch processing
 
             # Build header list — prepend art column if enabled
             if self._show_art:
@@ -1014,6 +1208,8 @@ class MusicBrowserList(QFrame):
             mhii_link = track.get("artwork_id_ref")
             if mhii_link:  # Truthy check ignores 0 and None
                 mhii_link = int(mhii_link)
+                # Cache row index for this artwork link (used during async load)
+                self._link_to_rows.setdefault(mhii_link, []).append(row)
                 if mhii_link in self._art_cache:
                     art_item.setIcon(QIcon(self._art_cache[mhii_link]))
                 else:
@@ -1232,23 +1428,12 @@ class MusicBrowserList(QFrame):
             if not new_links:
                 return
 
-            # Build row-index: link -> rows needing backfill (O(N) once)
-            link_to_rows: dict[int, list[int]] = {}
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                if item is None:
+            # Use cached row-index instead of scanning all rows (O(K) where K = matched rows)
+            # Only process rows with artwork links that were just loaded
+            for link in new_links:
+                if link not in self._link_to_rows:
                     continue
-                link = item.data(Qt.ItemDataRole.UserRole)
-                if link is not None:
-                    try:
-                        link = int(link)
-                    except (ValueError, TypeError):
-                        continue
-                    if link in new_links:
-                        link_to_rows.setdefault(link, []).append(row)
-
-            # Apply icons using the index (O(K) where K = matched rows)
-            for link, rows in link_to_rows.items():
+                rows = self._link_to_rows[link]
                 pixmap = self._art_cache[link]
                 icon = QIcon(pixmap)
                 for row in rows:
@@ -1334,6 +1519,24 @@ class MusicBrowserList(QFrame):
         table viewport (shift+scroll horizontal, middle-mouse grab scroll)."""
         header = self.table.horizontalHeader()
 
+        # ── Table widget: key shortcuts (table holds focus, not the parent frame) ──
+        if obj is self.table and event.type() == QEvent.Type.KeyPress:
+            ke: QKeyEvent = event  # type: ignore[assignment]
+            ctrl = Qt.KeyboardModifier.ControlModifier
+            alt = Qt.KeyboardModifier.AltModifier
+            if ke.modifiers() == (ctrl | alt) and ke.key() == Qt.Key.Key_C:
+                self._copy_files_to_clipboard()
+                return True
+            if ke.modifiers() == ctrl and ke.key() == Qt.Key.Key_C:
+                self._copy_selection()
+                return True
+            if ke.modifiers() == ctrl and ke.key() == Qt.Key.Key_Up:
+                self._move_selected_rows(-1)
+                return True
+            if ke.modifiers() == ctrl and ke.key() == Qt.Key.Key_Down:
+                self._move_selected_rows(1)
+                return True
+
         # ── Header viewport: right-click context menu ──
         if header and obj is header.viewport():
             if event.type() == QEvent.Type.MouseButtonPress:
@@ -1374,9 +1577,30 @@ class MusicBrowserList(QFrame):
                         vbar.setValue(vbar.value() + 1)
                 return True
 
-            # Middle-mouse press → start grab scroll
+            # Left-mouse press → record position + snapshot selection before
+            # QTableWidget processes the event and potentially clears it
             if etype == QEvent.Type.MouseButtonPress:
                 me: QMouseEvent = event  # type: ignore[assignment]
+                if me.button() == Qt.MouseButton.LeftButton:
+                    self._drag_start_pos = me.pos()
+                    self._drag_start_tracks = self._get_selected_tracks()
+
+            # Left-mouse move + Alt → start OS file drag if threshold exceeded
+            if etype == QEvent.Type.MouseMove and self._drag_start_pos is not None:
+                me = event  # type: ignore[assignment]
+                if me.buttons() & Qt.MouseButton.LeftButton:
+                    if me.modifiers() & Qt.KeyboardModifier.AltModifier:
+                        dist = (me.pos() - self._drag_start_pos).manhattanLength()
+                        if dist >= QApplication.startDragDistance():
+                            self._drag_start_pos = None
+                            self._start_file_drag()
+                            return True
+                else:
+                    self._drag_start_pos = None
+
+            # Middle-mouse press → start grab scroll
+            if etype == QEvent.Type.MouseButtonPress:
+                me = event  # type: ignore[assignment]
                 if me.button() == Qt.MouseButton.MiddleButton:
                     self._grab_scrolling = True
                     self._grab_origin = me.pos()
@@ -1399,9 +1623,14 @@ class MusicBrowserList(QFrame):
                     vbar.setValue(self._grab_v_value - delta.y())
                 return True
 
-            # Middle-mouse release → stop grab scroll
+            # Mouse release → clear drag start pos; stop grab scroll
             if etype == QEvent.Type.MouseButtonRelease:
                 me = event  # type: ignore[assignment]
+                if me.button() == Qt.MouseButton.LeftButton:
+                    self._drag_start_pos = None
+                    self._drag_start_tracks = []
+                    if self._drag_prep_thread is not None:
+                        self._cleanup_drag_prep()
                 if me.button() == Qt.MouseButton.MiddleButton and self._grab_scrolling:
                     self._grab_scrolling = False
                     self.table.unsetCursor()
@@ -1638,6 +1867,139 @@ class MusicBrowserList(QFrame):
                 tracks.append(self._tracks[orig_idx])
         return tracks
 
+    def _start_file_drag(self) -> None:
+        """Initiate an async Alt+drag export.
+
+        Launches _FilePrepThread to copy + embed artwork in the background.
+        Shows a wait cursor and grabs the mouse while preparing so the table
+        doesn't do rubber-band selection. QDrag.exec() is called from
+        _on_drag_files_ready once the thread finishes and the mouse is still held.
+        """
+        import os
+        from PyQt6.QtWidgets import QApplication
+
+        if self._drag_prep_thread is not None:
+            return  # already preparing
+
+        tracks = self._drag_start_tracks or self._get_selected_tracks()
+        if not tracks:
+            return
+
+        try:
+            from ..app import DeviceManager
+            dev = DeviceManager.get_instance()
+            ipod_root = dev.device_path or ""
+            artworkdb_path = dev.artworkdb_path or ""
+            artwork_folder = dev.artwork_folder_path or ""
+        except Exception:
+            return
+        if not ipod_root:
+            return
+
+        import shutil
+        from settings import default_cache_dir, get_settings
+        cache_root = get_settings().transcode_cache_dir or default_cache_dir()
+        temp_dir = os.path.join(cache_root, ".drag_tmp")
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        self._drag_prep_thread = _FilePrepThread(
+            list(tracks), ipod_root, artworkdb_path, artwork_folder, temp_dir
+        )
+        self._drag_prep_thread.files_ready.connect(self._on_drag_files_ready)
+        self._drag_prep_thread.prep_failed.connect(self._on_drag_prep_failed)
+
+        self._drag_progress_widget = _DragProgressWidget(list(tracks))
+        self._drag_prep_thread.track_done.connect(self._drag_progress_widget.mark_done)
+        self._drag_prep_thread.start()
+
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        # Position near the cursor, offset so it doesn't sit under the pointer
+        from PyQt6.QtGui import QCursor as _QCursor
+        _pos = _QCursor.pos()
+        self._drag_progress_widget.adjustSize()
+        self._drag_progress_widget.move(_pos.x() + 20, _pos.y() + 20)
+        self._drag_progress_widget.show()
+        vp = self.table.viewport()
+        if vp:
+            vp.grabMouse()
+
+    def _on_drag_files_ready(self, urls: list) -> None:
+        """Called from the main thread when _FilePrepThread finishes successfully."""
+        from PyQt6.QtCore import QMimeData
+        from PyQt6.QtGui import QDrag
+        from PyQt6.QtWidgets import QApplication
+
+        self._cleanup_drag_prep()
+
+        if not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            return  # mouse released during prep — silent cancel
+
+        import os
+        import shutil
+        temp_dir = os.path.dirname(urls[0].toLocalFile()) if urls else ""
+
+        mime = QMimeData()
+        mime.setUrls(urls)
+        drag = QDrag(self.table)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+        # exec() returns after the drop completes — safe to delete now
+        if temp_dir and os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _on_drag_prep_failed(self, msg: str) -> None:
+        """Called from the main thread when _FilePrepThread fails."""
+        self._cleanup_drag_prep()
+        log.warning("Alt+drag file prep failed: %s", msg)
+
+    def _cleanup_drag_prep(self) -> None:
+        """Idempotent teardown: restore cursor, release mouse grab, clear thread.
+
+        If the prep thread is still running (e.g. mouse released early), it is
+        moved to _drag_orphan_threads so Python keeps a reference until Qt's
+        finished() fires — avoiding the "destroyed while still running" warning.
+        """
+        from PyQt6.QtWidgets import QApplication
+        if self._drag_progress_widget is not None:
+            # Disconnect track_done signal before clearing the widget
+            # to prevent signal firing on None after this
+            t = self._drag_prep_thread
+            if t is not None:
+                try:
+                    t.track_done.disconnect()
+                except Exception:
+                    pass
+            self._drag_progress_widget.close()
+            self._drag_progress_widget = None
+        if QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        vp = self.table.viewport()
+        if vp:
+            vp.releaseMouse()
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        t = self._drag_prep_thread
+        self._drag_prep_thread = None
+        if t is not None and t.isRunning():
+            try:
+                t.files_ready.disconnect()
+                t.prep_failed.disconnect()
+            except Exception:
+                pass
+            self._drag_orphan_threads.append(t)
+            t.finished.connect(lambda: self._reap_orphan_thread(t))
+
+    def _reap_orphan_thread(self, t: "_FilePrepThread") -> None:
+        """Remove a finished orphan thread from the holding list."""
+        try:
+            self._drag_orphan_threads.remove(t)
+        except ValueError:
+            pass
+
     def _on_track_context_menu(self, pos) -> None:
         """Show context menu when right-clicking on track rows."""
         selected = self._get_selected_tracks()
@@ -1724,11 +2086,11 @@ class MusicBrowserList(QFrame):
         if self._is_reorderable_playlist():
             selected_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
             menu.addSeparator()
-            up_act = menu.addAction("Move Up\tCtrl+\u2191")
+            up_act = menu.addAction(f"Move Up\t{_CTRL}+\u2191")
             if up_act:
                 up_act.setEnabled(bool(selected_rows) and selected_rows[0] > 0)
                 up_act.triggered.connect(lambda: self._move_selected_rows(-1))
-            down_act = menu.addAction("Move Down\tCtrl+\u2193")
+            down_act = menu.addAction(f"Move Down\t{_CTRL}+\u2193")
             if down_act:
                 down_act.setEnabled(bool(selected_rows) and selected_rows[-1] < self.table.rowCount() - 1)
                 down_act.triggered.connect(lambda: self._move_selected_rows(1))
@@ -1745,6 +2107,15 @@ class MusicBrowserList(QFrame):
 
         # ── Start/Stop Time ──
         self._build_start_stop_menu(menu, menu_style, selected)
+
+        # ── Copy ──
+        menu.addSeparator()
+        copy_text_act = menu.addAction(f"Copy as Text\t{_CTRL}+C")
+        if copy_text_act:
+            copy_text_act.triggered.connect(self._copy_selection)
+        copy_files_act = menu.addAction(f"Copy as File(s)\t{_CTRL}+{_ALT}+C")
+        if copy_files_act:
+            copy_files_act.triggered.connect(self._copy_files_to_clipboard)
 
         vp = self.table.viewport()
         global_pos = vp.mapToGlobal(pos) if vp else QCursor.pos()
@@ -2139,22 +2510,131 @@ class MusicBrowserList(QFrame):
                  removed, title, playlist.get("playlist_id", 0))
 
     # -------------------------------------------------------------------------
-    # Keyboard Shortcuts
+    # Ctrl+Alt+C — Copy selected tracks as files into the clipboard
     # -------------------------------------------------------------------------
 
-    def keyPressEvent(self, a0: QKeyEvent | None) -> None:
-        """Handle keyboard shortcuts."""
-        if a0 and a0.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            if a0.key() == Qt.Key.Key_C:
-                self._copy_selection()
-                return
-            if a0.key() == Qt.Key.Key_Up:
-                self._move_selected_rows(-1)
-                return
-            if a0.key() == Qt.Key.Key_Down:
-                self._move_selected_rows(1)
-                return
-        super().keyPressEvent(a0)
+    def _copy_files_to_clipboard(self) -> None:
+        """Prepare selected tracks as files and place them on the clipboard.
+
+        Uses the same background-thread + progress-widget flow as Alt+drag.
+        The temporary files live in {cache}/.clip_tmp until the clipboard is
+        replaced (dataChanged signal) or a new copy is triggered (whichever
+        comes first).
+        """
+        import os
+        import shutil
+        from settings import default_cache_dir, get_settings
+
+        if self._clip_prep_thread is not None:
+            return  # already preparing
+
+        tracks = self._get_selected_tracks()
+        if not tracks:
+            return
+
+        try:
+            from ..app import DeviceManager
+            dev = DeviceManager.get_instance()
+            ipod_root = dev.device_path or ""
+            artworkdb_path = dev.artworkdb_path or ""
+            artwork_folder = dev.artwork_folder_path or ""
+        except Exception:
+            return
+        if not ipod_root:
+            return
+
+        # Build a fresh temp dir in the user's cache directory
+        cache_root = get_settings().transcode_cache_dir or default_cache_dir()
+        temp_dir = os.path.join(cache_root, ".clip_tmp")
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        self._clip_prep_thread = _FilePrepThread(
+            list(tracks), ipod_root, artworkdb_path, artwork_folder, temp_dir
+        )
+        self._clip_prep_thread.files_ready.connect(self._on_clip_files_ready)
+        self._clip_prep_thread.prep_failed.connect(self._on_clip_prep_failed)
+
+        self._clip_progress_widget = _DragProgressWidget(list(tracks))
+        self._clip_prep_thread.track_done.connect(self._clip_progress_widget.mark_done)
+        self._clip_prep_thread.start()
+
+        from PyQt6.QtGui import QCursor as _QCursor
+        _pos = _QCursor.pos()
+        self._clip_progress_widget.adjustSize()
+        self._clip_progress_widget.move(_pos.x() + 20, _pos.y() + 20)
+        self._clip_progress_widget.show()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+
+    def _on_clip_files_ready(self, urls: list) -> None:
+        """Place prepared files on the system clipboard."""
+        import os
+
+        log.info("clip: files_ready — %d url(s)", len(urls))
+        for u in urls:
+            local = u.toLocalFile()
+            exists = os.path.isfile(local)
+            log.info("  clip url=%s  exists=%s", local, exists)
+
+        self._cleanup_clip_prep()
+
+        import sys
+        from PyQt6.QtCore import QByteArray, QMimeData as _QMimeData
+        mime = _QMimeData()
+        mime.setUrls(urls)
+
+        if sys.platform == "linux":
+            # Nautilus/GNOME requires this additional format alongside text/uri-list.
+            # KDE/Dolphin accepts text/uri-list alone.
+            uri_bytes = "\n".join(u.toString() for u in urls).encode()
+            mime.setData("x-special/gnome-copied-files", QByteArray(b"copy\n" + uri_bytes))
+
+        log.info("clip: mime formats after setUrls: %s", mime.formats())
+
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setMimeData(mime)
+            cb_mime = clipboard.mimeData()
+            if cb_mime:
+                log.info("clip: clipboard formats: %s", cb_mime.formats())
+                log.info("clip: clipboard urls: %s", [u.toString() for u in cb_mime.urls()])
+            else:
+                log.warning("clip: clipboard.mimeData() returned None after setMimeData")
+        else:
+            log.warning("clip: QApplication.clipboard() returned None")
+
+    def _on_clip_prep_failed(self, msg: str) -> None:
+        self._cleanup_clip_prep()
+        log.warning("Ctrl+Alt+C file prep failed: %s", msg)
+
+    def _cleanup_clip_prep(self) -> None:
+        """Restore UI state after clipboard file prep (success, failure, or cancel)."""
+        from PyQt6.QtWidgets import QApplication as _QApp
+        if self._clip_progress_widget is not None:
+            self._clip_progress_widget.close()
+            self._clip_progress_widget = None
+        if _QApp.overrideCursor() is not None:
+            _QApp.restoreOverrideCursor()
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        t = self._clip_prep_thread
+        self._clip_prep_thread = None
+        if t is not None and t.isRunning():
+            try:
+                t.files_ready.disconnect()
+                t.prep_failed.disconnect()
+            except Exception:
+                pass
+            self._clip_orphan_threads.append(t)
+            t.finished.connect(lambda: self._reap_clip_orphan_thread(t))
+
+    def _reap_clip_orphan_thread(self, t: "_FilePrepThread") -> None:
+        try:
+            self._clip_orphan_threads.remove(t)
+        except ValueError:
+            pass
 
     def _copy_selection(self) -> None:
         """Copy selected rows as tab-separated text to clipboard."""
@@ -2192,3 +2672,27 @@ class MusicBrowserList(QFrame):
         clipboard = QApplication.clipboard()
         if clipboard:
             clipboard.setText("\n".join(lines))
+
+
+def _embed_artwork(path: str, ext: str, jpeg_bytes: bytes) -> None:
+    """Embed JPEG artwork into an audio file in-place using mutagen."""
+    if ext in (".m4a", ".m4b", ".aac", ".mp4"):
+        from mutagen.mp4 import MP4, MP4Cover
+        audio = MP4(path)
+        audio["covr"] = [MP4Cover(jpeg_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+        audio.save()
+    elif ext == ".mp3":
+        import mutagen.id3
+        try:
+            tags = mutagen.id3.ID3(path)
+        except Exception:
+            tags = mutagen.id3.ID3()
+        tags.delall("APIC")
+        tags.add(mutagen.id3.APIC(  # type: ignore[attr-defined]
+            encoding=3,
+            mime="image/jpeg",
+            type=3,
+            desc="Cover",
+            data=jpeg_bytes,
+        ))
+        tags.save(path)

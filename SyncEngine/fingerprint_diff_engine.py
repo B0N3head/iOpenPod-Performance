@@ -317,6 +317,12 @@ _WRITER_DEFAULTS: dict[str, int | str] = {
 # never demoted (1→0) by an absent one.
 _PC_ABSENT_PRESERVES_IPOD: frozenset[str] = frozenset({"compilation"})
 
+# NOTE: media_type is intentionally NOT in METADATA_FIELDS to prevent it from
+# being compared or updated during UPDATE_METADATA operations.  The media_type
+# (video category: music video vs movie vs TV show vs audio) is determined once
+# at ADD time and never changed afterward, even if the file's metadata tags
+# (stik atom) change or are missing on subsequent syncs.
+
 
 # ─── Engine ────────────────────────────────────────────────────────────────────
 
@@ -1056,11 +1062,11 @@ class FingerprintDiffEngine:
 
         Uses size+mtime as a fast gate.
         """
-        # Significant size change (>1% or >10 KB)
+        # Significant size change (>10 KB or >1% of file size)
         size_diff = abs(pc_track.size - mapping.source_size)
         size_pct = size_diff / max(mapping.source_size, 1)
 
-        if size_diff > 10_240 and size_pct > 0.01:
+        if size_diff > 10_240 or size_pct > 0.01:
             return True
 
         # mtime changed AND size changed (rules out metadata-only tag edits)

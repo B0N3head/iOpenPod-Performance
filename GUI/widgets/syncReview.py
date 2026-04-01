@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QFrame, QStackedWidget, QMessageBox,
-    QFileDialog, QDialog, QCheckBox, QSizePolicy,
+    QFileDialog, QDialog, QCheckBox,
 )
 from PyQt6.QtGui import QFont, QColor, QPainter
 from pathlib import Path
@@ -2509,11 +2509,11 @@ class PCFolderDialog(QDialog):
 
         # Instructions
         label = QLabel(
-            "Select the folder containing your music library.\n"
+            "Select the folder containing your media library.\n"
             "This folder will be compared with your iPod to find:\n"
-            "• New tracks to add\n"
-            "• Removed tracks to delete\n"
-            "• Updated tracks to re-sync"
+            "• New media to add\n"
+            "• Removed media to delete\n"
+            "• Updated media to re-sync"
         )
         label.setWordWrap(True)
         label.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))

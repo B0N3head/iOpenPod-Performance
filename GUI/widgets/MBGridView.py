@@ -1,9 +1,39 @@
+import difflib
 import logging
 from collections import deque
 from PyQt6.QtCore import QRect, QSize, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QSizePolicy
 from .MBGridViewItem import MusicBrowserGridItem
 from ..styles import Metrics
+
+# Fuzzy search: only attempt fuzzy matching for tokens at least this long,
+# and require a SequenceMatcher ratio above the threshold.
+_FUZZY_MIN_LEN = 3
+_FUZZY_THRESHOLD = 0.78
+
+
+def _token_matches(token: str, corpus_words: list[str]) -> bool:
+    """Return True if *token* matches any word in *corpus_words*.
+
+    Two-pass:
+      1. Exact substring (fast) — handles normal typing and partial words.
+      2. Fuzzy ratio (difflib) — handles typos for tokens >= _FUZZY_MIN_LEN.
+    """
+    # Pass 1: exact substring against each corpus word
+    for word in corpus_words:
+        if token in word:
+            return True
+    # Pass 2: fuzzy match for tokens long enough to be meaningful
+    if len(token) >= _FUZZY_MIN_LEN:
+        for word in corpus_words:
+            if len(word) >= _FUZZY_MIN_LEN:
+                ratio = difflib.SequenceMatcher(
+                    None, token, word, autojunk=False
+                ).ratio()
+                if ratio >= _FUZZY_THRESHOLD:
+                    return True
+    return False
+
 
 log = logging.getLogger(__name__)
 
@@ -123,13 +153,18 @@ class MusicBrowserGrid(QFrame):
         self._items_by_link: dict[int, list[MusicBrowserGridItem]] = {}  # mhiiLink -> items waiting for art
         self._art_pending: set[int] = set()  # links currently being loaded
 
+        # Sort / filter state
+        self._all_items: list[dict] = []
+        self._sort_key: str = "title"
+        self._sort_reverse: bool = False
+        self._search_query: str = ""
+
     def loadCategory(self, category: str):
         """Load and display items for the specified category."""
         from ..app import iTunesDBCache, build_album_list, build_artist_list, build_genre_list
         log.debug(f"loadCategory() called: {category}")
 
         self._current_category = category
-        self.clearGrid()
 
         cache = iTunesDBCache.get_instance()
         if not cache.is_ready():
@@ -144,11 +179,14 @@ class MusicBrowserGrid(QFrame):
         else:
             return
 
-        self.populateGrid(items)
+        self._all_items = items
+        self._apply_filter_and_sort()
 
     def populateGrid(self, items):
         """Populate the grid with items."""
+        _saved_all = self._all_items   # preserve source list across clearGrid()
         self.clearGrid()
+        self._all_items = _saved_all
         self._load_id += 1
         current_load_id = self._load_id
 
@@ -170,56 +208,63 @@ class MusicBrowserGrid(QFrame):
             self._load_art_async()
             return
 
-        batch_size = 5
-        for _ in range(batch_size):
-            if not self.pendingItems:
-                break
+        try:
+            batch_size = 5
+            for _ in range(batch_size):
+                if not self.pendingItems:
+                    break
 
-            i, item = self.pendingItems.popleft()
+                i, item = self.pendingItems.popleft()
 
-            if isinstance(item, dict):
-                title = item.get("title") or item.get("album", "Unknown")
-                subtitle = item.get("subtitle") or item.get("artist", "")
-                mhiiLink = item.get("artwork_id_ref")
+                if isinstance(item, dict):
+                    title = item.get("title") or item.get("album", "Unknown")
+                    subtitle = item.get("subtitle") or item.get("artist", "")
+                    mhiiLink = item.get("artwork_id_ref")
 
-                item_data = {
-                    "title": title,
-                    "subtitle": subtitle,
-                    "artwork_id_ref": mhiiLink,
-                    "category": item.get("category", "Albums"),
-                    "filter_key": item.get("filter_key", "Album"),
-                    "filter_value": item.get("filter_value", title),
-                    "album": item.get("album"),
-                    "artist": item.get("artist"),
-                }
+                    item_data = {
+                        "title": title,
+                        "subtitle": subtitle,
+                        "artwork_id_ref": mhiiLink,
+                        "category": item.get("category", "Albums"),
+                        "filter_key": item.get("filter_key", "Album"),
+                        "filter_value": item.get("filter_value", title),
+                        "album": item.get("album"),
+                        "artist": item.get("artist"),
+                    }
 
-                gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
-                gridItem.clicked.connect(self._onItemClicked)
-                self.gridItems.append(gridItem)
+                    gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
+                    gridItem.clicked.connect(self._onItemClicked)
+                    self.gridItems.append(gridItem)
 
-                # Track which items need artwork
-                if mhiiLink is not None:
-                    self._items_by_link.setdefault(int(mhiiLink), []).append(gridItem)
+                    # Track which items need artwork
+                    if mhiiLink is not None:
+                        self._items_by_link.setdefault(int(mhiiLink), []).append(gridItem)
 
-            elif isinstance(item, MusicBrowserGridItem):
-                gridItem = item
-                gridItem.clicked.connect(self._onItemClicked)
+                elif isinstance(item, MusicBrowserGridItem):
+                    gridItem = item
+                    gridItem.clicked.connect(self._onItemClicked)
+                else:
+                    continue
+
+                self._flow.addWidget(gridItem)
+
+            # Update minimum height so the scroll area can size correctly.
+            w = self.width()
+            if w > 0:
+                self.setMinimumHeight(self._flow.heightForWidth(w))
+
+            if self.pendingItems and load_id == self._load_id:
+                QTimer.singleShot(8, lambda: self._addNextItem(load_id))
             else:
-                continue
+                self.timerActive = False
+                # All items added — kick off batched artwork loading
+                self._load_art_async()
 
-            self._flow.addWidget(gridItem)
-
-        # Update minimum height so the scroll area can size correctly.
-        w = self.width()
-        if w > 0:
-            self.setMinimumHeight(self._flow.heightForWidth(w))
-
-        if self.pendingItems and load_id == self._load_id:
-            QTimer.singleShot(8, lambda: self._addNextItem(load_id))
-        else:
+        except RuntimeError:
+            # Qt has destroyed the underlying C++ layout/widget (e.g. the
+            # MusicBrowserGrid was deleted while this timer was pending).
+            # Nothing to do — just stop the loading chain.
             self.timerActive = False
-            # All items added — kick off batched artwork loading
-            self._load_art_async()
 
     # -------------------------------------------------------------------------
     # Batched artwork loading
@@ -316,6 +361,67 @@ class MusicBrowserGrid(QFrame):
         """Handle grid item click."""
         self.item_selected.emit(item_data)
 
+    # ── Sort / filter ─────────────────────────────────────────────────────────
+
+    def setSort(self, key: str, reverse: bool = False) -> None:
+        """Apply a new sort order to the current item list."""
+        self._sort_key = key
+        self._sort_reverse = reverse
+        self._apply_filter_and_sort()
+
+    def setSearchFilter(self, query: str) -> None:
+        """Filter grid items whose title contains *query* (case-insensitive)."""
+        self._search_query = query
+        self._apply_filter_and_sort()
+
+    def resetFilters(self) -> None:
+        """Reset sort and search to defaults without reloading source data."""
+        self._sort_key = "title"
+        self._sort_reverse = False
+        self._search_query = ""
+        self._apply_filter_and_sort()
+
+    @staticmethod
+    def _search_corpus(item: dict) -> str:
+        """Build a single lowercase string of every searchable field for *item*.
+
+        Albums:  album title + artist name + year
+        Artists: artist name (= title)
+        Genres:  genre name (= title)
+        """
+        parts = []
+        for field in ("title", "artist"):
+            v = item.get(field)
+            if v:
+                parts.append(str(v).lower())
+        year = item.get("year")
+        if year:
+            parts.append(str(year))
+        return " ".join(parts)
+
+    def _apply_filter_and_sort(self) -> None:
+        items = self._all_items
+
+        if self._search_query:
+            tokens = self._search_query.lower().split()
+            filtered = []
+            for x in items:
+                words = self._search_corpus(x).split()
+                if all(_token_matches(t, words) for t in tokens):
+                    filtered.append(x)
+            items = filtered
+
+        def _key_fn(x):
+            v = x.get(self._sort_key)
+            if isinstance(v, str):
+                return v.lower()
+            return v if v is not None else 0
+
+        items = sorted(items, key=_key_fn, reverse=self._sort_reverse)
+        self.populateGrid(items)
+
+    # ── Grid management ───────────────────────────────────────────────────────
+
     def rearrangeGrid(self):
         """Trigger a re-layout (flow layout handles this automatically)."""
         self._flow.activate()
@@ -327,6 +433,7 @@ class MusicBrowserGrid(QFrame):
         self._load_id += 1
         self._items_by_link.clear()
         self._art_pending.clear()
+        self._all_items = []
 
         while self._flow.count():
             item = self._flow.takeAt(0)

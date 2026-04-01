@@ -6,6 +6,7 @@ from .MBListView import MusicBrowserList
 from .playlistBrowser import PlaylistBrowser
 from .podcastBrowser import PodcastBrowser
 from .trackListTitleBar import TrackListTitleBar
+from .gridHeaderBar import GridHeaderBar
 from ..styles import Colors, make_scroll_area
 
 log = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class MusicBrowser(QFrame):
 
         self.gridTrackSplitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Top: Grid Browser in scroll area
+        # Top: Header bar + Grid Browser in scroll area, wrapped in a container
         self.browserGrid = MusicBrowserGrid()
         self.browserGrid.item_selected.connect(self._onGridItemSelected)
 
@@ -36,7 +37,21 @@ class MusicBrowser(QFrame):
         self.browserGridScroll.minimumSizeHint = lambda: QSize(0, 0)
         self.browserGridScroll.setWidget(self.browserGrid)
 
-        self.gridTrackSplitter.addWidget(self.browserGridScroll)
+        self.gridHeaderBar = GridHeaderBar()
+        self.gridHeaderBar.sort_changed.connect(
+            lambda key, rev: self.browserGrid.setSort(key, rev)
+        )
+        self.gridHeaderBar.search_changed.connect(self.browserGrid.setSearchFilter)
+
+        self.gridContainer = QFrame()
+        self.gridContainer.setMinimumSize(0, 0)
+        gridContainerLayout = QVBoxLayout(self.gridContainer)
+        gridContainerLayout.setContentsMargins(0, 0, 0, 0)
+        gridContainerLayout.setSpacing(0)
+        gridContainerLayout.addWidget(self.gridHeaderBar)
+        gridContainerLayout.addWidget(self.browserGridScroll)
+
+        self.gridTrackSplitter.addWidget(self.gridContainer)
 
         # Bottom: Track Browser
         self.trackContainer = QFrame()
@@ -125,6 +140,35 @@ class MusicBrowser(QFrame):
         except Exception:
             pass
 
+    def _apply_constrained_splitter_sizes(self):
+        """Apply splitter sizing with constraint: track list <= 50% of window height.
+
+        Uses the entire window height (not just splitter) to ensure consistent
+        sizing regardless of current layout state. Prevents track list from
+        taking more than 50% of window height, ensuring grid stays visible.
+        """
+        try:
+            from settings import get_settings
+            saved = get_settings().splitter_sizes
+            if isinstance(saved, list) and len(saved) == 2:
+                grid_h, track_h = int(saved[0]), int(saved[1])
+            else:
+                grid_h, track_h = 600, 400
+        except Exception:
+            grid_h, track_h = 600, 400
+
+        # Calculate 50% based on entire window height
+        window = self.window()
+        window_h = window.height() if window else 800
+        max_track = window_h // 2
+
+        # Constraint: track list should not exceed 50% of window height
+        if track_h > max_track:
+            track_h = max_track
+            grid_h = window_h - track_h
+
+        self.gridTrackSplitter.setSizes([grid_h, track_h])
+
     def onDataReady(self):
         """Called when iTunesDB cache is loaded. Refresh current view."""
         self._refreshCurrentCategory()
@@ -147,34 +191,38 @@ class MusicBrowser(QFrame):
 
         if category == "Tracks":
             self.stack.setCurrentIndex(0)
-            # Hide grid, show all tracks
-            self.browserGridScroll.hide()
+            # Hide entire grid container (header + grid) for fullscreen tracklist
+            self.gridContainer.hide()
             self.browserGrid.clearGrid()  # Clear grid to cancel pending image loads
             self.browserTrack.clearTable()  # Clear track list before reloading
             self.browserTrack.clearFilter()
             self.browserTrack.loadTracks(media_type_filter=0x01)  # Audio only
             self.trackListTitleBar.setTitle("All Tracks")
             self.trackListTitleBar.resetColor()
+            self.trackListTitleBar.setFullscreenMode(True)
         elif category == "Playlists":
             self.stack.setCurrentIndex(1)
+            self.trackListTitleBar.setFullscreenMode(False)
             self.playlistBrowser.loadPlaylists()
         elif category == "Podcasts":
             # Podcast manager — full subscription browser
             self.stack.setCurrentIndex(2)
+            self.trackListTitleBar.setFullscreenMode(False)
             self._ensure_podcast_device()
         elif category == "Audiobooks":
-            # Non-music audio categories
+            # Non-music audio categories — hide entire grid container for fullscreen tracklist
             log.debug(f"  Showing {category} view")
             self.stack.setCurrentIndex(0)
-            self.browserGridScroll.hide()
+            self.gridContainer.hide()
             self.browserGrid.clearGrid()
             self.browserTrack.clearTable()
             self.browserTrack.clearFilter()
             self.browserTrack.loadTracks(media_type_filter=0x08)  # MEDIA_TYPE_AUDIOBOOK
             self.trackListTitleBar.setTitle(category)
             self.trackListTitleBar.resetColor()
+            self.trackListTitleBar.setFullscreenMode(True)
         elif category in ("Videos", "Movies", "TV Shows", "Music Videos"):
-            # Video categories: show track list filtered by media type
+            # Video categories: hide entire grid container for fullscreen tracklist
             _MEDIA_TYPE_FILTER = {
                 "Videos": 0x62,        # All video (VIDEO|MUSIC_VIDEO|TV_SHOW)
                 "Movies": 0x02,        # MEDIA_TYPE_VIDEO
@@ -182,17 +230,22 @@ class MusicBrowser(QFrame):
                 "Music Videos": 0x20,  # MEDIA_TYPE_MUSIC_VIDEO
             }
             self.stack.setCurrentIndex(0)
-            self.browserGridScroll.hide()
+            self.gridContainer.hide()
             self.browserGrid.clearGrid()
             self.browserTrack.clearTable()
             self.browserTrack.clearFilter()
             self.browserTrack.loadTracks(media_type_filter=_MEDIA_TYPE_FILTER[category])
             self.trackListTitleBar.setTitle(category)
             self.trackListTitleBar.resetColor()
+            self.trackListTitleBar.setFullscreenMode(True)
         else:
             self.stack.setCurrentIndex(0)
             # Show grid for Albums, Artists, Genres
-            self.browserGridScroll.show()
+            self.gridContainer.show()
+            self.gridHeaderBar.setCategory(category)
+            self.gridHeaderBar.resetState()
+
+            self.browserGrid.resetFilters()
             self.browserGrid.loadCategory(category)
             # Pre-load audio-only tracks so filterByAlbum/Artist/Genre
             # won't include video tracks in results.
@@ -200,6 +253,10 @@ class MusicBrowser(QFrame):
             self.browserTrack.clearFilter()
             self.trackListTitleBar.setTitle(f"Select a{'n' if category[0] in 'AE' else ''} {category[:-1]}")
             self.trackListTitleBar.resetColor()
+            self.trackListTitleBar.setFullscreenMode(False)
+
+            # Apply constrained splitter sizes (50% grid max, 50% track list min)
+            self._apply_constrained_splitter_sizes()
 
     def _onGridItemSelected(self, item_data: dict):
         """Handle when a grid item is clicked."""

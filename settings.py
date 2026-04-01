@@ -163,8 +163,8 @@ class AppSettings:
     backup_dir: str = ""
 
     # ── Sync ────────────────────────────────────────────────────────────────
-    # Default PC music folder for sync (remembered between sessions)
-    music_folder: str = ""
+    # Default PC media folder for sync (remembered between sessions)
+    media_folder: str = ""
 
     # Write ratings back to PC source files after sync.
     # Off by default — users must opt in to having source files modified.
@@ -331,6 +331,9 @@ class AppSettings:
             for key, value in data.items():
                 if hasattr(settings, key):
                     expected_type = type(getattr(settings, key))
+                    # Allow int values for float fields (common in JSON serialization)
+                    if isinstance(value, int) and expected_type is float:
+                        value = float(value)
                     if isinstance(value, expected_type):
                         setattr(settings, key, value)
 

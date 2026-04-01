@@ -47,7 +47,7 @@ class MainWindow(QMainWindow):
         self._sync_worker = None
         self._sync_execute_worker = None
         self._plan = None
-        self._last_pc_folder = settings.music_folder or ""
+        self._last_pc_folder = settings.media_folder or ""
 
         # Quick metadata write (track flags, rating, etc.)
         self._quick_meta_worker: _QuickMetadataWorker | None = None
@@ -634,7 +634,7 @@ class MainWindow(QMainWindow):
         self._last_pc_folder = dialog.selected_folder
         # Persist the folder choice
         settings = get_settings()
-        settings.music_folder = dialog.selected_folder
+        settings.media_folder = dialog.selected_folder
         settings.save()
 
         # Switch to sync review view
@@ -915,7 +915,7 @@ class MainWindow(QMainWindow):
         """Return from settings to the main browsing view."""
         # Re-read persisted settings to pick up changes
         settings = get_settings()
-        self._last_pc_folder = settings.music_folder or self._last_pc_folder
+        self._last_pc_folder = settings.media_folder or self._last_pc_folder
         self._show_default_page()
 
     def showBackupBrowser(self):

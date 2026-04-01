@@ -222,11 +222,13 @@ def _parse_itun_smpb(value: str) -> dict:
         postgap = int(parts[2], 16)
         total_samples = int(parts[3], 16)
         result = {}
-        if pregap >= 0:
+        # Sanity checks: pregap/postgap should be encoder delays (typically < 100k samples)
+        # total_samples should be reasonable audio length (< 2 billion samples ≈ 45 hours at 48kHz)
+        if 0 <= pregap < 100_000:
             result["pregap"] = pregap
-        if postgap >= 0:
+        if 0 <= postgap < 100_000:
             result["postgap"] = postgap
-        if total_samples > 0:
+        if 0 < total_samples < 2_000_000_000:
             result["sample_count"] = total_samples
         return result
     except (ValueError, IndexError):
@@ -722,8 +724,11 @@ class PCLibrary:
                 try:
                     import json
                     from subprocess import check_output
+                    from .transcoder import find_ffmpeg
+                    ffmpeg_path = find_ffmpeg()
+                    ffprobe_path = str(ffmpeg_path).replace("ffmpeg", "ffprobe")
                     cmd = [
-                        "ffprobe",
+                        ffprobe_path,
                         "-v", "quiet",
                         "-print_format", "json",
                         "-show_format",
@@ -1274,19 +1279,19 @@ class PCLibrary:
                 metadata["network_name"] = str(tvnn[0])
 
             # desc: Short description
-            desc_val = audio.tags.get("desc")
-            if desc_val and len(desc_val) > 0:
-                metadata["description"] = str(desc_val[0])
-                # If ldes (long description) is also present, use desc as subtitle
-                # (iTunes convention: desc → subtitle, ldes → description)
-                ldes_for_sub = audio.tags.get("ldes")
-                if ldes_for_sub and len(ldes_for_sub) > 0:
-                    metadata["subtitle"] = str(desc_val[0])
-
             # ldes: Long description
-            ldes = audio.tags.get("ldes")
-            if ldes and len(ldes) > 0:
-                metadata["long_description"] = str(ldes[0])
+            # iTunes convention: desc → subtitle (when ldes is present), ldes → description
+            desc_val = audio.tags.get("desc")
+            ldes_val = audio.tags.get("ldes")
+
+            if ldes_val and len(ldes_val) > 0:
+                # Long description present: use ldes as description, desc as subtitle
+                metadata["description"] = str(ldes_val[0])
+                if desc_val and len(desc_val) > 0:
+                    metadata["subtitle"] = str(desc_val[0])
+            elif desc_val and len(desc_val) > 0:
+                # Only short description present: use as description
+                metadata["description"] = str(desc_val[0])
 
             # Release date from ©day atom (may contain full ISO date or just year)
             # Year was already extracted above; here we extract the full date for

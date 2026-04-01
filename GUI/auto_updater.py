@@ -188,7 +188,19 @@ def verify_checksum(archive_path: Path, checksum_url: str) -> bool:
         logger.warning("Could not fetch checksum: %s", exc)
         return False
 
-    actual_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest().lower()
+    # Stream the file through hashlib to avoid loading entire archive into memory
+    hasher = hashlib.sha256()
+    try:
+        with open(archive_path, "rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)  # 256 KB chunks
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        actual_hash = hasher.hexdigest().lower()
+    except (OSError, IOError) as exc:
+        logger.error("Failed to read archive for checksum: %s", exc)
+        return False
     ok = actual_hash == expected_hash
     if not ok:
         logger.error(
@@ -345,22 +357,82 @@ def _write_unix_bootstrap(
     """Write a shell script that swaps the update after we exit."""
     # Write to temp dir — app_dir.parent (e.g. /Applications/) may not be writable
     script = Path(tempfile.gettempdir()) / "_iopenpod_update.sh"
+    log_file = Path(tempfile.gettempdir()) / "_iopenpod_update.log"
 
-    # On macOS, use ditto (preserves permissions, resource forks, etc.)
-    # and remove quarantine so Gatekeeper doesn't block the updated app.
-    # On Linux, use cp -a to preserve all attributes.
     is_macos = sys.platform == "darwin"
+
     if is_macos:
-        copy_cmd = f'ditto "{staged_dir}" "{app_dir}"'
-        post_copy = (
+        # On macOS, put the actual file operations in a separate helper script.
+        # The bootstrap then tries running it directly; if that fails (e.g. the
+        # app is in /Applications/ which is root-owned), it retries via osascript
+        # which shows macOS's standard admin password dialog.
+        ops_script = Path(tempfile.gettempdir()) / "_iopenpod_update_ops.sh"
+        ops_script.write_text(
+            f'#!/bin/sh\n'
+            f'LOG="{log_file}"\n'
+            f'exec >> "$LOG" 2>&1\n'
+            f'echo "Starting file operations..."\n'
+            f'rm -rf "{app_dir}.bak"\n'
+            f'if ! mv "{app_dir}" "{app_dir}.bak"; then\n'
+            f'    echo "ERROR: mv failed — cannot move old app aside"\n'
+            f'    exit 1\n'
+            f'fi\n'
+            f'echo "Old app moved to .bak"\n'
+            f'if ! ditto "{staged_dir}" "{app_dir}"; then\n'
+            f'    echo "ERROR: ditto failed — restoring backup"\n'
+            f'    mv "{app_dir}.bak" "{app_dir}"\n'
+            f'    exit 1\n'
+            f'fi\n'
+            f'echo "New app copied"\n'
             f'xattr -dr com.apple.quarantine "{app_dir}" 2>/dev/null\n'
             f'chmod -R +x "{app_dir}/Contents/MacOS" 2>/dev/null\n'
+            f'rm -rf "{app_dir}.bak"\n'
+            f'rm -rf "{staged_dir.parent}"\n'
+            f'echo "File operations complete"\n',
+            encoding="utf-8",
         )
-    else:
-        copy_cmd = f'cp -a "{staged_dir}/." "{app_dir}/"'
-        post_copy = f'chmod +x "{app_dir}/{exe_name}"\n'
+        ops_script.chmod(ops_script.stat().st_mode | stat.S_IEXEC)
 
-    log_file = Path(tempfile.gettempdir()) / "_iopenpod_update.log"
+        # Build the osascript fallback.  The ops script path is embedded as a
+        # double-quoted shell word inside the AppleScript string literal, so
+        # inner double-quotes must be escaped with \".
+        ops_escaped = str(ops_script).replace('"', '\\"')
+        apply_block = (
+            f'# Try without admin first (works when app is outside /Applications/)\n'
+            f'if /bin/sh "{ops_script}"; then\n'
+            f'    echo "Updated without elevated privileges"\n'
+            f'else\n'
+            f'    echo "Retrying with administrator privileges via osascript..."\n'
+            f'    osascript -e \'do shell script "/bin/sh \\"{ops_escaped}\\"" with administrator privileges\' >> "$LOG" 2>&1\n'
+            f'    if [ $? -ne 0 ]; then\n'
+            f'        echo "ERROR: osascript elevated install failed"\n'
+            f'        exit 1\n'
+            f'    fi\n'
+            f'fi\n'
+        )
+        relaunch = f'open -a "{app_dir}"\n'
+        cleanup = f'rm -f "{ops_script}"\n'
+
+    else:
+        apply_block = (
+            f'rm -rf "{app_dir}.bak"\n'
+            f'if ! mv "{app_dir}" "{app_dir}.bak"; then\n'
+            f'    echo "ERROR: mv failed — cannot move old app aside"\n'
+            f'    exit 1\n'
+            f'fi\n'
+            f'echo "Old app moved to .bak"\n'
+            f'if ! cp -a "{staged_dir}/." "{app_dir}/"; then\n'
+            f'    echo "ERROR: copy failed — restoring backup"\n'
+            f'    mv "{app_dir}.bak" "{app_dir}"\n'
+            f'    exit 1\n'
+            f'fi\n'
+            f'echo "New files copied"\n'
+            f'chmod +x "{app_dir}/{exe_name}"\n'
+            f'rm -rf "{app_dir}.bak"\n'
+            f'rm -rf "{staged_dir.parent}"\n'
+        )
+        relaunch = f'"{app_dir}/{exe_name}" &\n'
+        cleanup = ''
 
     script.write_text(
         f'#!/bin/sh\n'
@@ -378,31 +450,34 @@ def _write_unix_bootstrap(
         f'sleep 1\n'
         f'\n'
         f'echo "Applying update..."\n'
-        f'rm -rf "{app_dir}.bak"\n'
-        f'if ! mv "{app_dir}" "{app_dir}.bak"; then\n'
-        f'    echo "ERROR: mv failed — cannot move old app aside"\n'
-        f'    exit 1\n'
-        f'fi\n'
-        f'echo "Old app moved to .bak"\n'
+        f'{apply_block}'
         f'\n'
-        f'if ! {copy_cmd}; then\n'
-        f'    echo "ERROR: copy failed — restoring backup"\n'
-        f'    mv "{app_dir}.bak" "{app_dir}"\n'
-        f'    exit 1\n'
-        f'fi\n'
-        f'echo "New files copied"\n'
-        f'\n'
-        f'{post_copy}'
         f'echo "Restarting iOpenPod..."\n'
-        f'"{app_dir}/{exe_name}" &\n'
-        f'rm -rf "{app_dir}.bak"\n'
-        f'rm -rf "{staged_dir.parent}"\n'
+        f'{relaunch}'
+        f'{cleanup}'
         f'echo "=== Update complete $(date) ==="\n'
         f'rm -f "$0"\n',
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     return script
+
+
+def update_log_path() -> Path:
+    """Return the path to the persistent update log file."""
+    return Path(tempfile.gettempdir()) / "_iopenpod_update.log"
+
+
+def _log_update(msg: str) -> None:
+    """Append *msg* (with timestamp) to the update log file."""
+    import datetime
+    line = f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}\n"
+    try:
+        with open(update_log_path(), "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+    logger.info(msg)
 
 
 def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
@@ -412,24 +487,25 @@ def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
     Returns ``False`` if this is not a frozen build or the bootstrap
     could not be launched.
     """
+    _log_update(f"=== launch_bootstrap_and_exit called ===")
+    _log_update(f"sys.frozen={getattr(sys, 'frozen', False)}")
+    _log_update(f"sys.executable={sys.executable}")
+    _log_update(f"sys.platform={sys.platform}")
+    _log_update(f"staged_dir={staged_dir}")
+
     if not getattr(sys, "frozen", False):
-        logger.info("Not a frozen build; bootstrap not applicable.")
+        _log_update("Not a frozen build — bootstrap not applicable.")
         return False
 
     pid = os.getpid()
     app_dir = Path(sys.executable).parent
     exe_name = Path(sys.executable).name
 
-    logger.info(
-        "Bootstrap: pid=%d, app_dir=%s, exe=%s, staged=%s",
-        pid, app_dir, exe_name, staged_dir,
-    )
-    # Log staged dir contents for debugging
     try:
         staged_contents = [p.name for p in staged_dir.iterdir()]
-        logger.info("Staged dir contents: %s", staged_contents)
-    except Exception:
-        pass
+        _log_update(f"staged_dir contents: {staged_contents}")
+    except Exception as exc:
+        _log_update(f"Could not list staged_dir: {exc}")
 
     # macOS .app bundle: replace the entire .app directory, not just
     # Contents/MacOS/.  The staged archive also contains an .app folder.
@@ -437,16 +513,21 @@ def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
         app_dir = app_dir.parent.parent.parent   # .app root
         exe_name = f"Contents/MacOS/{Path(sys.executable).name}"
 
+    _log_update(f"pid={pid}  app_dir={app_dir}  exe_name={exe_name}")
+
     try:
         if sys.platform == "win32":
             script = _write_windows_bootstrap(pid, app_dir, staged_dir, exe_name)
+            _log_update(f"Windows bootstrap script written to: {script}")
             # os.startfile uses ShellExecute — the launched process is
             # completely detached from Python.  Unlike subprocess.Popen,
             # it cannot be killed when the parent process exits.
             # A console window will briefly appear (acceptable).
             os.startfile(str(script))
+            _log_update("os.startfile succeeded — app should exit now.")
         else:
             script = _write_unix_bootstrap(pid, app_dir, staged_dir, exe_name)
+            _log_update(f"Unix bootstrap script written to: {script}")
             subprocess.Popen(
                 ["/bin/sh", str(script)],
                 start_new_session=True,
@@ -454,11 +535,12 @@ def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            _log_update("subprocess.Popen succeeded — app should exit now.")
 
-        logger.info("Bootstrap launched: %s — app should exit now.", script)
         return True
 
     except Exception as exc:
+        _log_update(f"ERROR launching bootstrap: {exc}")
         logger.error("Failed to launch bootstrap: %s", exc)
         return False
 

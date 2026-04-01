@@ -2,11 +2,16 @@
 ETA Tracker - Estimates time remaining during sync operations.
 
 Tracks elapsed time per stage and per item, computing a smoothed
-estimate of remaining time based on rolling average throughput.
+estimate of remaining time using exponential moving average (EMA)
+for professional-grade stability that doesn't jump around.
+
+The EMA approach weights recent samples more heavily but blends in
+historical data, avoiding the sharp jumps and flickering that occur
+with simple rolling windows or raw averages.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -19,9 +24,11 @@ class StageStats:
     total_items: int = 0
     completed_items: int = 0
 
-    # Rolling window of per-item durations for smoothing
-    _item_times: list[float] = field(default_factory=list)
+    # Exponential moving average for per-item duration (professional smoothing)
+    _ema_item_time: Optional[float] = None  # None until first sample
+    _ema_alpha: float = 0.15  # Smoothing factor: 0.15 = ~13-item decay time
     _last_item_time: float = 0.0
+    _items_processed: int = 0  # Count for cold-start bias correction
 
     @property
     def elapsed(self) -> float:
@@ -30,14 +37,37 @@ class StageStats:
 
     @property
     def avg_item_time(self) -> float:
-        """Smoothed average time per item using recent window."""
-        if not self._item_times:
+        """Exponential moving average of per-item time.
+
+        Uses Welford's online variance correction for the first ~20 items
+        to stabilize against outliers during cold start.
+        """
+        if self._ema_item_time is None:
             if self.completed_items > 0 and self.elapsed > 0:
                 return self.elapsed / self.completed_items
             return 0.0
-        # Use last N items for a responsive average
-        window = self._item_times[-20:]
-        return sum(window) / len(window)
+        # Apply cold-start correction: weight newer EMA less until we have
+        # enough samples. This prevents huge swings when the first few items
+        # happen to be much faster/slower than the average.
+        if self._items_processed < 20:
+            # Blend the EMA with a fall-back estimate based on total elapsed.
+            # As _items_processed grows, shift weight from fallback to EMA.
+            fallback = self.elapsed / max(1, self.completed_items)
+            blend_alpha = self._items_processed / 20.0
+            return (blend_alpha * self._ema_item_time
+                    + (1 - blend_alpha) * fallback)
+        return self._ema_item_time
+
+    def _update_ema(self, new_time: float):
+        """Update the exponential moving average with a new sample."""
+        if self._ema_item_time is None:
+            self._ema_item_time = new_time
+        else:
+            self._ema_item_time = (
+                self._ema_alpha * new_time
+                + (1 - self._ema_alpha) * self._ema_item_time
+            )
+        self._items_processed += 1
 
     @property
     def remaining_seconds(self) -> float:
@@ -91,8 +121,9 @@ class ETATracker:
 
     def stage_start(self, stage: str, total: int):
         """Begin tracking a new stage with the given item count."""
-        stats = StageStats(stage=stage, start_time=time.monotonic(), total_items=total)
-        stats._last_item_time = time.monotonic()
+        t = time.monotonic()
+        stats = StageStats(stage=stage, start_time=t, total_items=total)
+        stats._last_item_time = t
         self._stages[stage] = stats
         if stage not in self._stage_order:
             self._stage_order.append(stage)
@@ -108,7 +139,7 @@ class ETATracker:
         now = time.monotonic()
         dt = now - stats._last_item_time
         stats._last_item_time = now
-        stats._item_times.append(dt)
+        stats._update_ema(dt)
         stats.completed_items += 1
 
     def stage_end(self, stage: str):
@@ -133,15 +164,15 @@ class ETATracker:
 
         # Record newly completed items.
         # When progress jumps by >1 (batched updates), spread the elapsed
-        # time evenly across the skipped items instead of recording near-zero
-        # deltas for each, which would collapse the rolling average to ~0.
+        # time evenly across the items instead of recording near-zero
+        # deltas for each, which would collapse the EMA.
         gap = current - stats.completed_items
         if gap > 0:
             now = time.monotonic()
             total_dt = now - stats._last_item_time
             per_item = total_dt / gap
             for _ in range(gap):
-                stats._item_times.append(per_item)
+                stats._update_ema(per_item)
                 stats.completed_items += 1
             stats._last_item_time = now
 

@@ -131,6 +131,7 @@ def pc_track_to_info(
     was_transcoded: bool,
     ipod_file_path: Optional[Path] = None,
     aac_quality: str = "normal",
+    existing_media_type: Optional[int] = None,
 ) -> TrackInfo:
     """Convert PCTrack to TrackInfo for writing.
 
@@ -140,6 +141,9 @@ def pc_track_to_info(
         was_transcoded: Whether the file was format-converted.
         ipod_file_path: Actual file on iPod (for accurate size after transcode).
         aac_quality: AAC quality preset name (for transcoded bitrate).
+        existing_media_type: If provided, preserve this media_type instead of
+                            recalculating from pc_track.video_kind. Used for
+                            UPDATE operations to preserve the original type.
     """
     ext = Path(ipod_location.replace(":", "/")).suffix.lower().lstrip(".")
     if ext in ("m4a", "aac", "alac"):
@@ -179,39 +183,51 @@ def pc_track_to_info(
             sample_rate = min(sample_rate, _MAX_SR)
 
     # ── Media type auto-detection ────────────────────────────────
-    is_video = pc_track.is_video
-    video_kind = pc_track.video_kind or ""
-    is_podcast = pc_track.is_podcast
-    is_audiobook = pc_track.is_audiobook
-    movie_file_flag = 0
-    media_type = MEDIA_TYPE_AUDIO
-    podcast_flag = 0
-    skip_when_shuffling = False
-    remember_position = False
+    # If an existing media_type is provided (for UPDATE operations), preserve it
+    # instead of recalculating from the current file's video_kind metadata.
+    # This prevents media_type from changing due to missing/inconsistent stik atoms.
+    if existing_media_type is not None:
+        media_type = existing_media_type
+        # Derive flags from the preserved media_type
+        movie_file_flag = 1 if existing_media_type & (MEDIA_TYPE_VIDEO | MEDIA_TYPE_MUSIC_VIDEO | MEDIA_TYPE_TV_SHOW | MEDIA_TYPE_VIDEO_PODCAST) else 0
+        podcast_flag = 1 if existing_media_type & (MEDIA_TYPE_PODCAST | MEDIA_TYPE_VIDEO_PODCAST) else 0
+        skip_when_shuffling = bool(existing_media_type & (MEDIA_TYPE_PODCAST | MEDIA_TYPE_AUDIOBOOK | MEDIA_TYPE_VIDEO_PODCAST))
+        remember_position = bool(existing_media_type & (MEDIA_TYPE_PODCAST | MEDIA_TYPE_AUDIOBOOK | MEDIA_TYPE_VIDEO_PODCAST))
+    else:
+        # Normal auto-detection from PC track metadata
+        is_video = pc_track.is_video
+        video_kind = pc_track.video_kind or ""
+        is_podcast = pc_track.is_podcast
+        is_audiobook = pc_track.is_audiobook
+        movie_file_flag = 0
+        media_type = MEDIA_TYPE_AUDIO
+        podcast_flag = 0
+        skip_when_shuffling = False
+        remember_position = False
 
-    if is_video:
-        movie_file_flag = 1
-        if is_podcast:
-            media_type = MEDIA_TYPE_VIDEO_PODCAST
+        if is_video:
+            movie_file_flag = 1
+            if is_podcast:
+                media_type = MEDIA_TYPE_VIDEO_PODCAST
+                podcast_flag = 1
+                skip_when_shuffling = True
+                remember_position = True
+            elif video_kind == "tv_show":
+                media_type = MEDIA_TYPE_TV_SHOW
+            elif video_kind == "music_video":
+                media_type = MEDIA_TYPE_MUSIC_VIDEO
+            else:
+                # Default to movie for generic video files
+                media_type = MEDIA_TYPE_VIDEO
+        elif is_podcast:
+            media_type = MEDIA_TYPE_PODCAST
             podcast_flag = 1
             skip_when_shuffling = True
             remember_position = True
-        elif video_kind == "tv_show":
-            media_type = MEDIA_TYPE_TV_SHOW
-        elif video_kind == "music_video":
-            media_type = MEDIA_TYPE_MUSIC_VIDEO
-        else:
-            # Default to movie for generic video files
-            media_type = MEDIA_TYPE_VIDEO
-    elif is_podcast:
-        media_type = MEDIA_TYPE_PODCAST
-        podcast_flag = 1
-        skip_when_shuffling = True
-        remember_position = True
-    elif is_audiobook:
-        media_type = MEDIA_TYPE_AUDIOBOOK
-        skip_when_shuffling = True
-        remember_position = True
+        elif is_audiobook:
+            media_type = MEDIA_TYPE_AUDIOBOOK
+            skip_when_shuffling = True
+            remember_position = True
 
     # ── Gapless & encoder flags ──────────────────────────────────
     pregap = pc_track.pregap or 0

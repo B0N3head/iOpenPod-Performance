@@ -55,6 +55,7 @@ class TrackListTitleBar(QFrame):
         self.splitter = splitterToControl
         self.dragging = False
         self.dragStartPos = QPoint()
+        self._fullscreen_mode = False
         self.setMouseTracking(True)
         self.titleBarLayout = QHBoxLayout(self)
         self.titleBarLayout.setContentsMargins((14), 0, (10), 0)
@@ -115,6 +116,13 @@ class TrackListTitleBar(QFrame):
                                           text_secondary=txt_sec))
         self._set_handle_color(f"rgba({r2},{g2},{b2},180)")
 
+    def setFullscreenMode(self, fullscreen: bool):
+        """Enable/disable fullscreen mode. Hides buttons and disables dragging."""
+        self._fullscreen_mode = fullscreen
+        self.button1.setVisible(not fullscreen)
+        self.button2.setVisible(not fullscreen)
+        self.unsetCursor()
+
     def resetColor(self):
         """Reset to the default blue gradient."""
         self.setStyleSheet(_default_css())
@@ -146,7 +154,7 @@ class TrackListTitleBar(QFrame):
 
     def mousePressEvent(self, a0):
         if a0 and a0.button() == Qt.MouseButton.LeftButton:
-            if self.childAt(a0.pos()) is None:
+            if not self._fullscreen_mode and self.childAt(a0.pos()) is None:
                 self.dragging = True
                 self.dragStartPos = a0.globalPosition().toPoint()
                 a0.accept()
@@ -177,7 +185,7 @@ class TrackListTitleBar(QFrame):
             a0.accept()
 
     def enterEvent(self, event):  # type: ignore[override]
-        if event:
+        if event and not self._fullscreen_mode:
             pos = event.position().toPoint()
             if self.childAt(pos) is None:
                 self.setCursor(Qt.CursorShape.SizeVerCursor)

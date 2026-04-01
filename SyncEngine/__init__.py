@@ -1,5 +1,5 @@
 """
-SyncEngine - Bridge between PC music library and iPod
+SyncEngine - Bridge between PC media library and iPod
 
 Core components:
 - PCLibrary: Scans PC music folder, extracts metadata

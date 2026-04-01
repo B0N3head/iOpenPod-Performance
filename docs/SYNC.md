@@ -1,6 +1,6 @@
 # iOpenPod Sync — How It Works
 
-Complete reference for the sync system that bridges a PC music library to an iPod Classic.
+Complete reference for the sync system that bridges a PC media library to an iPod Classic.
 
 ---
 
@@ -556,7 +556,7 @@ The user can cancel at any point during execution. The `is_cancelled` callback (
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `music_folder` | — | Remembered PC folder path |
+| `media_folder` | — | Remembered PC folder path |
 | `write_back_to_pc` | `false` | When true, play counts and ratings are written to PC file metadata |
 | `aac_quality` | `"normal"` | Quality preset for lossy transcodes: high, normal, compact, spoken |
 | `prefer_lossy` | `false` | When true, lossless (FLAC/WAV/AIFF) encodes to AAC instead of ALAC |

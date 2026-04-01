@@ -530,15 +530,15 @@ class Sidebar(QFrame):
     category_glyphs = {
         "Albums": "music",
         "Artists": "user",
+        "Genres": "grid",
         "Tracks": "music",
         "Playlists": "annotation-dots",
-        "Genres": "grid",
         "Podcasts": "broadcast",
         "Audiobooks": "book",
-        "Videos": "video",
         "Movies": "film",
         "TV Shows": "monitor",
         "Music Videos": "video",
+        "Videos": "video",
     }
 
     def __init__(self):
@@ -751,7 +751,9 @@ class Sidebar(QFrame):
         self.category_changed.emit(category)
 
     def _style_nav_btn(self, category: str, selected: bool):
-        btn = self.buttons[category]
+        btn = self.buttons.get(category)
+        if btn is None:
+            return
         btn.setStyleSheet(sidebar_nav_selected_css() if selected else sidebar_nav_css())
         icon_name = self._button_icons.get(category)
         if icon_name:

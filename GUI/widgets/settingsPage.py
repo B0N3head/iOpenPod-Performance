@@ -984,9 +984,9 @@ class SettingsPage(QWidget):
         )
 
     def _build_sync_page(self) -> QScrollArea:
-        self.music_folder = FolderRow(
-            "Music Folder",
-            "Default PC music library folder for sync. "
+        self.media_folder = FolderRow(
+            "Media Folder",
+            "Default PC media library folder for sync. "
             "This is remembered between sessions.",
         )
         self.write_back = ToggleRow(
@@ -1014,7 +1014,7 @@ class SettingsPage(QWidget):
         return self._make_page(
             "Sync",
             _SettingsCard(
-                self.music_folder,
+                self.media_folder,
                 self.write_back,
                 self.compute_sound_check,
                 self.rating_strategy,
@@ -1247,7 +1247,7 @@ class SettingsPage(QWidget):
         from settings import get_settings
         s = get_settings()
 
-        self.music_folder.value = s.music_folder
+        self.media_folder.value = s.media_folder
         self.write_back.value = s.write_back_to_pc
         self.compute_sound_check.value = s.compute_sound_check
 
@@ -1374,7 +1374,7 @@ class SettingsPage(QWidget):
         # Connect signals to auto-save (only once)
         if not hasattr(self, '_signals_connected'):
             self._signals_connected = True
-            self.music_folder.changed.connect(self._save)
+            self.media_folder.changed.connect(self._save)
             self.write_back.changed.connect(self._save)
             self.compute_sound_check.changed.connect(self._save)
             self.rating_strategy.changed.connect(self._save)
@@ -1407,7 +1407,7 @@ class SettingsPage(QWidget):
         from settings import get_settings
         s = get_settings()
 
-        s.music_folder = self.music_folder.value
+        s.media_folder = self.media_folder.value
         s.write_back_to_pc = self.write_back.value
         s.compute_sound_check = self.compute_sound_check.value
 
@@ -1587,6 +1587,7 @@ class SettingsPage(QWidget):
         from PyQt6.QtWidgets import QMessageBox, QProgressDialog
         from GUI.auto_updater import (
             UpdateDownloader, stage_update, launch_bootstrap_and_exit,
+            update_log_path,
         )
 
         notes_preview = result.release_notes[:500]
@@ -1680,11 +1681,13 @@ class SettingsPage(QWidget):
                 )
                 return
 
+            log_path = update_log_path()
             answer2 = QMessageBox.question(
                 self, "Install Update & Restart?",
                 f"v{result.latest_version} is ready to install.\n\n"
                 "iOpenPod will close, apply the update, and "
                 "relaunch automatically.\n\n"
+                f"If anything goes wrong, check the log at:\n{log_path}\n\n"
                 "Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -1700,8 +1703,8 @@ class SettingsPage(QWidget):
                     QMessageBox.warning(
                         self, "Update Failed",
                         "Could not start the update installer.\n\n"
-                        f"The update files are at:\n{staged}\n"
-                        "You can copy them manually.",
+                        f"The update files are at:\n{staged}\n\n"
+                        f"Check the log for details:\n{log_path}",
                     )
 
         downloader.progress.connect(_on_progress)

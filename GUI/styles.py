@@ -495,7 +495,6 @@ class Colors:
 
         palette_entry = _THEME_REGISTRY.get(effective, _THEME_REGISTRY["dark"])
         base_palette, is_dark = palette_entry
-        is_catppuccin = effective.startswith("catppuccin-")
 
         # Resolve contrast (ignored for Catppuccin — they have their own contrast ratios)
         if high_contrast == "system":
@@ -507,9 +506,11 @@ class Colors:
         cls._active_theme = effective
         cls._active_hc = hc
 
-        # Build resolved palette, optionally merging HC overrides
+        # Build resolved palette, optionally merging HC overrides.
+        # High contrast applies to all themes based on their is_dark flag,
+        # including Catppuccin variants (Latte is light, others are dark).
         resolved = dict(base_palette)
-        if hc and not is_catppuccin:
+        if hc:
             resolved.update(_HC_DARK_OVERRIDES if is_dark else _HC_LIGHT_OVERRIDES)
 
         # Apply custom accent color (skip for "blue" — use theme default)
@@ -528,6 +529,13 @@ class Colors:
         cls.PLAYLIST_PODCAST = pc["PLAYLIST_PODCAST"]
         cls.PLAYLIST_MASTER = pc["PLAYLIST_MASTER"]
         cls.PLAYLIST_REGULAR = pc["PLAYLIST_REGULAR"]
+
+        # If a custom accent color was applied, use it for PLAYLIST_REGULAR
+        # so the default track title bar color matches the user's accent choice.
+        if accent_color and accent_color not in ("blue", "match-ipod"):
+            rgb = _parse_accent_hex(accent_color)
+            if rgb is not None:
+                cls.PLAYLIST_REGULAR = rgb
 
 
 # Named accent color presets (settings value → hex).
@@ -559,6 +567,14 @@ def resolve_accent_color(
             from ipod_models import color_for_image
             rgb = color_for_image(ipod_image)
             if rgb is not None:
+                # Reject white/silver and black/gray iPods — they don't work
+                # as accent colors. Check saturation: achromatic colors have
+                # R, G, B values very close together; colorful ones are spread out.
+                r_min, r_max = min(rgb), max(rgb)
+                saturation = r_max - r_min
+                # Saturation < 15 indicates grayscale (white/silver/black/gray)
+                if saturation < 15:
+                    return "blue"  # fall back to theme default
                 return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
         return "blue"  # no iPod connected — fall back to default
     # Named preset

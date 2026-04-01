@@ -1034,6 +1034,11 @@ class SyncExecutor:
                 if item.pc_track.sample_rate:
                     existing_track.sample_rate = item.pc_track.sample_rate
 
+                # IMPORTANT: Preserve media_type from the existing iPod track.
+                # Don't recalculate it from the current file's metadata (stik atom),
+                # which may be missing or inconsistent between syncs.
+                # (media_type is already set from the original file, no change needed)
+
                 ctx.tracks_by_location[ipod_location] = existing_track
 
             if db_id:
@@ -1499,7 +1504,7 @@ class SyncExecutor:
 
     # ── File Operations ─────────────────────────────────────────────────────
 
-    def _get_next_music_folder(self) -> Path:
+    def _get_next_media_folder(self) -> Path:
         """Get next music folder (F00-Fxx) using round-robin. Thread-safe.
 
         The number of Fxx directories varies by device (3-50); defaults to
@@ -1580,7 +1585,7 @@ class SyncExecutor:
 
         Returns: (success, ipod_path, was_transcoded, error_message)
         """
-        dest_folder = self._get_next_music_folder()
+        dest_folder = self._get_next_media_folder()
         source_size = source_path.stat().st_size
 
         # Safety check: abort if writing this file would leave below the reserve
