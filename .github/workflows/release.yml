@@ -33,6 +33,7 @@ jobs:
           - os: ubuntu-22.04
             artifact: iOpenPod-Linux
             archive_name: iOpenPod-Linux.tar.gz
+            appimage_name: iOpenPod-Linux-x86_64.AppImage
 
     runs-on: ${{ matrix.os }}
 
@@ -99,12 +100,67 @@ jobs:
         if: runner.os == 'Linux'
         run: cd dist && tar czf ../${{ matrix.archive_name }} iOpenPod/
 
+      - name: Build AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -L --fail -o appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications
+
+          # Preserve PyInstaller one-folder layout so the binary can load _internal/*.
+          cp -a dist/iOpenPod/. AppDir/usr/bin/
+
+          cat > AppDir/iOpenPod.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=iOpenPod
+          Exec=iOpenPod
+          Icon=iOpenPod
+          Categories=AudioVideo;Utility;
+          Terminal=false
+          EOF
+          cp AppDir/iOpenPod.desktop AppDir/usr/share/applications/iOpenPod.desktop
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          APPBIN="$HERE/usr/bin"
+
+          export PATH="$APPBIN:$PATH"
+          export LD_LIBRARY_PATH="$APPBIN/_internal:$APPBIN/_internal/Qt/lib:$APPBIN/_internal/lib:${LD_LIBRARY_PATH:-}"
+          export QT_PLUGIN_PATH="$APPBIN/_internal/plugins:${QT_PLUGIN_PATH:-}"
+          export QML2_IMPORT_PATH="$APPBIN/_internal/qml:${QML2_IMPORT_PATH:-}"
+
+          exec "$APPBIN/iOpenPod" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          cp assets/icons/icon-256.png AppDir/iOpenPod.png
+
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
+            AppDir "${{ matrix.appimage_name }}"
+
       # ── Checksums ───────────────────────────────────────────────────
       - name: Generate SHA-256 checksum
         run: |
           python -c "
           import hashlib, pathlib, sys
           p = pathlib.Path('${{ matrix.archive_name }}')
+          h = hashlib.sha256(p.read_bytes()).hexdigest()
+          out = f'{h}  {p.name}\n'
+          pathlib.Path(p.name + '.sha256').write_text(out)
+          print(out.strip())
+          "
+
+      - name: Generate SHA-256 checksum (Linux AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          python -c "
+          import hashlib, pathlib
+          p = pathlib.Path('${{ matrix.appimage_name }}')
           h = hashlib.sha256(p.read_bytes()).hexdigest()
           out = f'{h}  {p.name}\n'
           pathlib.Path(p.name + '.sha256').write_text(out)
@@ -118,6 +174,15 @@ jobs:
           path: |
             ${{ matrix.archive_name }}
             ${{ matrix.archive_name }}.sha256
+
+      - name: Upload AppImage artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOpenPod-Linux-AppImage
+          path: |
+            ${{ matrix.appimage_name }}
+            ${{ matrix.appimage_name }}.sha256
 
   # ── Publish GitHub Release ──────────────────────────────────────────────
   release:
@@ -135,4 +200,5 @@ jobs:
           files: |
             *.zip
             *.tar.gz
+            *.AppImage
             *.sha256

@@ -24,8 +24,9 @@ Grab the latest release for your platform. No Python required, no setup wizards,
 |----------|------|-------------|
 | **Windows** | `iOpenPod-windows.zip` | Extract, and run `iOpenPod.exe` |
 | **macOS** | `iOpenPod-macos.tar.gz` | Extract, and run `iOpenPod.app`, you will need to allow the unknown developer in System Settings. |
-| **Linux (All distros)** | `iOpenPod-linux.tar.gz` | Extract, and run `./iOpenPod` |
+| **Linux (All distros, recommended)** | `iOpenPod-Linux-x86_64.AppImage ` | Make it executable with `chmod a+x ./iOpenPod-Linux-x86_64.AppImage` and run. |
 | **Linux (Arch-based)** | [`iopenpod`](https://aur.archlinux.org/packages/iopenpod)<sup>AUR</sup> | Available in the AUR |
+| **Linux (All distros)** | `iOpenPod-linux.tar.gz` | Extract, and run `./iOpenPod` |
 
 Once installed, iOpenPod can check for updates automatically and can update itself right from the app. (Except when installed from AUR.)
 
