@@ -1,0 +1,86 @@
+# Flatpak manifest for iOpenPod.
+#
+# This manifest wraps the pre-built PyInstaller bundle produced by the
+# release workflow — it does NOT build iOpenPod from Python source inside
+# the Flatpak SDK.  The bundle directory (dist/iOpenPod/) must already
+# exist when flatpak-builder is invoked; the GitHub Actions workflow takes
+# care of building it first.
+#
+# App-ID follows the reverse-DNS convention for GitHub-hosted projects:
+#   io.github.<owner>.<AppName>
+
+app-id: io.github.marthabo.iOpenPod
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: iOpenPod
+
+# Do not split out locale data — the app ships no gettext catalogues.
+separate-locales: false
+
+finish-args:
+  # Qt needs shared memory for IPC between processes.
+  - --share=ipc
+  # Allow the app to open an X11 window.
+  - --socket=x11
+  # Allow the app to open a Wayland window.
+  - --socket=wayland
+  # Give the app access to all host devices, including USB (for iPod).
+  - --device=all
+  # Allow outbound network access (podcast downloads, artwork, update checks).
+  - --share=network
+  # Allow read/write access to the user's home directory (music library).
+  - --filesystem=home
+  # Common iPod mount points on Linux.
+  - --filesystem=/media
+  - --filesystem=/run/media
+
+modules:
+  - name: iOpenPod
+    buildsystem: simple
+
+    sources:
+      # The PyInstaller one-folder bundle built by the CI workflow.
+      # Contains the 'iOpenPod' ELF binary and the '_internal/' directory.
+      - type: dir
+        path: ../dist/iOpenPod
+        dest: bundle
+
+      # Icon assets from the repository.
+      - type: dir
+        path: ../assets/icons
+        dest: icons
+
+      # Wrapper shell script, desktop entry, and AppStream metadata live in
+      # the same directory as this manifest so they are easy to find.
+      - type: file
+        path: iOpenPod-wrapper.sh
+      - type: file
+        path: io.github.marthabo.iOpenPod.desktop
+      - type: file
+        path: io.github.marthabo.iOpenPod.metainfo.xml
+
+    build-commands:
+      # ── Install the PyInstaller bundle ────────────────────────────────
+      - install -d /app/lib/iOpenPod
+      - cp -a bundle/. /app/lib/iOpenPod/
+      # Ensure the main executable is executable (cp -a should preserve
+      # the bit, but be explicit for robustness).
+      - chmod +x /app/lib/iOpenPod/iOpenPod
+
+      # ── Wrapper script at /app/bin/iOpenPod ──────────────────────────
+      - install -Dm755 iOpenPod-wrapper.sh /app/bin/iOpenPod
+
+      # ── Icons ─────────────────────────────────────────────────────────
+      - install -Dm644 icons/icon-256.png /app/share/icons/hicolor/256x256/apps/io.github.marthabo.iOpenPod.png
+      - install -Dm644 icons/icon-128.png /app/share/icons/hicolor/128x128/apps/io.github.marthabo.iOpenPod.png
+      - install -Dm644 icons/icon-64.png  /app/share/icons/hicolor/64x64/apps/io.github.marthabo.iOpenPod.png
+      - install -Dm644 icons/icon-48.png  /app/share/icons/hicolor/48x48/apps/io.github.marthabo.iOpenPod.png
+      - install -Dm644 icons/icon-32.png  /app/share/icons/hicolor/32x32/apps/io.github.marthabo.iOpenPod.png
+      - install -Dm644 icons/icon-16.png  /app/share/icons/hicolor/16x16/apps/io.github.marthabo.iOpenPod.png
+
+      # ── Desktop entry ────────────────────────────────────────────────
+      - install -Dm644 io.github.marthabo.iOpenPod.desktop /app/share/applications/io.github.marthabo.iOpenPod.desktop
+
+      # ── AppStream metadata ───────────────────────────────────────────
+      - install -Dm644 io.github.marthabo.iOpenPod.metainfo.xml /app/share/metainfo/io.github.marthabo.iOpenPod.metainfo.xml

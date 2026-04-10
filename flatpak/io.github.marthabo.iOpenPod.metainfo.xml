@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.marthabo.iOpenPod</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>iOpenPod</name>
+  <summary>Ditch iTunes. Sync your iPod the open way.</summary>
+  <description>
+    <p>
+      iOpenPod is a free, open-source desktop application that lets you manage your iPod
+      without iTunes. Plug in your iPod and sync from any file format — FLAC, OGG, MP3 —
+      iOpenPod automatically handles conversion.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Sync music from any format with automatic transcoding to ALAC or AAC</li>
+      <li>Built-in podcast manager — subscribe, download, and sync episodes</li>
+      <li>ListenBrainz scrobbling</li>
+      <li>Drag-and-drop file management</li>
+      <li>Play count and rating sync back from iPod</li>
+      <li>Album art written in the iPod's native RGB565 format</li>
+      <li>Sync review with per-item checkboxes before anything changes</li>
+      <li>Playlist and smart playlist support</li>
+      <li>Backup and rollback</li>
+    </ul>
+    <p>
+      Works with every click-wheel iPod Apple ever made: 1G–5G, Mini, Photo,
+      Classic (all generations), Nano 1G–7G.
+    </p>
+  </description>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Utility</category>
+  </categories>
+  <url type="homepage">https://github.com/marthabo/iOpenPod</url>
+  <url type="bugtracker">https://github.com/marthabo/iOpenPod/issues</url>
+  <launchable type="desktop-id">io.github.marthabo.iOpenPod.desktop</launchable>
+  <provides>
+    <binary>iOpenPod</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.41" date="2026-04-10"/>
+  </releases>
+</component>
