@@ -52,9 +52,6 @@ jobs:
       # downloads the required runtime from Flathub, runs flatpak-builder
       # with the manifest, and exports a single-file .flatpak bundle.
       - name: Build Flatpak bundle
-          run: |
-            flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-            flatpak --user remotes --show-details 
           uses: flatpak/flatpak-github-actions/flatpak-builder@v6
           with:
             bundle: iOpenPod-Linux.flatpak
