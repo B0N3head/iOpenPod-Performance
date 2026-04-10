@@ -1,0 +1,79 @@
+# Build a Flatpak bundle that wraps the PyInstaller binary and attach it
+# to the GitHub Release on every version tag.
+#
+# Approach:
+#   1. Build the Linux PyInstaller one-folder bundle (same steps as
+#      release.yml so the two workflows stay in sync).
+#   2. Run flatpak-builder against flatpak/io.github.marthabo.iOpenPod.yml,
+#      which copies the bundle into the Flatpak sandbox and installs the
+#      desktop entry, icons, and AppStream metadata.
+#   3. Upload the resulting .flatpak bundle as a release asset.
+
+name: Flatpak
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # needed to upload assets to the GitHub Release
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python + uv ───────────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      # Qt runtime libraries required for the PyInstaller build step.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install project dependencies
+        run: uv sync
+
+      # ── Build the PyInstaller one-folder bundle ───────────────────────
+      - name: Build with PyInstaller
+        run: uv run pyinstaller iOpenPod.spec --noconfirm
+
+      # ── Package as a Flatpak bundle ───────────────────────────────────
+      # flatpak-github-actions installs flatpak + flatpak-builder,
+      # downloads the required runtime from Flathub, runs flatpak-builder
+      # with the manifest, and exports a single-file .flatpak bundle.
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: iOpenPod-Linux.flatpak
+          manifest-path: flatpak/io.github.marthabo.iOpenPod.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      # ── Checksum ──────────────────────────────────────────────────────
+      - name: Generate SHA-256 checksum
+        run: |
+          python -c "
+          import hashlib, pathlib
+          p = pathlib.Path('iOpenPod-Linux.flatpak')
+          h = hashlib.sha256(p.read_bytes()).hexdigest()
+          out = f'{h}  {p.name}\n'
+          pathlib.Path(p.name + '.sha256').write_text(out)
+          print(out.strip())
+          "
+
+      # ── Attach to GitHub Release ──────────────────────────────────────
+      - name: Upload Flatpak bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            iOpenPod-Linux.flatpak
+            iOpenPod-Linux.flatpak.sha256
