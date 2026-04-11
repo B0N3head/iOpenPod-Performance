@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='UTF-8'?>
 <component type="desktop-application">
   <id>io.github.therealsavi.iOpenPod</id>
   <metadata_license>MIT</metadata_license>
@@ -39,8 +39,8 @@
   <provides>
     <binary>iOpenPod</binary>
   </provides>
-  <content_rating type="oars-1.1"/>
+  <content_rating type="oars-1.1" />
   <releases>
-    <release version="1.0.43" date="2026-04-08"/>
+    <release version="version" date="date" />
   </releases>
 </component>
