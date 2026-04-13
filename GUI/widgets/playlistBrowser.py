@@ -10,7 +10,8 @@ from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QProgressBar, QPushButton,
     QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout,
     QWidget,
 )
@@ -138,6 +139,25 @@ class PlaylistInfoCard(QFrame):
         self.evaluate_btn.hide()
         btn_row.addWidget(self.evaluate_btn)
 
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _exp_ic = glyph_icon("arrow-up-tray", (14), Colors.TEXT_SECONDARY)
+        if _exp_ic:
+            self.export_btn.setIcon(_exp_ic)
+            self.export_btn.setIconSize(QSize((14), (14)))
+        self.export_btn.setStyleSheet(btn_css(
+            bg="transparent",
+            bg_hover=Colors.SURFACE_HOVER,
+            bg_press=Colors.SURFACE_ACTIVE,
+            fg=Colors.TEXT_SECONDARY,
+            border=f"1px solid {Colors.BORDER}",
+            padding="3px 12px",
+        ))
+        self.export_btn.setToolTip("Export playlist to M3U8 file")
+        self.export_btn.hide()
+        btn_row.addWidget(self.export_btn)
+
         self._layout.addLayout(btn_row)
 
         # ── Separator ──────────────────────────────────────────
@@ -205,6 +225,8 @@ class PlaylistInfoCard(QFrame):
         self.delete_btn.setVisible(deletable)
         # Show evaluate button for any smart playlist (except master and categories)
         self.evaluate_btn.setVisible(is_smart and not is_master and not is_category)
+        # Show export button whenever there are tracks to export
+        self.export_btn.setVisible(bool(resolved_tracks))
         self._current_playlist = playlist
 
         self._populate_stats(playlist, resolved_tracks, source)
@@ -377,6 +399,7 @@ class PlaylistInfoCard(QFrame):
         self.edit_btn.hide()
         self.delete_btn.hide()
         self.evaluate_btn.hide()
+        self.export_btn.hide()
         self._current_playlist = None
 
     # ─────────────────────────────────────────────────────────────
@@ -430,6 +453,7 @@ class PlaylistListPanel(QFrame):
     """Scrollable list of playlists grouped by type with section headers."""
     playlist_selected = pyqtSignal(dict)  # Emits the full playlist dict
     new_playlist_requested = pyqtSignal(str)  # "smart" or "regular"
+    import_playlist_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -463,6 +487,22 @@ class PlaylistListPanel(QFrame):
         ))
         self._new_btn.clicked.connect(self._on_new_playlist)
         outer.addWidget(self._new_btn)
+
+        self._import_btn = QPushButton("↓  Import Playlist")
+        self._import_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        self._import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_btn.setMinimumHeight((34))
+        self._import_btn.setStyleSheet(btn_css(
+            bg="transparent",
+            bg_hover=Colors.SURFACE_HOVER,
+            bg_press=Colors.SURFACE_ACTIVE,
+            fg=Colors.TEXT_SECONDARY,
+            border=f"1px solid {Colors.BORDER}",
+            radius=Metrics.BORDER_RADIUS_SM,
+            padding="6px 8px",
+        ))
+        self._import_btn.clicked.connect(self.import_playlist_requested.emit)
+        outer.addWidget(self._import_btn)
 
         # Scroll area wrapping playlist sections
         self._scroll = make_scroll_area()
@@ -641,6 +681,12 @@ class PlaylistListPanel(QFrame):
             if choice:
                 self.new_playlist_requested.emit(choice)
 
+    def set_import_busy(self, busy: bool) -> None:
+        """Lock/unlock the Import and New Playlist buttons during import."""
+        self._import_btn.setEnabled(not busy)
+        self._new_btn.setEnabled(not busy)
+        self._import_btn.setText("Importing\u2026" if busy else "\u2193  Import Playlist")
+
     def _on_click(self, index: int) -> None:
         # Reset previous selection
         if self._selected_btn is not None:
@@ -695,6 +741,7 @@ class PlaylistBrowser(QFrame):
         self.listPanel = PlaylistListPanel()
         self.listPanel.playlist_selected.connect(self._onPlaylistSelected)
         self.listPanel.new_playlist_requested.connect(self._onNewPlaylist)
+        self.listPanel.import_playlist_requested.connect(self._onImportPlaylist)
         main_layout.addWidget(self.listPanel)
 
         # ── Right: vertical splitter (info-or-editor / track list) ──
@@ -708,6 +755,7 @@ class PlaylistBrowser(QFrame):
         self.infoCard.edit_btn.clicked.connect(self._onEditClicked)
         self.infoCard.delete_btn.clicked.connect(self._onDeleteClicked)
         self.infoCard.evaluate_btn.clicked.connect(self._onEvaluateNow)
+        self.infoCard.export_btn.clicked.connect(self._onExportClicked)
         self.infoCard.setMinimumHeight(0)
         self.infoCard.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._topStack.addWidget(self.infoCard)
@@ -723,6 +771,61 @@ class PlaylistBrowser(QFrame):
         self.regularEditor.saved.connect(self._onEditorSaved)
         self.regularEditor.cancelled.connect(self._onEditorCancelled)
         self._topStack.addWidget(self.regularEditor)
+
+        # Import progress page (index 3)
+        _imp_page = QFrame()
+        _imp_page.setStyleSheet(
+            f"QFrame {{ background: {Colors.SURFACE}; border: none; }}"
+        )
+        _imp_lay = QVBoxLayout(_imp_page)
+        _imp_lay.setContentsMargins(24, 24, 24, 24)
+        _imp_lay.setSpacing(12)
+        _imp_lay.addStretch()
+
+        _imp_title = QLabel("Importing Playlist\u2026")
+        _imp_title.setFont(QFont(FONT_FAMILY, Metrics.FONT_PAGE_TITLE, QFont.Weight.Bold))
+        _imp_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent;")
+        _imp_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _imp_lay.addWidget(_imp_title)
+
+        self._import_progress_bar = QProgressBar()
+        self._import_progress_bar.setFixedHeight(8)
+        self._import_progress_bar.setTextVisible(False)
+        self._import_progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {Colors.SURFACE_ALT};
+                border: none;
+                border-radius: 4px;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {Colors.ACCENT}, stop:1 {Colors.ACCENT_LIGHT});
+                border-radius: 4px;
+            }}
+        """)
+        _imp_lay.addWidget(self._import_progress_bar)
+
+        self._import_status_label = QLabel("")
+        self._import_status_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        self._import_status_label.setStyleSheet(
+            f"color: {Colors.TEXT_SECONDARY}; background: transparent;"
+        )
+        self._import_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._import_status_label.setWordWrap(True)
+        _imp_lay.addWidget(self._import_status_label)
+
+        self._import_count_label = QLabel("")
+        self._import_count_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._import_count_label.setStyleSheet(
+            f"color: {Colors.TEXT_TERTIARY}; background: transparent;"
+        )
+        self._import_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _imp_lay.addWidget(self._import_count_label)
+
+        _imp_lay.addStretch()
+        self._topStack.addWidget(_imp_page)  # Index 3
+
+        self._import_worker: _PlaylistImportWorker | None = None
 
         self._topStack.setCurrentIndex(0)  # start in browse mode
         self.rightSplitter.addWidget(self._topStack)
@@ -1114,6 +1217,186 @@ class PlaylistBrowser(QFrame):
         # Use the shared write flow
         self._writePlaylistToIPod(playlist)
 
+    def _onExportClicked(self) -> None:
+        """Export the current playlist to a standard playlist file."""
+        import os
+        from ..app import DeviceManager
+
+        tracks = self.trackList.tracks
+        if not tracks:
+            return
+
+        playlist_name = (self._current_playlist or {}).get("Title", "playlist")
+        safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in playlist_name).strip()
+
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Playlist",
+            safe_name + ".m3u8",
+            "M3U8 Playlist (*.m3u8);;"
+            "M3U Playlist (*.m3u);;"
+            "PLS Playlist (*.pls);;"
+            "XSPF Playlist (*.xspf);;"
+            "All Files (*)",
+        )
+        if not path:
+            return
+
+        device = DeviceManager.get_instance()
+        ipod_root = device.device_path or ""
+
+        def _abs_path(track: dict) -> str:
+            location = track.get("Location", "")
+            if location and ipod_root:
+                return os.path.join(ipod_root, location.replace(":", "/").lstrip("/"))
+            return location
+
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".pls":
+                content = self._export_pls(tracks, _abs_path)
+            elif ext == ".xspf":
+                content = self._export_xspf(tracks, _abs_path, playlist_name)
+            else:  # .m3u8, .m3u, or anything else
+                content = self._export_m3u(tracks, _abs_path)
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            QMessageBox.warning(self, "Export Failed", f"Could not write file:\n{e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Import Playlist
+    # ─────────────────────────────────────────────────────────────
+
+    def _onImportPlaylist(self) -> None:
+        """Open a file dialog and kick off the import worker."""
+        from ..app import DeviceManager
+        device = DeviceManager.get_instance()
+        if not device.device_path:
+            QMessageBox.warning(self, "No Device", "Please connect an iPod first.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Playlist",
+            "",
+            "Playlist Files (*.m3u *.m3u8 *.pls *.xspf);;All Files (*)",
+        )
+        if not path:
+            return
+
+        from settings import get_settings
+        settings = get_settings()
+
+        self.listPanel.set_import_busy(True)
+        self._topStack.setCurrentIndex(3)
+        self._import_progress_bar.setRange(0, 0)  # indeterminate
+        self._import_status_label.setText("Parsing playlist…")
+        self._import_count_label.setText("")
+
+        self._import_worker = _PlaylistImportWorker(
+            playlist_file=path,
+            ipod_path=str(device.device_path),
+            fpcalc_path=settings.fpcalc_path,
+        )
+        self._import_worker.progress.connect(self._onImportProgress)
+        self._import_worker.finished_ok.connect(self._onImportDone)
+        self._import_worker.failed.connect(self._onImportFailed)
+        self._import_worker.start()
+
+    def _onImportProgress(self, current: int, total: int, message: str) -> None:
+        if total > 0:
+            self._import_progress_bar.setRange(0, total)
+            self._import_progress_bar.setValue(current)
+            self._import_count_label.setText(f"{current} / {total}")
+        else:
+            # Indeterminate — keep bar spinning but don't clear previous count
+            self._import_progress_bar.setRange(0, 0)
+            self._import_count_label.setText("")
+        self._import_status_label.setText(message)
+
+    def _onImportDone(self, playlist_name: str, added: int, already_present: int, skipped: int) -> None:
+        self.listPanel.set_import_busy(False)
+        self._switchToBrowse()
+        parts = []
+        if added:
+            parts.append(f"{added} track(s) added to iPod")
+        if already_present:
+            parts.append(f"{already_present} already on iPod")
+        if skipped:
+            parts.append(f"{skipped} skipped (not found on PC)")
+        summary = "\n".join(parts) if parts else "No tracks found."
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Playlist '{playlist_name}' imported.\n\n{summary}",
+        )
+        QTimer.singleShot(500, self._rescanAfterWrite)
+
+    def _onImportFailed(self, error_msg: str) -> None:
+        self.listPanel.set_import_busy(False)
+        self._switchToBrowse()
+        QMessageBox.critical(self, "Import Failed", f"Could not import playlist:\n{error_msg}")
+
+    @staticmethod
+    def _export_m3u(tracks: list[dict], abs_path_fn) -> str:
+        lines = ["#EXTM3U", ""]
+        for track in tracks:
+            title = track.get("Title") or "Unknown Title"
+            artist = track.get("Artist") or track.get("Album Artist") or ""
+            duration_s = int((track.get("length") or 0) / 1000)
+            extinf_title = f"{artist} - {title}" if artist else title
+            lines.append(f"#EXTINF:{duration_s},{extinf_title}")
+            lines.append(abs_path_fn(track))
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _export_pls(tracks: list[dict], abs_path_fn) -> str:
+        lines = ["[playlist]", ""]
+        for i, track in enumerate(tracks, 1):
+            title = track.get("Title") or "Unknown Title"
+            artist = track.get("Artist") or track.get("Album Artist") or ""
+            duration_s = int((track.get("length") or 0) / 1000)
+            display = f"{artist} - {title}" if artist else title
+            lines.append(f"File{i}={abs_path_fn(track)}")
+            lines.append(f"Title{i}={display}")
+            lines.append(f"Length{i}={duration_s if duration_s else -1}")
+            lines.append("")
+        lines.append(f"NumberOfEntries={len(tracks)}")
+        lines.append("Version=2")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _export_xspf(tracks: list[dict], abs_path_fn, playlist_title: str) -> str:
+        import xml.etree.ElementTree as ET
+        from urllib.request import pathname2url
+
+        root = ET.Element("playlist", version="1", xmlns="http://xspf.org/ns/0/")
+        ET.SubElement(root, "title").text = playlist_title
+        track_list = ET.SubElement(root, "trackList")
+
+        for track in tracks:
+            t = ET.SubElement(track_list, "track")
+            raw_path = abs_path_fn(track)
+            if raw_path:
+                ET.SubElement(t, "location").text = "file://" + pathname2url(raw_path)
+            if title := track.get("Title"):
+                ET.SubElement(t, "title").text = title
+            artist = track.get("Artist") or track.get("Album Artist") or ""
+            if artist:
+                ET.SubElement(t, "creator").text = artist
+            if album := track.get("Album"):
+                ET.SubElement(t, "album").text = album
+            if duration_ms := track.get("length"):
+                ET.SubElement(t, "duration").text = str(int(duration_ms))
+            if track_num := track.get("track_number"):
+                ET.SubElement(t, "trackNum").text = str(track_num)
+
+        ET.indent(root, space="  ")
+        return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
+            root, encoding="unicode"
+        ) + "\n"
+
 
 # =============================================================================
 # _PlaylistWriteWorker — background thread for playlist save + write
@@ -1164,7 +1447,6 @@ class _PlaylistWriteWorker(QThread):
                 mapping=MappingFile(),
                 progress_callback=None,
                 dry_run=False,
-                aac_quality="normal",
                 write_back_to_pc=False,
                 _is_cancelled=None,
             )
@@ -1316,7 +1598,6 @@ class _PlaylistDeleteWorker(QThread):
                 mapping=MappingFile(),
                 progress_callback=None,
                 dry_run=False,
-                aac_quality="normal",
                 write_back_to_pc=False,
                 _is_cancelled=None,
             )
@@ -1387,3 +1668,299 @@ class _PlaylistDeleteWorker(QThread):
             import traceback
             traceback.print_exc()
             self.failed.emit(str(e))
+
+
+# =============================================================================
+# _PlaylistImportWorker — background thread for playlist file import
+# =============================================================================
+
+class _PlaylistImportWorker(QThread):
+    """Parse a playlist file, add missing tracks to iPod, create the playlist."""
+
+    progress = pyqtSignal(int, int, str)       # current, total, message
+    finished_ok = pyqtSignal(str, int, int, int)  # name, added, already_present, skipped
+    failed = pyqtSignal(str)                 # error message
+
+    def __init__(
+        self,
+        playlist_file: str,
+        ipod_path: str,
+        fpcalc_path: str,
+    ):
+        super().__init__()
+        self._playlist_file = playlist_file
+        self._ipod_path = ipod_path
+        self._fpcalc_path = fpcalc_path or None
+
+    def run(self):  # noqa: C901
+        try:
+            import random
+            from pathlib import Path
+
+            from SyncEngine.playlist_parser import parse_playlist
+            from SyncEngine.mapping import MappingManager
+            from SyncEngine.audio_fingerprint import get_or_compute_fingerprint
+            from SyncEngine.pc_library import PCLibrary
+            from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction
+            from SyncEngine.sync_executor import SyncExecutor, _SyncContext
+            from SyncEngine.mapping import MappingFile
+            from ..app import iTunesDBCache
+
+            # ── 1. Parse playlist file ──────────────────────────────────────
+            self.progress.emit(0, 0, "Parsing playlist file…")
+            try:
+                raw_paths, playlist_name = parse_playlist(self._playlist_file)
+            except Exception as exc:
+                self.failed.emit(f"Failed to parse playlist: {exc}")
+                return
+
+            if not raw_paths:
+                self.failed.emit("Playlist contains no tracks.")
+                return
+
+            # ── 2. Pre-screen: only files that exist on disk ────────────────
+            existing_paths: list[str] = []
+            skipped = 0
+            for p in raw_paths:
+                if Path(p).is_file():
+                    existing_paths.append(p)
+                else:
+                    skipped += 1
+
+            total = len(existing_paths)
+            if not existing_paths:
+                self.failed.emit("None of the playlist files could be found on this PC.")
+                return
+
+            self.progress.emit(0, total, f"Scanning {total} tracks…")
+
+            # ── 3. Fast-path: resolve iPod files by path lookup (O(1)) ──────
+            # Tracks already on the iPod have a known Location in iTunesDB.
+            # Convert file path → colon-separated Location and look up in a dict.
+            # No fpcalc needed for these.
+            ipod_root = Path(self._ipod_path)
+            cache = iTunesDBCache.get_instance()
+            track_id_index = cache.get_track_id_index()
+
+            loc_to_dbid: dict[str, int] = {}
+            for track in track_id_index.values():
+                loc = track.get("Location", "")
+                db_id = track.get("db_id")
+                if loc and db_id:
+                    loc_to_dbid[loc.lower()] = db_id
+
+            def _path_to_location(p: Path) -> str:
+                try:
+                    rel = p.relative_to(ipod_root)
+                except ValueError:
+                    return ""
+                return ":" + str(rel).replace("\\", ":").replace("/", ":")
+
+            playlist_db_ids: list[int] = []
+            needs_fingerprint: list[str] = []
+            already_present_fps: list[str] = []
+            fast_path_count = 0
+
+            for i, p in enumerate(existing_paths):
+                fname = Path(p).name
+                loc = _path_to_location(Path(p))
+                if loc:
+                    db_id = loc_to_dbid.get(loc.lower())
+                    if db_id is not None:
+                        playlist_db_ids.append(db_id)
+                        fast_path_count += 1
+                        self.progress.emit(i + 1, total, f"On iPod: {fname}")
+                        continue
+                needs_fingerprint.append(p)
+                self.progress.emit(i + 1, total, f"Needs ID check: {fname}")
+
+            # ── 4. Fingerprint tracks that weren't resolved by path ─────────
+            to_add: list[SyncItem] = []
+
+            if needs_fingerprint:
+                mapping = MappingManager(self._ipod_path).load()
+                n_fp = len(needs_fingerprint)
+
+                for j, p in enumerate(needs_fingerprint):
+                    fname = Path(p).name
+                    # Global position: path-resolved tracks already counted
+                    global_i = fast_path_count + j + 1
+                    self.progress.emit(
+                        global_i, total,
+                        f"Identifying ({j + 1} of {n_fp}): {fname}",
+                    )
+
+                    fp = get_or_compute_fingerprint(p, self._fpcalc_path)
+                    if fp is None:
+                        skipped += 1
+                        continue
+
+                    if mapping.get_entries(fp):
+                        # Already on iPod under a different filename/path
+                        already_present_fps.append(fp)
+                        self.progress.emit(
+                            global_i, total,
+                            f"Already on iPod: {fname}",
+                        )
+                        continue
+
+                    # Genuinely new — queue for add
+                    self.progress.emit(
+                        global_i, total,
+                        f"New track, will add: {fname}",
+                    )
+                    lib = PCLibrary(str(Path(p).parent))
+                    pc_track = lib._read_track(Path(p))
+                    if pc_track is None:
+                        skipped += 1
+                        continue
+
+                    to_add.append(SyncItem(
+                        action=SyncAction.ADD_TO_IPOD,
+                        fingerprint=fp,
+                        pc_track=pc_track,
+                    ))
+
+            # ── 5. Execute adds (only for genuinely new PC files) ───────────
+            if to_add:
+                n_add = len(to_add)
+                self.progress.emit(0, n_add, f"Adding {n_add} track(s) to iPod…")
+
+                from SyncEngine.sync_executor import SyncProgress as _SP
+
+                def _prog(p: _SP) -> None:
+                    msg = p.message or ""
+                    if p.current and p.total:
+                        self.progress.emit(p.current, p.total, msg)
+                    else:
+                        # Keep bar determinate at last known position when total is unknown
+                        self.progress.emit(p.current or 0, n_add, msg)
+
+                executor = SyncExecutor(self._ipod_path)
+                fresh_mapping = MappingManager(self._ipod_path).load()
+                result = executor.execute(
+                    plan=SyncPlan(to_add=to_add),
+                    mapping=fresh_mapping,
+                    progress_callback=_prog,
+                )
+                if not result.success:
+                    err = result.errors[0] if result.errors else "Unknown error"
+                    self.failed.emit(f"Sync failed: {err}")
+                    return
+
+            # ── 6. Resolve db_ids for fingerprint-matched tracks ────────────
+            if already_present_fps or to_add:
+                self.progress.emit(0, 0, "Resolving track IDs…")
+                final_mapping = MappingManager(self._ipod_path).load()
+
+                for fp in already_present_fps:
+                    entries = final_mapping.get_entries(fp)
+                    if entries:
+                        playlist_db_ids.append(entries[0].db_id)
+
+                for item in to_add:
+                    if item.fingerprint is None:
+                        continue
+                    entries = final_mapping.get_entries(item.fingerprint)
+                    if entries:
+                        playlist_db_ids.append(entries[0].db_id)
+
+            if not playlist_db_ids:
+                self.failed.emit("No tracks could be matched to iPod database IDs.")
+                return
+
+            # ── 7. Write playlist ───────────────────────────────────────────
+            self.progress.emit(0, 0, f"Writing playlist '{playlist_name}'…")
+
+            # Read DB first so we can build the db_id → tid map.
+            # _build_regular_playlists expects playlist items to use the
+            # internal track_id (tid), NOT the db_id — it then converts
+            # tid → db_id via old_tid_to_db_id.  Using db_ids directly
+            # causes every item to be silently dropped (empty playlist).
+            executor2 = SyncExecutor(self._ipod_path)
+            existing_db = executor2._read_existing_database()
+            existing_tracks_data = existing_db["tracks"]
+            existing_playlists_raw = list(existing_db["playlists"])
+            existing_smart_raw = list(existing_db["smart_playlists"])
+
+            db_id_to_tid: dict[int, int] = {}
+            for t in existing_tracks_data:
+                tid = t.get("track_id", 0)
+                db_id = t.get("db_id", 0)
+                if tid and db_id:
+                    db_id_to_tid[db_id] = tid
+
+            playlist_items = []
+            for db_id in playlist_db_ids:
+                tid = db_id_to_tid.get(db_id)
+                if tid:
+                    playlist_items.append({"track_id": tid})
+                # If tid not found the track isn't in the DB — skip silently
+
+            playlist_dict = {
+                "Title": playlist_name,
+                "playlist_id": random.getrandbits(64),
+                "_isNew": True,
+                "_source": "regular",
+                "items": playlist_items,
+            }
+
+            ctx = _SyncContext(
+                plan=None,  # type: ignore[arg-type]
+                mapping=MappingFile(),
+                progress_callback=None,
+                dry_run=False,
+                write_back_to_pc=False,
+                _is_cancelled=None,
+            )
+            ctx.existing_tracks_data = existing_tracks_data
+            ctx.existing_playlists_raw = existing_playlists_raw
+            ctx.existing_smart_raw = existing_smart_raw
+
+            existing_playlists_raw.append(playlist_dict)
+            try:
+                for upl in cache.get_user_playlists():
+                    uid = upl.get("playlist_id", 0)
+                    is_new = upl.get("_isNew", False)
+                    if is_new:
+                        existing_playlists_raw.append(upl)
+                    else:
+                        for idx, epl in enumerate(existing_playlists_raw):
+                            if epl.get("playlist_id") == uid:
+                                existing_playlists_raw[idx] = upl
+                                break
+            except Exception:
+                pass
+
+            all_tracks = [executor2._track_dict_to_info(t) for t in existing_tracks_data]
+            _master_name, playlists, smart_playlists = executor2._build_and_evaluate_playlists(
+                ctx, all_tracks,
+            )
+            success = executor2._write_database(
+                all_tracks,
+                playlists=playlists,
+                smart_playlists=smart_playlists,
+                master_playlist_name=_master_name,
+            )
+
+            if not success:
+                self.failed.emit("Database write returned False.")
+                return
+
+            try:
+                cache._user_playlists.clear()
+            except Exception:
+                pass
+
+            # ── 8. Done ─────────────────────────────────────────────────────
+            self.finished_ok.emit(
+                playlist_name,
+                len(to_add),
+                fast_path_count + len(already_present_fps),
+                skipped,
+            )
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(str(exc))

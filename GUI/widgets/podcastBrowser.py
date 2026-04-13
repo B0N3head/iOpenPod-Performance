@@ -25,7 +25,7 @@ import logging
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QFont, QPixmap, QImage, QIcon
+from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -52,7 +52,6 @@ from ..styles import (
     accent_btn_css,
     btn_css,
     combo_css,
-    input_css,
     make_label,
     make_separator,
     LABEL_SECONDARY,
@@ -599,17 +598,25 @@ class PodcastBrowser(QFrame):
         # ── Per-feed settings strip ────────────────────────────────────
         hdr_layout.addWidget(make_separator())
 
-        settings_strip = QFrame()
-        settings_strip.setStyleSheet("background: transparent; border: none;")
-        strip_lay = QHBoxLayout(settings_strip)
-        strip_lay.setContentsMargins(24, 8, 24, 10)
-        strip_lay.setSpacing(8)
-
         _lbl_css = (
             f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;"
         )
         _combo_style = combo_css()
-        _spin_style = input_css() + "QSpinBox { padding: 2px 6px; border-radius: 4px; }"
+        _spin_style = f"""
+            QSpinBox {{
+                background: {Colors.SURFACE_RAISED};
+                border: 1px solid {Colors.BORDER};
+                border-radius: {Metrics.BORDER_RADIUS_SM}px;
+                color: {Colors.TEXT_PRIMARY};
+                padding: 2px 6px;
+            }}
+            QSpinBox:hover {{
+                border: 1px solid {Colors.BORDER_FOCUS};
+            }}
+            QSpinBox:focus {{
+                border: 1px solid {Colors.BORDER_FOCUS};
+            }}
+        """
 
         def _make_setting_combo(options: list[str], width: int = 110) -> QComboBox:
             cb = QComboBox()
@@ -625,39 +632,44 @@ class PodcastBrowser(QFrame):
             lbl.setStyleSheet(_lbl_css)
             return lbl
 
-        strip_lay.addWidget(_make_setting_label("Episodes:"))
+        def _make_pair(label_text: str, control: QWidget) -> QWidget:
+            """Wrap a label + control into a single flow-layout item."""
+            w = QWidget()
+            w.setStyleSheet("background: transparent;")
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            lay.addWidget(_make_setting_label(label_text))
+            lay.addWidget(control)
+            return w
+
+        from .MBGridView import _FlowLayout as _SettingsFlow
+        settings_strip = QFrame()
+        settings_strip.setStyleSheet("background: transparent; border: none;")
+        flow = _SettingsFlow(settings_strip, spacing=12)
+        flow.setContentsMargins(24, 8, 24, 10)
+
         self._feed_episode_slots = QSpinBox()
         self._feed_episode_slots.setRange(1, 50)
         self._feed_episode_slots.setValue(3)
         self._feed_episode_slots.setFixedWidth(60)
         self._feed_episode_slots.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self._feed_episode_slots.setStyleSheet(_spin_style)
-        strip_lay.addWidget(self._feed_episode_slots)
 
-        strip_lay.addSpacing(8)
-        strip_lay.addWidget(_make_setting_label("Fill with:"))
         self._feed_fill_mode = _make_setting_combo(["Newest Episode", "Next Episode"])
-        strip_lay.addWidget(self._feed_fill_mode)
-
-        strip_lay.addSpacing(8)
-        strip_lay.addWidget(_make_setting_label("Clear method:"))
         self._feed_clear_method = _make_setting_combo(
             ["Remove Immediately", "Mark for Replacement"], width=140)
-        strip_lay.addWidget(self._feed_clear_method)
-
-        strip_lay.addSpacing(8)
-        strip_lay.addWidget(_make_setting_label("Clear when listened:"))
         self._feed_clear_listened = _make_setting_combo(["Yes", "No"], width=70)
-        strip_lay.addWidget(self._feed_clear_listened)
-
-        strip_lay.addSpacing(8)
-        strip_lay.addWidget(_make_setting_label("Clear older than:"))
         self._feed_clear_older = _make_setting_combo([
             "1 Day", "3 Days", "1 Week", "2 Weeks",
             "1 Month", "2 Months", "3 Months", "Never",
         ])
-        strip_lay.addWidget(self._feed_clear_older)
-        strip_lay.addStretch()
+
+        flow.addWidget(_make_pair("Episodes:", self._feed_episode_slots))
+        flow.addWidget(_make_pair("Fill with:", self._feed_fill_mode))
+        flow.addWidget(_make_pair("Clear method:", self._feed_clear_method))
+        flow.addWidget(_make_pair("Clear when listened:", self._feed_clear_listened))
+        flow.addWidget(_make_pair("Clear older than:", self._feed_clear_older))
 
         # Connect setting changes to save handler
         self._feed_episode_slots.valueChanged.connect(self._on_feed_setting_changed)

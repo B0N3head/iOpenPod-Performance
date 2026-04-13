@@ -162,7 +162,7 @@ class MainWindow(QMainWindow):
 
         # Sync review page
         self.syncReview = SyncReviewWidget()
-        self.syncReview.cancelled.connect(self.hideSyncReview)
+        self.syncReview.cancelled.connect(self._onSyncReviewCancelled)
         self.syncReview.sync_requested.connect(self.executeSyncPlan)
         self.centralStack.addWidget(self.syncReview)  # Index 1
 
@@ -934,6 +934,17 @@ class MainWindow(QMainWindow):
         """User cancelled selective sync browser."""
         self._show_default_page()
 
+    def _onSyncReviewCancelled(self) -> None:
+        """Handle cancel from the sync review page.
+
+        During sync execution we only request cancellation and keep the page
+        visible so partial-save confirmation (save vs discard) can be shown.
+        """
+        if self._sync_execute_worker is not None and self._sync_execute_worker.isRunning():
+            self._sync_execute_worker.requestInterruption()
+            return
+        self.hideSyncReview()
+
     def hideSyncReview(self):
         """Return to the main browsing view, stopping any background work."""
         if self._sync_worker is not None and self._sync_worker.isRunning():
@@ -955,7 +966,7 @@ class MainWindow(QMainWindow):
         if w.isRunning():
             w.requestInterruption()
         # Disconnect all signals so stale callbacks don't fire
-        for sig in (w.progress, w.finished, w.error):
+        for sig in (w.progress, w.finished, w.error, w.confirm_partial_save):
             try:
                 sig.disconnect()
             except TypeError:
@@ -1062,6 +1073,7 @@ class MainWindow(QMainWindow):
         self._sync_execute_worker.progress.connect(self.syncReview.update_execute_progress)
         self._sync_execute_worker.finished.connect(self._onSyncExecuteComplete)
         self._sync_execute_worker.error.connect(self._onSyncExecuteError)
+        self._sync_execute_worker.confirm_partial_save.connect(self._onConfirmPartialSave)
         # Allow the user to skip the in-progress backup from the progress screen
         self.syncReview.skip_backup_signal.connect(self._sync_execute_worker.request_skip_backup)
         self._sync_execute_worker.start()
@@ -1218,6 +1230,41 @@ class MainWindow(QMainWindow):
 
         QMessageBox.critical(self, "Sync Error", msg)
         self.hideSyncReview()
+
+    def _onConfirmPartialSave(self, n_added: int, n_skipped: int) -> None:
+        """Called from the sync worker when the user cancels mid-sync with tracks already copied.
+        Shows a dialog asking whether to save the partial database, then unblocks the worker."""
+        worker = getattr(self, '_sync_execute_worker', None)
+        if worker is None:
+            return
+
+        tracks_word = "track" if n_added == 1 else "tracks"
+        skipped_line = (
+            f"{n_skipped} more {'track was' if n_skipped == 1 else 'tracks were'} not copied."
+            if n_skipped > 0 else ""
+        )
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Save Partial Sync?")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText(
+            f"{n_added} {tracks_word} were successfully copied to your iPod before the sync was cancelled."
+        )
+        detail = "Would you like to save these tracks to your iPod's database?"
+        if skipped_line:
+            detail = skipped_line + "\n\n" + detail
+        detail += (
+            "\n\nIf you discard, the copied files will be cleaned up automatically the next time you sync."
+        )
+        msg.setInformativeText(detail)
+        save_btn = msg.addButton("Save Partial Database", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Discard", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(save_btn)
+        msg.exec()
+
+        # Default to save if dialog was closed via X button (no explicit choice)
+        save = (msg.clickedButton() != discard_btn)
+        worker.respond_to_partial_save(save)
 
     # ── Drag-and-drop support ──────────────────────────────────────────────
 
@@ -2355,7 +2402,6 @@ class _DeviceRenameWorker(QThread):
                 mapping=MappingFile(),
                 progress_callback=None,
                 dry_run=False,
-                aac_quality="normal",
                 write_back_to_pc=False,
                 _is_cancelled=None,
             )
@@ -2430,7 +2476,6 @@ class _QuickMetadataWorker(QThread):
                 mapping=MappingFile(),
                 progress_callback=None,
                 dry_run=False,
-                aac_quality="normal",
                 write_back_to_pc=False,
                 _is_cancelled=None,
             )

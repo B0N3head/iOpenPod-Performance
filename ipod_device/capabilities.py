@@ -87,6 +87,10 @@ class DeviceCapabilities:
     """Device has chapter image artwork formats (for enhanced podcasts)."""
     supports_sparse_artwork: bool = False
     """Artwork can be written in sparse mode (Nano 3G+, Classic, Touch)."""
+    supports_alac: bool = True
+    """Device supports Apple Lossless (ALAC) audio playback.
+    False for iPod 1G–3G and Mini 1G (pre-firmware-update era hardware that
+    received ALAC support only from 4th Gen / Photo / Mini 2G onwards)."""
     cover_art_formats: tuple[ArtworkFormat, ...] = ()
     """Supported cover-art thumbnail sizes.  Empty means no artwork."""
 
@@ -192,6 +196,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "1st Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
+        supports_alac=False,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -199,6 +204,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "2nd Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
+        supports_alac=False,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -206,6 +212,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "3rd Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
+        supports_alac=False,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -329,6 +336,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     # ── iPod Mini ─────────────────────────────────────────────────────
     ("iPod Mini", "1st Gen"): DeviceCapabilities(
         supports_artwork=False,
+        supports_alac=False,
         music_dirs=6,
         db_version=0x13,
     ),

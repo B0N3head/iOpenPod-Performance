@@ -39,8 +39,27 @@ from .pc_library import PCLibrary, PCTrack
 from .audio_fingerprint import get_or_compute_fingerprint, is_fpcalc_available
 from .mapping import MappingManager, MappingFile, TrackMapping
 from .integrity import IntegrityReport
+from .transcoder import resolve_transcode_plan
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Storage Estimation ───────────────────────────────────────────────────────
+
+def estimate_transcode_size(pc_track: PCTrack) -> int:
+    """Estimate the size of a file after transcode, based on metadata and settings.
+
+    For files that don't need transcoding (native COPY), returns the actual file size.
+    For transcoded files (AAC/ALAC/VIDEO), estimates based on duration and codec bitrate
+    from the shared transcode plan.
+
+    Returns the estimated bytes on the iPod after transcode.
+    """
+    plan = resolve_transcode_plan(pc_track.path)
+    return plan.estimate_output_size(
+        source_size=pc_track.size,
+        duration_ms=pc_track.duration_ms,
+    )
 
 
 # ─── Enums & Data Classes ─────────────────────────────────────────────────────
@@ -68,6 +87,10 @@ class SyncItem:
 
     # For ADD/UPDATE actions — the source PC track
     pc_track: Optional[PCTrack] = None
+
+    # For ADD/UPDATE actions — estimated size after transcode (bytes)
+    # Set when the item is created; used for accurate storage estimates in UI
+    estimated_size: Optional[int] = None
 
     # For REMOVE/matched actions — iPod-side info
     db_id: Optional[int] = None
@@ -585,13 +608,15 @@ class FingerprintDiffEngine:
 
             if not mapping_entries:
                 # NEW TRACK: Not in mapping → Add
+                estimated_size = estimate_transcode_size(pc_track)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
                     pc_track=pc_track,
+                    estimated_size=estimated_size,
                     description=f"New: {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename}",
                 ))
-                plan.storage.bytes_to_add += pc_track.size
+                plan.storage.bytes_to_add += estimated_size
                 continue
 
             # Filter out mapping entries already claimed by another album group
@@ -600,13 +625,15 @@ class FingerprintDiffEngine:
             if not available_entries:
                 # All mapping entries for this fingerprint are claimed by other
                 # album groups → this is a new album variant (greatest hits case)
+                estimated_size = estimate_transcode_size(pc_track)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
                     pc_track=pc_track,
+                    estimated_size=estimated_size,
                     description=f"New (album variant): {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename} [{pc_track.album or 'Unknown'}]",
                 ))
-                plan.storage.bytes_to_add += pc_track.size
+                plan.storage.bytes_to_add += estimated_size
                 continue
 
             # MATCHED: Resolve which mapping entry this PC track matches
@@ -625,13 +652,15 @@ class FingerprintDiffEngine:
             if ipod_track is None:
                 # Mapping exists but track missing from iTunesDB (stale mapping)
                 logger.warning(f"Mapping for {fp} points to missing db_id {db_id}")
+                estimated_size = estimate_transcode_size(pc_track)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
                     pc_track=pc_track,
+                    estimated_size=estimated_size,
                     description=f"Re-add (stale mapping): {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename}",
                 ))
-                plan.storage.bytes_to_add += pc_track.size
+                plan.storage.bytes_to_add += estimated_size
                 continue
 
             plan.matched_tracks += 1
@@ -643,15 +672,17 @@ class FingerprintDiffEngine:
 
             # File change: size+mtime gate
             if self._source_file_changed(pc_track, matched_entry):
+                estimated_size = estimate_transcode_size(pc_track)
                 plan.to_update_file.append(SyncItem(
                     action=SyncAction.UPDATE_FILE,
                     fingerprint=fp,
                     pc_track=pc_track,
                     db_id=db_id,
                     ipod_track=ipod_track,
+                    estimated_size=estimated_size,
                     description=f"File changed: {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename}",
                 ))
-                plan.storage.bytes_to_update += pc_track.size
+                plan.storage.bytes_to_update += estimated_size
 
             # Metadata change
             metadata_changes = self._compare_metadata(pc_track, ipod_track)

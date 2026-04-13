@@ -130,7 +130,6 @@ def pc_track_to_info(
     ipod_location: str,
     was_transcoded: bool,
     ipod_file_path: Optional[Path] = None,
-    aac_quality: str = "normal",
     existing_media_type: Optional[int] = None,
 ) -> TrackInfo:
     """Convert PCTrack to TrackInfo for writing.
@@ -140,7 +139,6 @@ def pc_track_to_info(
         ipod_location: iPod-style colon-separated path.
         was_transcoded: Whether the file was format-converted.
         ipod_file_path: Actual file on iPod (for accurate size after transcode).
-        aac_quality: AAC quality preset name (for transcoded bitrate).
         existing_media_type: If provided, preserve this media_type instead of
                             recalculating from pc_track.video_kind. Used for
                             UPDATE operations to preserve the original type.
@@ -174,8 +172,9 @@ def pc_track_to_info(
         source_ext = pc_track.extension.lower().lstrip(".")
         is_lossless_source = source_ext in ("flac", "wav", "aif", "aiff")
         if filetype == "m4a" and not is_lossless_source:
-            from .transcoder import quality_to_nominal_bitrate
-            bitrate = quality_to_nominal_bitrate(aac_quality)
+            from .transcoder import resolve_transcode_plan, quality_to_nominal_bitrate
+            plan = resolve_transcode_plan(pc_track.path)
+            bitrate = quality_to_nominal_bitrate(plan.effective_quality)
         # Transcoded audio is capped at IPOD_MAX_SAMPLE_RATE; reflect that
         # in the stored sample_rate so iTunesDB is consistent with the file.
         if filetype == "m4a":

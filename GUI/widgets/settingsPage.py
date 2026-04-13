@@ -179,8 +179,17 @@ class FolderRow(SettingRow):
 
     changed = pyqtSignal(str)
 
-    def __init__(self, title: str, description: str = "", path: str = ""):
+    def __init__(self, title: str, description: str = "", path: str = "",
+                 resolve_default_fn=None):
         super().__init__(title, description)
+        self._resolve_default_fn = resolve_default_fn
+
+        self.open_btn = QPushButton("Open \u2197")
+        self.open_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.open_btn.setStyleSheet(link_btn_css())
+        self.open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_btn.clicked.connect(self._open_location)
+        self._text_layout.addWidget(self.open_btn)
 
         right_layout = QHBoxLayout()
         right_layout.setSpacing((8))
@@ -210,11 +219,29 @@ class FolderRow(SettingRow):
         self.add_control(container)
 
         self._full_path = path
+        self._update_open_btn()
 
     def _truncate(self, path: str) -> str:
         if len(path) > 40:
             return "…" + path[-38:]
         return path
+
+    def _effective_path(self) -> str:
+        if self._full_path:
+            return self._full_path
+        if self._resolve_default_fn:
+            return self._resolve_default_fn()
+        return ""
+
+    def _update_open_btn(self):
+        self.open_btn.setVisible(bool(self._effective_path()))
+
+    def _open_location(self):
+        path = self._effective_path()
+        if path:
+            import os
+            os.makedirs(path, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(
@@ -224,6 +251,7 @@ class FolderRow(SettingRow):
         if folder:
             self._full_path = folder
             self.path_label.setText(self._truncate(folder))
+            self._update_open_btn()
             self.changed.emit(folder)
 
     @property
@@ -234,6 +262,7 @@ class FolderRow(SettingRow):
     def value(self, v: str):
         self._full_path = v
         self.path_label.setText(self._truncate(v) if v else "Not set")
+        self._update_open_btn()
 
 
 class ResettableFolderRow(SettingRow):
@@ -242,9 +271,18 @@ class ResettableFolderRow(SettingRow):
     changed = pyqtSignal(str)
 
     def __init__(self, title: str, description: str = "",
-                 path: str = "", default_label: str = "Platform default"):
+                 path: str = "", default_label: str = "Platform default",
+                 resolve_default_fn=None):
         super().__init__(title, description)
         self._default_label = default_label
+        self._resolve_default_fn = resolve_default_fn
+
+        self.open_btn = QPushButton("Open \u2197")
+        self.open_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self.open_btn.setStyleSheet(link_btn_css())
+        self.open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_btn.clicked.connect(self._open_location)
+        self._text_layout.addWidget(self.open_btn)
 
         right_layout = QHBoxLayout()
         right_layout.setSpacing((8))
@@ -300,8 +338,24 @@ class ResettableFolderRow(SettingRow):
             return "\u2026" + path[-38:]
         return path
 
+    def _effective_path(self) -> str:
+        if self._full_path:
+            return self._full_path
+        if self._resolve_default_fn:
+            return self._resolve_default_fn()
+        return ""
+
     def _update_clear_visibility(self):
         self.clear_btn.setVisible(bool(self._full_path))
+        # Open is always available as long as we can resolve a path.
+        self.open_btn.setVisible(bool(self._effective_path()))
+
+    def _open_location(self):
+        path = self._effective_path()
+        if path:
+            import os
+            os.makedirs(path, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(
@@ -736,7 +790,11 @@ class _SettingsCard(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
+        self._rows: list[QWidget] = []
+        self._seps: list["QFrame | None"] = []
+
         for i, row in enumerate(rows):
+            sep = None
             if i > 0:
                 sep = QFrame()
                 sep.setFixedHeight(1)
@@ -744,6 +802,9 @@ class _SettingsCard(QFrame):
                     f"background: {Colors.BORDER_SUBTLE}; border: none;"
                 )
                 lay.addWidget(sep)
+
+            self._seps.append(sep)
+            self._rows.append(row)
 
             if isinstance(row, SettingRow):
                 name = f"cr{i}"
@@ -756,6 +817,23 @@ class _SettingsCard(QFrame):
                     }}
                 """)
             lay.addWidget(row)
+
+    def set_row_visible(self, row: QWidget, visible: bool) -> None:
+        """Show or hide a row and keep surrounding separators consistent.
+
+        A separator before row[i] is shown when row[i] is visible and at
+        least one row above it is also visible — covering the case where
+        hidden rows leave a gap between two visible rows.
+        """
+        row.setVisible(visible)
+        any_visible_above = False
+        for i, r in enumerate(self._rows):
+            sep = self._seps[i]
+            shown = not r.isHidden()
+            if sep is not None:
+                sep.setVisible(shown and any_visible_above)
+            if shown:
+                any_visible_above = True
 
 
 # ── Main settings page ─────────────────────────────────────────────────────
@@ -1022,18 +1100,43 @@ class SettingsPage(QWidget):
         )
 
     def _build_transcoding_page(self) -> QScrollArea:
-        self.aac_quality = ComboRow(
-            "AAC Quality",
-            "Quality preset for lossy transcodes (OGG, Opus, WMA → AAC). "
-            "Uses the best available encoder automatically (libfdk_aac > "
-            "AudioToolbox > built-in).",
-            options=[
-                "High (~320 kbps)",
-                "Normal (~256 kbps)",
-                "Compact (~128 kbps)",
-                "Spoken Word (~64 kbps)",
-            ],
-            current="Normal (~256 kbps)",
+        self.aac_encoder = ComboRow(
+            "AAC Encoder",
+            "Which encoder FFmpeg uses. Auto picks the best available: "
+            "libfdk_aac (highest quality) > AudioToolbox (macOS only) > Built-in.",
+            options=["Auto", "libfdk_aac", "AudioToolbox (macOS)", "Built-in (aac)"],
+            current="Auto",
+        )
+        self.aac_quality_simple = ComboRow(
+            "Quality",
+            "Audio quality preset for music tracks. High = 256 kbps, "
+            "Normal = 192 kbps, Compact = 128 kbps. "
+            "For full control, switch the encoder above to a specific encoder.",
+            options=["High (256 kbps)", "Normal (192 kbps)", "Compact (128 kbps)"],
+            current="Normal (192 kbps)",
+        )
+        self.aac_mode = ComboRow(
+            "Encoding Mode",
+            "CBR (Constant Bitrate) is recommended for best compatibility "
+            "with older iPods. VBR may cause instability on pre-Classic "
+            "iPods at higher quality levels.",
+            options=["CBR (Constant Bitrate)", "VBR (libfdk_aac only)"],
+            current="CBR (Constant Bitrate)",
+        )
+        self.aac_quality_value = ComboRow(
+            "Music Bitrate",
+            "Target bitrate for music tracks. 256 kbps is the maximum "
+            "useful quality for AAC — higher bitrates waste storage.",
+            options=["64 kbps", "96 kbps", "128 kbps", "160 kbps",
+                     "192 kbps", "224 kbps", "256 kbps"],
+            current="192 kbps",
+        )
+        self.aac_spoken_bitrate = ComboRow(
+            "Spoken Word Bitrate",
+            "Bitrate for podcasts and audiobooks (always CBR). "
+            "Pair with 'Mono for Spoken Word' for best results.",
+            options=["32 kbps", "48 kbps", "64 kbps", "80 kbps", "96 kbps"],
+            current="64 kbps",
         )
         self.prefer_lossy = ToggleRow(
             "Prefer Lossy Encoding",
@@ -1086,16 +1189,30 @@ class SettingsPage(QWidget):
             "hi-res (96/192 kHz) FLAC sources.",
         )
 
+        # Wire reactive encoder/mode behaviour after all rows are created
+        self.aac_encoder.changed.connect(self._update_aac_mode_options)
+        self.aac_mode.changed.connect(self._update_aac_quality_value_row)
+
+        # Build audio card and store reference for later show/hide calls
+        self._audio_card = _SettingsCard(
+            self.aac_encoder,
+            self.aac_quality_simple,
+            self.aac_mode,
+            self.aac_quality_value,
+            self.aac_spoken_bitrate,
+            self.prefer_lossy,
+            self.mono_for_spoken,
+            self.smart_quality_by_type,
+            self.normalize_sample_rate,
+        )
+        # Default state: auto encoder → show simple quality, hide advanced rows
+        self._audio_card.set_row_visible(self.aac_mode, False)
+        self._audio_card.set_row_visible(self.aac_quality_value, False)
+
         return self._make_page(
             "Transcoding",
             "Audio",
-            _SettingsCard(
-                self.aac_quality,
-                self.prefer_lossy,
-                self.mono_for_spoken,
-                self.smart_quality_by_type,
-                self.normalize_sample_rate,
-            ),
+            self._audio_card,
             "Video",
             _SettingsCard(
                 self.video_crf,
@@ -1167,11 +1284,13 @@ class SettingsPage(QWidget):
         )
 
     def _build_storage_page(self) -> QScrollArea:
+        from settings import default_cache_dir
         self.transcode_cache_dir = ResettableFolderRow(
             "Cache Location",
             "Where transcoded files are cached to avoid re-encoding "
             "on future syncs.",
             default_label="Platform default",
+            resolve_default_fn=default_cache_dir,
         )
         self.max_cache_size = ComboRow(
             "Max Cache Size",
@@ -1181,17 +1300,21 @@ class SettingsPage(QWidget):
             current="5 GB",
         )
         self.cache_status = _CacheSizeRow()
+        from settings import get_settings_dir, default_data_dir
+        import os as _os
         self.settings_dir = ResettableFolderRow(
             "Settings Location",
             "Custom directory to store iOpenPod settings. Useful for "
             "portable setups or backups.",
             default_label="Platform default",
+            resolve_default_fn=get_settings_dir,
         )
         self.log_dir = ResettableFolderRow(
             "Log Location",
             "Where iOpenPod writes log files and crash reports. "
             "Takes effect on next launch.",
             default_label="Platform default",
+            resolve_default_fn=lambda: _os.path.join(default_data_dir(), "logs"),
         )
 
         return self._make_page(
@@ -1210,10 +1333,13 @@ class SettingsPage(QWidget):
         )
 
     def _build_backups_page(self) -> QScrollArea:
+        from settings import default_data_dir as _ddd
+        import os as _os2
         self.backup_dir = FolderRow(
             "Backup Location",
             "Where full device backups are stored on your PC. "
             "Leave empty for the platform default.",
+            resolve_default_fn=lambda: _os2.path.join(_ddd(), "backups"),
         )
         self.backup_before_sync = ToggleRow(
             "Backup Before Sync",
@@ -1334,15 +1460,51 @@ class SettingsPage(QWidget):
         if idx >= 0:
             self.max_backups.combo.setCurrentIndex(idx)
 
-        # AAC quality → combo text
-        quality_map = {
-            "high": "High (~320 kbps)", "normal": "Normal (~256 kbps)",
-            "compact": "Compact (~128 kbps)", "spoken": "Spoken Word (~64 kbps)",
-        }
-        q_text = quality_map.get(s.aac_quality, "Normal (~256 kbps)")
-        idx = self.aac_quality.combo.findText(q_text)
+        # AAC encoder — rebuild the combo with only available encoders first,
+        # then select the saved value (or fall back to Auto if unavailable).
+        enc_map = {"auto": "Auto", "libfdk_aac": "libfdk_aac",
+                   "aac_at": "AudioToolbox (macOS)", "aac": "Built-in (aac)"}
+        enc_text = enc_map.get(s.aac_encoder, "Auto")
+        enc_text = self._refresh_encoder_options(enc_text)
+        self._update_aac_mode_options(enc_text)
+
+        # Simple quality (auto mode)
+        if s.aac_music_bitrate >= 224:
+            simple_text = "High (256 kbps)"
+        elif s.aac_music_bitrate >= 160:
+            simple_text = "Normal (192 kbps)"
+        else:
+            simple_text = "Compact (128 kbps)"
+        idx = self.aac_quality_simple.combo.findText(simple_text)
         if idx >= 0:
-            self.aac_quality.combo.setCurrentIndex(idx)
+            self.aac_quality_simple.combo.setCurrentIndex(idx)
+
+        # AAC mode (manual encoder)
+        mode_map = {"cbr": "CBR (Constant Bitrate)", "vbr": "VBR (libfdk_aac only)",
+                    "cvbr": "CVBR (Constrained VBR)", "abr": "ABR (Average Bitrate)",
+                    "vbr_at": "VBR (Variable Bitrate)"}
+        mode_text = mode_map.get(s.aac_mode, "CBR (Constant Bitrate)")
+        idx = self.aac_mode.combo.findText(mode_text)
+        if idx >= 0:
+            self.aac_mode.combo.setCurrentIndex(idx)
+        self._update_aac_quality_value_row(mode_text)
+
+        # Music bitrate / VBR level (manual encoder)
+        if "VBR" in self.aac_quality_value.title_label.text():
+            vbr_map = {1: "1 (~64 kbps)", 2: "2 (~80 kbps)", 3: "3 (~112 kbps)",
+                       4: "4 (~144 kbps)", 5: "5 (~192–256 kbps)"}
+            q_text = vbr_map.get(s.aac_vbr_level, "4 (~144 kbps)")
+        else:
+            q_text = f"{s.aac_music_bitrate} kbps"
+        idx = self.aac_quality_value.combo.findText(q_text)
+        if idx >= 0:
+            self.aac_quality_value.combo.setCurrentIndex(idx)
+
+        # Spoken word bitrate
+        spk_text = f"{s.aac_spoken_bitrate} kbps"
+        idx = self.aac_spoken_bitrate.combo.findText(spk_text)
+        if idx >= 0:
+            self.aac_spoken_bitrate.combo.setCurrentIndex(idx)
 
         # Prefer lossy toggle
         self.prefer_lossy.value = s.prefer_lossy
@@ -1378,7 +1540,11 @@ class SettingsPage(QWidget):
             self.write_back.changed.connect(self._save)
             self.compute_sound_check.changed.connect(self._save)
             self.rating_strategy.changed.connect(self._save)
-            self.aac_quality.changed.connect(self._save)
+            self.aac_encoder.changed.connect(self._save)
+            self.aac_quality_simple.changed.connect(self._save)
+            self.aac_mode.changed.connect(self._save)
+            self.aac_quality_value.changed.connect(self._save)
+            self.aac_spoken_bitrate.changed.connect(self._save)
             self.prefer_lossy.changed.connect(self._save)
             self.mono_for_spoken.changed.connect(self._save)
             self.smart_quality_by_type.changed.connect(self._save)
@@ -1401,6 +1567,131 @@ class SettingsPage(QWidget):
             self.backup_before_sync.changed.connect(self._save)
             self.max_backups.changed.connect(self._save)
             self.scrobble_on_sync.changed.connect(self._save)
+
+    # ── AAC encoder reactive helpers ─────────────────────────────────────────
+
+    def _refresh_encoder_options(self, desired: str = "Auto") -> str:
+        """Repopulate the AAC encoder combo with only available encoders.
+
+        Queries ``available_aac_encoders()`` (cached after first call) and
+        rebuilds the combo so the user can only pick what their ffmpeg build
+        actually supports. If *desired* names an encoder that isn't available,
+        returns ``"Auto"`` so the caller can update downstream rows.
+
+        Returns the encoder text that was actually selected.
+        """
+        try:
+            from SyncEngine.transcoder import available_aac_encoders, find_ffmpeg
+            ffmpeg_ok = bool(find_ffmpeg())
+            available = available_aac_encoders() if ffmpeg_ok else set()
+        except Exception:
+            available = set()
+
+        # Map display name → internal key for each candidate encoder.
+        candidates = [
+            ("libfdk_aac", "libfdk_aac"),
+            ("AudioToolbox (macOS)", "aac_at"),
+            ("Built-in (aac)", "aac"),
+        ]
+        options = ["Auto"] + [
+            label for label, key in candidates if key in available
+        ]
+
+        combo = self.aac_encoder.combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(options)
+        combo.blockSignals(False)
+
+        # Use desired value if it's present; otherwise fall back to Auto.
+        if desired in options:
+            idx = combo.findText(desired)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+            return desired
+        else:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)  # Auto
+            combo.blockSignals(False)
+            return "Auto"
+
+    def _update_aac_mode_options(self, encoder_text: str) -> None:
+        """Show simple quality row for Auto; show advanced rows for a specific encoder."""
+        is_auto = encoder_text == "Auto"
+
+        if hasattr(self, "_audio_card"):
+            self._audio_card.set_row_visible(self.aac_quality_simple, is_auto)
+            self._audio_card.set_row_visible(self.aac_mode, not is_auto)
+            self._audio_card.set_row_visible(self.aac_quality_value, not is_auto)
+
+        if not is_auto:
+            # Carry the simple quality preset's implied bitrate to the advanced combo
+            simple_map = {"High (256 kbps)": "256 kbps", "Normal (192 kbps)": "192 kbps",
+                          "Compact (128 kbps)": "128 kbps"}
+            implied_br = simple_map.get(self.aac_quality_simple.value)
+            if implied_br:
+                idx = self.aac_quality_value.combo.findText(implied_br)
+                if idx >= 0:
+                    self.aac_quality_value.combo.setCurrentIndex(idx)
+
+            mode_combo = self.aac_mode.combo
+            prev = mode_combo.currentText()
+            mode_combo.blockSignals(True)
+            mode_combo.clear()
+            if "AudioToolbox" in encoder_text:
+                mode_combo.addItems([
+                    "CBR (Constant Bitrate)", "CVBR (Constrained VBR)",
+                    "ABR (Average Bitrate)", "VBR (Variable Bitrate)",
+                ])
+            elif "Built-in" in encoder_text:
+                mode_combo.addItems(["CBR (Constant Bitrate)"])
+            else:  # libfdk_aac
+                mode_combo.addItems(["CBR (Constant Bitrate)", "VBR (libfdk_aac only)"])
+            idx = mode_combo.findText(prev)
+            mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            mode_combo.blockSignals(False)
+            self._update_aac_quality_value_row(mode_combo.currentText())
+
+    def _update_aac_quality_value_row(self, mode_text: str) -> None:
+        """Swap the quality-value row between bitrate options and VBR levels."""
+        # Only libfdk_aac uses true VBR quality levels. AudioToolbox VBR
+        # still uses a target bitrate, so show the bitrate picker for it.
+        is_fdk_vbr = mode_text == "VBR (libfdk_aac only)"
+        is_vbr = is_fdk_vbr
+        row = self.aac_quality_value
+        combo = row.combo
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        if is_vbr:
+            row.title_label.setText("VBR Quality Level")
+            row.desc_label.setText(
+                "libfdk_aac VBR quality level (1 = lowest, 5 = highest). "
+                "Level 5 can spike above 256 kbps and may cause instability "
+                "on pre-Classic iPods."
+            )
+            combo.addItems([
+                "1 (~64 kbps)", "2 (~80 kbps)", "3 (~112 kbps)",
+                "4 (~144 kbps)", "5 (~192–256 kbps)",
+            ])
+            default = "4 (~144 kbps)"
+        else:
+            row.title_label.setText("Music Bitrate")
+            row.desc_label.setText(
+                "Target bitrate for music tracks. 256 kbps is the maximum "
+                "useful quality for AAC — higher bitrates waste storage."
+            )
+            combo.addItems([
+                "64 kbps", "96 kbps", "128 kbps", "160 kbps",
+                "192 kbps", "224 kbps", "256 kbps",
+            ])
+            default = "192 kbps"
+        idx = combo.findText(prev)
+        combo.setCurrentIndex(idx if idx >= 0 else combo.findText(default))
+        combo.blockSignals(False)
+
+    # ── Settings persistence ─────────────────────────────────────────────────
 
     def _save(self, *_args):
         """Read all controls back into AppSettings and persist."""
@@ -1476,12 +1767,35 @@ class SettingsPage(QWidget):
         mb_text = self.max_backups.value
         s.max_backups = int(mb_text) if mb_text and mb_text != "Unlimited" else 0
 
-        # Parse AAC quality preset
-        quality_keys = {
-            "High (~320 kbps)": "high", "Normal (~256 kbps)": "normal",
-            "Compact (~128 kbps)": "compact", "Spoken Word (~64 kbps)": "spoken",
-        }
-        s.aac_quality = quality_keys.get(self.aac_quality.value, "normal")
+        # AAC encoder / mode / bitrate
+        enc_key_map = {"Auto": "auto", "libfdk_aac": "libfdk_aac",
+                       "AudioToolbox (macOS)": "aac_at", "Built-in (aac)": "aac"}
+        s.aac_encoder = enc_key_map.get(self.aac_encoder.value, "auto")
+
+        if s.aac_encoder == "auto":
+            # Simple quality preset → bitrate (always CBR in auto mode)
+            simple_map = {"High (256 kbps)": 256, "Normal (192 kbps)": 192,
+                          "Compact (128 kbps)": 128}
+            s.aac_music_bitrate = simple_map.get(self.aac_quality_simple.value, 192)
+            s.aac_mode = "cbr"
+        else:
+            mode_key_map = {"CBR (Constant Bitrate)": "cbr", "VBR (libfdk_aac only)": "vbr",
+                            "CVBR (Constrained VBR)": "cvbr", "ABR (Average Bitrate)": "abr",
+                            "VBR (Variable Bitrate)": "vbr"}
+            s.aac_mode = mode_key_map.get(self.aac_mode.value, "cbr")
+
+            qv = self.aac_quality_value.value
+            if "~" in qv:
+                # VBR level — parse leading digit
+                vbr_str = qv[:1]
+                s.aac_vbr_level = int(vbr_str) if vbr_str.isdigit() else 4
+            else:
+                # CBR bitrate — parse leading integer
+                br_str = qv.replace(" kbps", "")
+                s.aac_music_bitrate = int(br_str) if br_str.isdigit() else 192
+
+        spk_str = self.aac_spoken_bitrate.value.replace(" kbps", "")
+        s.aac_spoken_bitrate = int(spk_str) if spk_str.isdigit() else 64
 
         # Prefer lossy toggle
         s.prefer_lossy = self.prefer_lossy.value

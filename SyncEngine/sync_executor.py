@@ -25,7 +25,7 @@ from typing import Optional, Callable
 from dataclasses import dataclass, field
 from .fingerprint_diff_engine import SyncPlan, SyncItem
 from .mapping import MappingManager, MappingFile
-from .transcoder import transcode, needs_transcoding, clear_caches as _clear_transcoder_caches
+from .transcoder import transcode, needs_transcoding, resolve_transcode_plan, clear_caches as _clear_transcoder_caches
 from .audio_fingerprint import get_or_compute_fingerprint
 from .itunes_prefs import protect_from_itunes
 
@@ -43,7 +43,12 @@ logger = logging.getLogger(__name__)
 # ── Constants ───────────────────────────────────────────────────────────────
 
 # Minimum free space (bytes) that must remain on the iPod after each file copy.
-_DISK_RESERVE_BYTES = 30 * 1024 * 1024   # 30 MB
+_DISK_RESERVE_BYTES = 4 * 1024 * 1024   # 4 MB
+
+# Minimum free space required before attempting to write the database.
+# Smaller than _DISK_RESERVE_BYTES so a sync that fills the iPod to ~4 MB
+# remaining can still commit its database.
+_DB_WRITE_RESERVE_BYTES = 1 * 1024 * 1024  # 1 MB
 
 # Estimated overhead for the database files themselves.
 _DB_OVERHEAD_BYTES = 10 * 1024 * 1024    # 10 MB
@@ -110,6 +115,9 @@ class SyncResult:
     sound_check_computed: int = 0
     scrobbles_submitted: int = 0
     errors: list[tuple[str, str]] = field(default_factory=list)
+    # True when the sync stopped early (storage full, cancelled, etc.) but a
+    # partial database write was still attempted to keep iPod consistent.
+    partial_save: bool = False
 
     @property
     def has_errors(self) -> bool:
@@ -140,7 +148,12 @@ class SyncResult:
         if not lines:
             return "No changes made."
 
-        status = "Sync completed" if self.success else "Sync completed with errors"
+        if self.partial_save:
+            status = "Sync stopped early — partial results saved"
+        elif self.success:
+            status = "Sync completed"
+        else:
+            status = "Sync completed with errors"
         return f"{status}:\n" + "\n".join(lines)
 
 
@@ -158,7 +171,6 @@ class _SyncContext:
     mapping: MappingFile
     progress_callback: Optional[Callable[["SyncProgress"], None]]
     dry_run: bool
-    aac_quality: str
     write_back_to_pc: bool
     _is_cancelled: Optional[Callable[[], bool]]
 
@@ -251,13 +263,13 @@ class SyncExecutor:
         dry_run: bool = False,
         is_cancelled: Optional[Callable[[], bool]] = None,
         write_back_to_pc: bool = False,
-        aac_quality: str = "normal",
         *,
         user_playlists: Optional[list[dict]] = None,
         on_sync_complete: Optional[Callable[[], None]] = None,
         compute_sound_check: bool = False,
         scrobble_on_sync: bool = False,
         listenbrainz_token: str = "",
+        on_cancel_with_partial: Optional[Callable[[int, int], bool]] = None,
     ) -> SyncResult:
         """Execute the sync plan.
 
@@ -268,7 +280,6 @@ class SyncExecutor:
            add → sound check → play counts → ratings)
         4. Write database in one shot (stage 7)
         """
-        self._aac_quality = aac_quality
         _clear_transcoder_caches()
 
         ctx = _SyncContext(
@@ -276,7 +287,6 @@ class SyncExecutor:
             mapping=mapping,
             progress_callback=progress_callback,
             dry_run=dry_run,
-            aac_quality=aac_quality,
             write_back_to_pc=write_back_to_pc,
             _is_cancelled=is_cancelled,
             user_playlists=list(user_playlists) if user_playlists else [],
@@ -291,30 +301,140 @@ class SyncExecutor:
 
         self._load_existing_database_into(ctx)
 
-        # Run stages 1-6; bail on first failure.
+        # Run stages 1-6.  Break on failure or cancellation rather than
+        # returning immediately so the DB write below always gets a chance
+        # to run — this keeps the iPod's file system and database consistent
+        # even when a sync stops early (storage full, user cancel, etc.).
         stages = [
-            self._execute_removes,          # Stage 1
-            self._execute_file_updates,     # Stage 2
+            self._execute_removes,           # Stage 1
+            self._execute_file_updates,      # Stage 2
             self._execute_metadata_updates,  # Stage 3
-            self._execute_artwork_updates,  # Stage 3b
+            self._execute_artwork_updates,   # Stage 3b
             self._download_podcast_episodes,  # Stage 3c (podcast prep)
-            self._execute_adds,             # Stage 4
-            self._execute_sound_check,      # Stage 4b
-            self._execute_playcount_sync,   # Stage 5
-            self._execute_rating_sync,      # Stage 6
+            self._execute_adds,              # Stage 4
+            self._execute_sound_check,       # Stage 4b
+            self._execute_playcount_sync,    # Stage 5
+            self._execute_rating_sync,       # Stage 6
         ]
         for stage in stages:
             if ctx.cancelled():
-                return ctx.result
+                break
             stage(ctx)
             if not ctx.result.success:
-                return ctx.result
+                break
 
-        # Stage 7: write database (one shot)
-        if ctx.cancelled():
-            return ctx.result
+        # Stage 7: write database.
+        # Always runs as long as the database was loaded (i.e. we got past
+        # preflight).  On a partial sync, this saves whatever succeeded so
+        # the iPod isn't left with orphaned files or missing entries.
         if not ctx.dry_run:
-            self._execute_write_and_finalize(ctx)
+            _was_cancelled = ctx.cancelled()
+            _had_failure = not ctx.result.success
+            _n_added = len(ctx.new_tracks)
+            _n_removed = ctx.result.tracks_removed
+            _n_updated = ctx.result.tracks_updated_file
+            _anything_done = _n_added > 0 or _n_removed > 0 or _n_updated > 0
+
+            _should_write = True  # default: always write
+
+            if _was_cancelled and _anything_done:
+                # Ask the caller whether to write the partial database.
+                # on_cancel_with_partial(n_added, n_skipped) → True = save, False = discard.
+                # If no callback is provided, auto-save (safe default).
+                if on_cancel_with_partial is not None:
+                    n_planned = len(getattr(ctx.plan, "to_add", []))
+                    n_skipped = max(0, n_planned - _n_added)
+                    _should_write = on_cancel_with_partial(_n_added, n_skipped)
+                    logger.info(
+                        "User chose to %s partial sync results (%d added).",
+                        "save" if _should_write else "discard", _n_added,
+                    )
+
+            if _should_write and (_was_cancelled or _had_failure):
+                ctx.result.partial_save = True
+
+                if _was_cancelled and not any(
+                    e[0] == "cancelled" for e in ctx.result.errors
+                ):
+                    # Build a summary of what actually completed
+                    _parts = []
+                    if _n_added > 0:
+                        _parts.append(f"{_n_added} track{'s' if _n_added != 1 else ''} copied")
+                    if _n_removed > 0:
+                        _parts.append(f"{_n_removed} track{'s' if _n_removed != 1 else ''} removed")
+                    if _n_updated > 0:
+                        _parts.append(f"{_n_updated} file{'s' if _n_updated != 1 else ''} updated")
+
+                    if _parts:
+                        ctx.result.errors.append((
+                            "cancelled",
+                            f"Sync was cancelled after {', '.join(_parts)}. "
+                            f"The database has been updated with those changes.",
+                        ))
+                    else:
+                        ctx.result.errors.append((
+                            "cancelled",
+                            "Sync was cancelled. No file changes had been made.",
+                        ))
+
+                logger.info(
+                    "Sync stopped early — attempting partial database write "
+                    "(%d existing + %d newly added tracks).",
+                    len(ctx.tracks_by_db_id), _n_added,
+                )
+                self._execute_write_and_finalize(ctx)
+
+            elif not _should_write:
+                # User chose to discard — but if removes or file updates already
+                # happened, the database MUST be written or the iPod is left in
+                # an inconsistent state (DB references deleted files).
+                if _n_removed > 0 or _n_updated > 0:
+                    logger.info(
+                        "User chose discard, but %d removes and %d file updates "
+                        "already committed — writing DB anyway to stay consistent.",
+                        _n_removed, _n_updated,
+                    )
+                    ctx.result.partial_save = True
+                    ctx.result.errors.append((
+                        "cancelled",
+                        f"Sync was cancelled. New tracks were discarded, but "
+                        f"the database was updated to reflect "
+                        f"{_n_removed} removal{'s' if _n_removed != 1 else ''} "
+                        f"and {_n_updated} file update{'s' if _n_updated != 1 else ''} "
+                        f"that had already completed."
+                        if _n_removed > 0 and _n_updated > 0
+                        else (
+                            f"Sync was cancelled. New tracks were discarded, but "
+                            f"the database was updated to reflect "
+                            f"{_n_removed} removal{'s' if _n_removed != 1 else ''} "
+                            f"that had already completed."
+                            if _n_removed > 0
+                            else f"Sync was cancelled. New tracks were discarded, but "
+                            f"the database was updated to reflect "
+                            f"{_n_updated} file update{'s' if _n_updated != 1 else ''} "
+                            f"that had already completed."
+                        ),
+                    ))
+                    # Strip new_tracks so only removes/updates are saved
+                    ctx.new_tracks.clear()
+                    self._execute_write_and_finalize(ctx)
+                else:
+                    # Only adds happened — safe to truly discard
+                    ctx.result.errors.append((
+                        "cancelled",
+                        f"Sync was cancelled. "
+                        + (
+                            f"{_n_added} track{'s' if _n_added != 1 else ''} were "
+                            f"copied to the iPod but the database was not updated — "
+                            f"they will be cleaned up automatically on the next sync."
+                            if _n_added > 0
+                            else "No changes were made."
+                        ),
+                    ))
+
+            else:
+                # Normal (non-cancelled, non-failed) path
+                self._execute_write_and_finalize(ctx)
 
         ctx.result.success = not ctx.result.has_errors
         return ctx.result
@@ -548,6 +668,25 @@ class SyncExecutor:
             nonlocal _step
             ctx.progress("write_database", _step, _TOTAL_STEPS, message=msg)
             _step += 1
+
+        # ── Pre-write space guard ─────────────────────────────────
+        # The copy loop stops at 4 MB free; here we only need 1 MB to write
+        # the database itself.  This lets a sync that fills the iPod close to
+        # the wire still commit successfully.
+        try:
+            free_now = shutil.disk_usage(self.ipod_path).free
+            if free_now < _DB_WRITE_RESERVE_BYTES:
+                reserve_mb = _DB_WRITE_RESERVE_BYTES / (1024 * 1024)
+                free_mb = free_now / (1024 * 1024)
+                ctx.result.errors.append((
+                    "storage",
+                    f"Not enough space to write the database: "
+                    f"{free_mb:.1f} MB free, {reserve_mb:.0f} MB required.",
+                ))
+                ctx.result.success = False
+                return
+        except OSError as e:
+            logger.warning("Could not check disk space before DB write: %s", e)
 
         _advance("Preparing tracks")
 
@@ -900,7 +1039,6 @@ class SyncExecutor:
 
             success, ipod_path, was_transcoded, err_msg = self._copy_to_ipod(
                 source_path, need_transcode, fingerprint=item.fingerprint,
-                aac_quality=ctx.aac_quality,
                 transcode_progress=transcode_cb,
                 copy_progress=copy_cb,
                 is_cancelled=ctx._is_cancelled,
@@ -934,7 +1072,21 @@ class SyncExecutor:
                     is_oom = isinstance(e, _OutOfSpaceError)
                     if is_oom:
                         logger.error(str(e))
-                        ctx.result.errors.append(("storage", str(e)))
+                        n_done = ctx.result.tracks_added
+                        n_left = total - completed_count
+                        if n_done > 0:
+                            oom_msg = (
+                                f"Ran out of space after copying {n_done} "
+                                f"track{'s' if n_done != 1 else ''} — "
+                                f"{n_left} more could not be added. "
+                                f"The database will be saved with what completed."
+                            )
+                        else:
+                            oom_msg = (
+                                f"Not enough space to copy any tracks. "
+                                f"The iPod database was not changed."
+                            )
+                        ctx.result.errors.append(("storage", oom_msg))
                         ctx.result.success = False
                     for f in future_to_idx:
                         f.cancel()
@@ -1029,7 +1181,8 @@ class SyncExecutor:
                 if was_transcoded:
                     if ext in ("m4a", "aac") and ext != "alac":
                         from .transcoder import quality_to_nominal_bitrate
-                        existing_track.bitrate = quality_to_nominal_bitrate(ctx.aac_quality)
+                        plan = resolve_transcode_plan(source_path)
+                        existing_track.bitrate = quality_to_nominal_bitrate(plan.effective_quality)
 
                 if item.pc_track.duration_ms:
                     existing_track.length = item.pc_track.duration_ms
@@ -1555,23 +1708,13 @@ class SyncExecutor:
 
     def _get_target_format(self, source_path: Path) -> str:
         """Determine the target format for transcoding."""
-        from .transcoder import get_transcode_target, TranscodeTarget
-
-        target = get_transcode_target(source_path)
-        if target == TranscodeTarget.ALAC:
-            return "alac"
-        elif target == TranscodeTarget.AAC:
-            return "aac"
-        elif target == TranscodeTarget.VIDEO_H264:
-            return "m4v"
-        return source_path.suffix.lstrip(".")
+        return resolve_transcode_plan(source_path).cache_target_format
 
     def _copy_to_ipod(
         self,
         source_path: Path,
         needs_transcode: bool,
         fingerprint: Optional[str] = None,
-        aac_quality: str = "normal",
         transcode_progress: Optional[Callable[[float], None]] = None,
         copy_progress: Optional[Callable[[float], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
@@ -1604,9 +1747,9 @@ class SyncExecutor:
             pass  # Can't check — proceed and let the copy fail naturally
 
         if needs_transcode:
-            target_format = self._get_target_format(source_path)
-            from .transcoder import quality_to_nominal_bitrate
-            bitrate = quality_to_nominal_bitrate(aac_quality) if target_format == "aac" else None
+            plan = resolve_transcode_plan(source_path)
+            target_format = plan.cache_target_format
+            bitrate = plan.cache_bitrate_kbps
 
             # Check transcode cache
             if fingerprint:
@@ -1646,7 +1789,6 @@ class SyncExecutor:
             result = transcode(
                 source_path, output_dir,
                 output_filename=output_filename,
-                aac_quality=aac_quality,
                 progress_callback=transcode_progress,
                 is_cancelled=is_cancelled,
             )
@@ -1899,7 +2041,6 @@ class SyncExecutor:
         return pc_track_to_info(
             pc_track, ipod_location, was_transcoded,
             ipod_file_path=ipod_file_path,
-            aac_quality=self._aac_quality,
         )
 
     @staticmethod

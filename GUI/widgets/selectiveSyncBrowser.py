@@ -740,7 +740,19 @@ _CATEGORY_GLYPHS = {
     "Artists": "user",
     "Genres": "grid",
     "All Tracks": "music",
+    "Podcasts": "broadcast",
+    "Audiobooks": "book",
+    "TV Shows": "monitor",
+    "Movies": "film",
+    "Music Videos": "video",
 }
+
+# Modes that use the grid → drill-in track-list pattern.
+_GRID_MODES = {"Albums", "Artists", "Genres", "Podcasts", "Audiobooks",
+               "TV Shows", "Music Videos"}
+
+# Modes that go straight to the track list with no grouping.
+_LIST_MODES = {"All Tracks", "Movies"}
 
 
 class SelectiveSyncBrowser(QWidget):
@@ -753,6 +765,7 @@ class SelectiveSyncBrowser(QWidget):
         self._folder = ""
         self._all_tracks: list = []
         self._groups: dict[str, dict[str, dict]] = {}  # mode -> groups
+        self._buckets: dict[str, list] = {}  # media_type -> tracks
         self._selected: dict[str, bool] = {}
         self._current_mode = "Albums"
         self._current_group: str | None = None
@@ -819,9 +832,35 @@ class SelectiveSyncBrowser(QWidget):
         sb_lay.setContentsMargins(8, 12, 8, 12)
         sb_lay.setSpacing(1)
 
+        # Build buttons for every known category; empty buckets are hidden
+        # after the library scan completes.
         self._mode_buttons: dict[str, QPushButton] = {}
+        self._mode_separators: dict[str, QFrame] = {}
         nav_icon_sz = QSize(20, 20)
-        for cat, icon_name in _CATEGORY_GLYPHS.items():
+
+        def _make_separator() -> QFrame:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(
+                f"background: {Colors.BORDER_SUBTLE}; border: none; margin: 4px 6px;"
+            )
+            return sep
+
+        _ordered_cats = [
+            "Albums", "Artists", "Genres", "All Tracks",
+            "__sep_media__",
+            "Podcasts", "Audiobooks",
+            "__sep_video__",
+            "TV Shows", "Movies", "Music Videos",
+        ]
+        for cat in _ordered_cats:
+            if cat.startswith("__sep"):
+                sep = _make_separator()
+                sb_lay.addWidget(sep)
+                self._mode_separators[cat] = sep
+                continue
+            icon_name = _CATEGORY_GLYPHS[cat]
             btn = QPushButton(cat)
             btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
             icon = glyph_icon(icon_name, 20, Colors.TEXT_SECONDARY)
@@ -884,7 +923,8 @@ class SelectiveSyncBrowser(QWidget):
         self._grid_scrolls: dict[str, QWidget] = {}
         self._grid_loaded: set[str] = set()  # categories already populated
 
-        for cat in ("Albums", "Artists", "Genres"):
+        for cat in ("Albums", "Artists", "Genres",
+                    "Podcasts", "Audiobooks", "TV Shows", "Music Videos"):
             grid = PCMusicBrowserGrid()
             grid.item_selected.connect(self._on_grid_item_clicked)
             scroll = make_scroll_area()
@@ -977,6 +1017,7 @@ class SelectiveSyncBrowser(QWidget):
         self._folder = folder
         self._all_tracks = []
         self._groups.clear()
+        self._buckets.clear()
         self._selected.clear()
         self._current_mode = "Albums"
         self._grid_loaded.clear()
@@ -1009,7 +1050,16 @@ class SelectiveSyncBrowser(QWidget):
         self._all_tracks = tracks
         self._selected = {t.path: True for t in tracks}
         self._build_groups()
-        self._show_mode("Albums")
+        self._apply_sidebar_visibility()
+        # Pick the first mode that actually has content.
+        for mode in ("Albums", "Artists", "Genres", "All Tracks",
+                     "Podcasts", "Audiobooks",
+                     "TV Shows", "Movies", "Music Videos"):
+            if self._mode_has_content(mode):
+                self._show_mode(mode)
+                return
+        # Nothing to show — leave loading label.
+        self._loading_label.setText("No media found in this folder.")
 
     def _on_scan_error(self, msg: str):
         self._loading_label.setText(f"Scan failed: {msg}")
@@ -1029,112 +1079,289 @@ class SelectiveSyncBrowser(QWidget):
         # Return art-hash files first, then up to 3 fallbacks.
         return with_art[:5] + without[:3]
 
-    def _build_groups(self):
-        """Pre-compute album, artist, and genre groupings.
+    @staticmethod
+    def _classify(track) -> str:
+        """Return the media-type bucket for *track*.
 
-        Display format mirrors the iPod browser:
-        - Albums:  title = album name,  subtitle = "Artist \xb7 Year \xb7 N tracks"
-        - Artists: title = artist name, subtitle = "N albums \xb7 M tracks"
-        - Genres:  title = genre name,  subtitle = "N artists \xb7 M tracks"
+        Priority: podcasts > audiobooks > video_kind > music. A track is only
+        counted in one bucket so podcasts don't leak into Albums.
         """
-        # ── Collect raw groups ───────────────────────────────────────────
-        # Albums keyed by (album_artist, album) to avoid collisions when
-        # two artists share an album name.
-        album_raw: dict[tuple[str, str], list] = defaultdict(list)
-        artist_raw: dict[str, list] = defaultdict(list)
-        genre_raw: dict[str, list] = defaultdict(list)
+        if getattr(track, "is_podcast", False):
+            return "podcast"
+        if getattr(track, "is_audiobook", False):
+            return "audiobook"
+        if getattr(track, "is_video", False):
+            kind = getattr(track, "video_kind", "") or ""
+            if kind == "tv_show":
+                return "tv_show"
+            if kind == "music_video":
+                return "music_video"
+            # Default unclassified videos to movies.
+            return "movie"
+        return "music"
 
+    def _build_groups(self):
+        """Partition tracks by media type, then build per-mode groupings.
+
+        Music tracks power the existing Albums / Artists / Genres / All
+        Tracks views.  Podcasts, audiobooks, TV shows, and music videos get
+        their own grid groupings; movies use the direct track-list view.
+        """
+        # ── Partition by media type ───────────────────────────────────────
+        buckets: dict[str, list] = {
+            "music": [], "podcast": [], "audiobook": [],
+            "tv_show": [], "movie": [], "music_video": [],
+        }
         for t in self._all_tracks:
+            buckets[self._classify(t)].append(t)
+        self._buckets = buckets
+
+        # Reset all mode group maps — stale modes must disappear between
+        # scans when the user switches folders.
+        self._groups.clear()
+
+        self._groups["Albums"] = self._build_music_albums(buckets["music"])
+        self._groups["Artists"] = self._build_music_artists(buckets["music"])
+        self._groups["Genres"] = self._build_music_genres(buckets["music"])
+        self._groups["Podcasts"] = self._build_podcast_shows(buckets["podcast"])
+        self._groups["Audiobooks"] = self._build_audiobooks(buckets["audiobook"])
+        self._groups["TV Shows"] = self._build_tv_shows(buckets["tv_show"])
+        self._groups["Music Videos"] = self._build_music_videos(buckets["music_video"])
+        # Movies and All Tracks are list-mode and don't need pre-built groups.
+
+    # ── Per-type group builders ──────────────────────────────────────────
+
+    def _build_music_albums(self, tracks: list) -> dict[str, dict]:
+        album_raw: dict[tuple[str, str], list] = defaultdict(list)
+        for t in tracks:
             album_artist = getattr(t, "album_artist", None) or t.artist or "Unknown Artist"
-            album = t.album or "Unknown Album"
-            album_raw[(album_artist, album)].append(t)
-            artist_raw[album_artist].append(t)
-            genre_raw[getattr(t, "genre", None) or "Unknown Genre"].append(t)
+            album_raw[(album_artist, t.album or "Unknown Album")].append(t)
 
-        # ── Albums ───────────────────────────────────────────────────────
-        # Detect album-name collisions across different artists so we can
-        # disambiguate them in the display title (e.g. "Greatest Hits" by
-        # two artists becomes "Greatest Hits" and "Greatest Hits").
-        _albums_by_name: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        _by_name: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for artist, album in album_raw:
-            _albums_by_name[album].append((artist, album))
+            _by_name[album].append((artist, album))
 
-        albums: dict[str, dict] = {}
-        for (artist, album), tracks in album_raw.items():
-            # Detect year from first track that has one
-            year = 0
-            for t in tracks:
-                y = getattr(t, "year", None) or 0
-                if y:
-                    year = y
-                    break
-
+        out: dict[str, dict] = {}
+        for (artist, album), group in album_raw.items():
+            year = next((getattr(t, "year", 0) or 0 for t in group
+                         if getattr(t, "year", 0) or 0), 0)
             sub_parts = [artist]
             if year:
                 sub_parts.append(str(year))
-            sub_parts.append(f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}")
+            sub_parts.append(f"{len(group)} track{'s' if len(group) != 1 else ''}")
 
-            # Disambiguate title when multiple artists share the same album name
             display_title = album
-            if len(_albums_by_name.get(album, [])) > 1:
+            if len(_by_name.get(album, [])) > 1:
                 display_title = f"{album} ({artist})"
 
-            albums[display_title] = {
-                "tracks": tracks,
+            out[display_title] = {
+                "tracks": group,
                 "subtitle": " \xb7 ".join(sub_parts),
-                "art_paths": self._art_candidates(tracks),
+                "art_paths": self._art_candidates(group),
                 "category": "Albums",
                 "filter_key": "album",
                 "filter_value": album,
                 "album": album,
                 "artist": artist,
                 "year": year,
-                "track_count": len(tracks),
+                "track_count": len(group),
             }
+        return out
 
-        # ── Artists ──────────────────────────────────────────────────────
-        artists: dict[str, dict] = {}
-        for artist, tracks in artist_raw.items():
-            album_count = len({(t.album or "") for t in tracks})
+    def _build_music_artists(self, tracks: list) -> dict[str, dict]:
+        artist_raw: dict[str, list] = defaultdict(list)
+        for t in tracks:
+            artist_raw[getattr(t, "album_artist", None) or t.artist or "Unknown Artist"].append(t)
+
+        out: dict[str, dict] = {}
+        for artist, group in artist_raw.items():
+            album_count = len({(t.album or "") for t in group})
             sub_parts = []
             if album_count > 1:
                 sub_parts.append(f"{album_count} albums")
-            sub_parts.append(f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}")
-
-            artists[artist] = {
-                "tracks": tracks,
+            sub_parts.append(f"{len(group)} track{'s' if len(group) != 1 else ''}")
+            out[artist] = {
+                "tracks": group,
                 "subtitle": " \xb7 ".join(sub_parts),
-                "art_paths": self._art_candidates(tracks),
+                "art_paths": self._art_candidates(group),
                 "category": "Artists",
                 "filter_key": "artist",
                 "filter_value": artist,
                 "album_count": album_count,
-                "track_count": len(tracks),
+                "track_count": len(group),
             }
+        return out
 
-        # ── Genres ───────────────────────────────────────────────────────
-        genres: dict[str, dict] = {}
-        for genre, tracks in genre_raw.items():
-            artist_count = len({(getattr(t, "album_artist", None) or t.artist or "") for t in tracks})
+    def _build_music_genres(self, tracks: list) -> dict[str, dict]:
+        genre_raw: dict[str, list] = defaultdict(list)
+        for t in tracks:
+            genre_raw[getattr(t, "genre", None) or "Unknown Genre"].append(t)
+
+        out: dict[str, dict] = {}
+        for genre, group in genre_raw.items():
+            artist_count = len({(getattr(t, "album_artist", None) or t.artist or "") for t in group})
             sub_parts = []
             if artist_count > 1:
                 sub_parts.append(f"{artist_count} artists")
-            sub_parts.append(f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}")
-
-            genres[genre] = {
-                "tracks": tracks,
+            sub_parts.append(f"{len(group)} track{'s' if len(group) != 1 else ''}")
+            out[genre] = {
+                "tracks": group,
                 "subtitle": " \xb7 ".join(sub_parts),
-                "art_paths": self._art_candidates(tracks),
+                "art_paths": self._art_candidates(group),
                 "category": "Genres",
                 "filter_key": "genre",
                 "filter_value": genre,
                 "artist_count": artist_count,
-                "track_count": len(tracks),
+                "track_count": len(group),
             }
+        return out
 
-        self._groups["Albums"] = albums
-        self._groups["Artists"] = artists
-        self._groups["Genres"] = genres
+    def _build_podcast_shows(self, tracks: list) -> dict[str, dict]:
+        """Group podcast episodes by show (album tag is typically the show)."""
+        show_raw: dict[str, list] = defaultdict(list)
+        for t in tracks:
+            show = t.album or t.artist or "Unknown Podcast"
+            show_raw[show].append(t)
+
+        out: dict[str, dict] = {}
+        for show, eps in show_raw.items():
+            # Sort newest first when release dates are available; fall back
+            # to track number so the drill-in view is ordered predictably.
+            eps.sort(key=lambda e: (
+                -(getattr(e, "date_released", 0) or 0),
+                getattr(e, "track_number", 0) or 0,
+            ))
+            n = len(eps)
+            out[show] = {
+                "tracks": eps,
+                "subtitle": f"{n} episode{'s' if n != 1 else ''}",
+                "art_paths": self._art_candidates(eps),
+                "category": "Podcasts",
+                "filter_key": "podcast",
+                "filter_value": show,
+                "track_count": n,
+            }
+        return out
+
+    def _build_audiobooks(self, tracks: list) -> dict[str, dict]:
+        """Group audiobook chapters/tracks by book (album tag)."""
+        book_raw: dict[tuple[str, str], list] = defaultdict(list)
+        for t in tracks:
+            author = getattr(t, "album_artist", None) or t.artist or "Unknown Author"
+            book = t.album or t.title or "Unknown Book"
+            book_raw[(author, book)].append(t)
+
+        out: dict[str, dict] = {}
+        for (author, book), parts in book_raw.items():
+            parts.sort(key=lambda p: (
+                getattr(p, "disc_number", 0) or 0,
+                getattr(p, "track_number", 0) or 0,
+            ))
+            total_ms = sum(getattr(p, "duration_ms", 0) or 0 for p in parts)
+            sub_parts = [author]
+            if total_ms:
+                sub_parts.append(format_duration_human(total_ms))
+            sub_parts.append(f"{len(parts)} part{'s' if len(parts) != 1 else ''}")
+            out[book] = {
+                "tracks": parts,
+                "subtitle": " \xb7 ".join(sub_parts),
+                "art_paths": self._art_candidates(parts),
+                "category": "Audiobooks",
+                "filter_key": "audiobook",
+                "filter_value": book,
+                "track_count": len(parts),
+            }
+        return out
+
+    def _build_tv_shows(self, tracks: list) -> dict[str, dict]:
+        """Group TV episodes by (show, season)."""
+        show_raw: dict[tuple[str, int], list] = defaultdict(list)
+        for t in tracks:
+            show = getattr(t, "show_name", None) or t.album or t.artist or "Unknown Show"
+            season = getattr(t, "season_number", 0) or 0
+            show_raw[(show, season)].append(t)
+
+        out: dict[str, dict] = {}
+        for (show, season), eps in show_raw.items():
+            eps.sort(key=lambda e: getattr(e, "episode_number", 0) or 0)
+            n = len(eps)
+            title = f"{show} \u2014 Season {season}" if season else show
+            sub_parts = []
+            if season:
+                sub_parts.append(f"Season {season}")
+            sub_parts.append(f"{n} episode{'s' if n != 1 else ''}")
+            out[title] = {
+                "tracks": eps,
+                "subtitle": " \xb7 ".join(sub_parts),
+                "art_paths": self._art_candidates(eps),
+                "category": "TV Shows",
+                "filter_key": "tv_show",
+                "filter_value": title,
+                "show": show,
+                "season": season,
+                "track_count": n,
+            }
+        return out
+
+    def _build_music_videos(self, tracks: list) -> dict[str, dict]:
+        """Group music videos by artist."""
+        artist_raw: dict[str, list] = defaultdict(list)
+        for t in tracks:
+            artist_raw[getattr(t, "album_artist", None) or t.artist or "Unknown Artist"].append(t)
+
+        out: dict[str, dict] = {}
+        for artist, vids in artist_raw.items():
+            n = len(vids)
+            out[artist] = {
+                "tracks": vids,
+                "subtitle": f"{n} video{'s' if n != 1 else ''}",
+                "art_paths": self._art_candidates(vids),
+                "category": "Music Videos",
+                "filter_key": "artist",
+                "filter_value": artist,
+                "track_count": n,
+            }
+        return out
+
+    # ── Sidebar visibility ───────────────────────────────────────────────
+
+    def _mode_has_content(self, mode: str) -> bool:
+        if mode == "All Tracks":
+            return bool(self._buckets.get("music"))
+        if mode == "Movies":
+            return bool(self._buckets.get("movie"))
+        return bool(self._groups.get(mode))
+
+    def _apply_sidebar_visibility(self):
+        """Hide buttons for empty media buckets; hide separators that
+        become orphans because every neighbor is hidden.
+
+        Uses bucket contents directly (rather than ``isVisible()``) so the
+        calculation is correct before the widget is first shown.
+        """
+        has: dict[str, bool] = {
+            cat: self._mode_has_content(cat) for cat in self._mode_buttons
+        }
+        for cat, btn in self._mode_buttons.items():
+            btn.setVisible(has[cat])
+
+        music_section = any(has[c] for c in
+                            ("Albums", "Artists", "Genres", "All Tracks"))
+        non_music = any(has[c] for c in (
+            "Podcasts", "Audiobooks", "TV Shows", "Movies", "Music Videos"
+        ))
+        if "__sep_media__" in self._mode_separators:
+            # Only show when there's content on BOTH sides of the divider.
+            self._mode_separators["__sep_media__"].setVisible(
+                music_section and non_music
+            )
+
+        audio_media = any(has[c] for c in ("Podcasts", "Audiobooks"))
+        video_media = any(has[c] for c in ("TV Shows", "Movies", "Music Videos"))
+        if "__sep_video__" in self._mode_separators:
+            self._mode_separators["__sep_video__"].setVisible(
+                audio_media and video_media
+            )
 
     # ── Mode switching ───────────────────────────────────────────────────
 
@@ -1147,18 +1374,26 @@ class SelectiveSyncBrowser(QWidget):
         self._current_mode = mode
         self._highlight_mode(mode)
 
-        if mode == "All Tracks":
-            self._current_group = "All Tracks"
-            self._current_group_tracks = self._all_tracks
-            self._track_list.setTitle("All Tracks")
-            n = len(self._all_tracks)
+        if mode in _LIST_MODES:
+            # Direct track list — no grouping, no grid.
+            if mode == "All Tracks":
+                tracks = self._buckets.get("music", [])
+                title = "All Tracks"
+                noun = ("track", "tracks")
+            else:  # Movies
+                tracks = self._buckets.get("movie", [])
+                title = "Movies"
+                noun = ("movie", "movies")
+
+            self._current_group = mode
+            self._current_group_tracks = tracks
+            self._track_list.setTitle(title)
+            n = len(tracks)
             self._track_list.setSubtitle(
-                f"{n} track{'s' if n != 1 else ''}"
+                f"{n} {noun[0] if n == 1 else noun[1]}"
             )
-            total_ms = sum(getattr(t, "duration_ms", 0) or 0
-                           for t in self._all_tracks)
-            total_bytes = sum(getattr(t, "size", 0) or 0
-                              for t in self._all_tracks)
+            total_ms = sum(getattr(t, "duration_ms", 0) or 0 for t in tracks)
+            total_bytes = sum(getattr(t, "size", 0) or 0 for t in tracks)
             meta_parts = []
             if total_ms:
                 meta_parts.append(format_duration_human(total_ms))
@@ -1166,7 +1401,8 @@ class SelectiveSyncBrowser(QWidget):
                 meta_parts.append(format_size(total_bytes))
             self._track_list.setMeta(" \u00b7 ".join(meta_parts))
             self._track_list.setHeroVisible(False)
-            self._track_list.setTracks(self._all_tracks, self._selected)
+            self._track_list.setBackVisible(False)
+            self._track_list.setTracks(tracks, self._selected)
             self._content.setCurrentIndex(2)
         else:
             grid = self._grids.get(mode)

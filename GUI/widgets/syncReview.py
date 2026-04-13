@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFont, QColor, QPainter
 from pathlib import Path
 import shutil
+import threading
 
 from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction, FingerprintDiffEngine
 from SyncEngine.pc_library import PCLibrary
@@ -93,6 +94,10 @@ class SyncExecuteWorker(QThread):
     progress = pyqtSignal(object)  # SyncProgress
     finished = pyqtSignal(object)  # SyncResult
     error = pyqtSignal(str)
+    # Emitted when the sync is cancelled mid-way with partial results.
+    # Carries (n_added, n_skipped).  The UI must respond by calling
+    # respond_to_partial_save(True/False) to unblock the worker thread.
+    confirm_partial_save = pyqtSignal(int, int)
 
     def __init__(self, ipod_path: str, plan, *, skip_backup: bool = False,
                  user_playlists: list | None = None,
@@ -104,6 +109,14 @@ class SyncExecuteWorker(QThread):
         self._skip_backup_requested = False
         self.user_playlists = user_playlists
         self.on_sync_complete = on_sync_complete
+        self._partial_save_event: "threading.Event | None" = None
+        self._partial_save_decision: list[bool] = [True]
+
+    def respond_to_partial_save(self, save: bool) -> None:
+        """Called from the UI thread to unblock the worker with the user's decision."""
+        self._partial_save_decision[0] = save
+        if self._partial_save_event:
+            self._partial_save_event.set()
 
     def request_skip_backup(self):
         """Signal the worker to skip the in-progress backup and proceed to sync."""
@@ -116,6 +129,19 @@ class SyncExecuteWorker(QThread):
             from settings import get_settings
 
             settings = get_settings()
+
+            # Callback that blocks the worker thread until the UI responds
+            self._partial_save_event = threading.Event()
+
+            def _on_cancel_with_partial(n_added: int, n_skipped: int) -> bool:
+                evt = self._partial_save_event
+                if evt is None:
+                    return True
+                self._partial_save_decision[0] = True  # default: save
+                evt.clear()
+                self.confirm_partial_save.emit(n_added, n_skipped)
+                evt.wait()  # blocks until respond_to_partial_save() is called
+                return self._partial_save_decision[0]
 
             # ── Pre-sync backup ───────────────────────────────────────
             if not self.skip_backup:
@@ -208,12 +234,12 @@ class SyncExecuteWorker(QThread):
                 dry_run=False,
                 is_cancelled=self.isInterruptionRequested,
                 write_back_to_pc=settings.write_back_to_pc,
-                aac_quality=settings.aac_quality,
                 user_playlists=self.user_playlists,
                 on_sync_complete=self.on_sync_complete,
                 compute_sound_check=settings.compute_sound_check,
                 scrobble_on_sync=settings.scrobble_on_sync,
                 listenbrainz_token=settings.listenbrainz_token or "",
+                on_cancel_with_partial=_on_cancel_with_partial,
             )
 
             self.finished.emit(result)
@@ -551,7 +577,9 @@ class SyncTrackRow(QFrame):
             self.title_label.setText(track.title or track.filename)
             parts = [track.artist or "Unknown", track.album or "Unknown"]
             if track.size:
-                parts.append(_format_size(track.size))
+                parts.append(f"PC: {_format_size(track.size)}")
+            if item.estimated_size is not None:
+                parts.append(f"iPod est: {_format_size(item.estimated_size)}")
             parts.append(track.extension.upper())
             # Media type indicator for non-music items
             if track.is_podcast:
@@ -597,7 +625,11 @@ class SyncTrackRow(QFrame):
 
         elif item.action == SyncAction.UPDATE_FILE and track:
             self.title_label.setText(track.title or track.filename)
-            parts = [track.artist or "Unknown", track.album or "Unknown", _format_size(track.size)]
+            parts = [track.artist or "Unknown", track.album or "Unknown"]
+            if track.size:
+                parts.append(f"PC: {_format_size(track.size)}")
+            if item.estimated_size is not None:
+                parts.append(f"iPod est: {_format_size(item.estimated_size)}")
             self.detail_label.setText(" · ".join(parts))
             self.badge_label.setText(_format_duration(track.duration_ms))
 
@@ -1691,7 +1723,10 @@ class SyncReviewWidget(QWidget):
             if use_subgroups:
                 for type_key, group_items in groups:
                     label, icon = _MEDIA_TYPE_LABELS[type_key]
-                    group_size = sum((it.pc_track.size if it.pc_track else 0) for it in group_items)
+                    group_size = sum(
+                        (it.estimated_size if it.estimated_size is not None else (it.pc_track.size if it.pc_track else 0))
+                        for it in group_items
+                    )
                     card = SyncCategoryCard(
                         "plus", f"Add {label} to iPod", len(group_items),
                         _CAT_COLORS["add"], size_bytes=group_size,
@@ -2125,6 +2160,7 @@ class SyncReviewWidget(QWidget):
 
         success = getattr(result, 'success', True)
         errors = getattr(result, 'errors', [])
+        partial_save = getattr(result, 'partial_save', False)
 
         # Title
         def _set_result(glyph_name: str, fallback: str, color: str, title: str) -> None:
@@ -2137,10 +2173,11 @@ class SyncReviewWidget(QWidget):
             self.result_title.setText(title)
             self.result_title.setStyleSheet(f"color: {color};")
 
-        if success and not errors:
+        if partial_save:
+            # Stopped early but DB was saved — not a clean success, not a hard fail
+            _set_result("warning-triangle", "△", Colors.WARNING, "Partial Sync Saved")
+        elif success and not errors:
             _set_result("check-circle", "✓", Colors.SUCCESS, "Sync Complete")
-        elif not success:
-            _set_result("close-circle", "✕", Colors.DANGER, "Sync Failed")
         elif errors:
             _set_result("warning-triangle", "△", Colors.WARNING, "Sync Completed with Errors")
         else:
@@ -2174,7 +2211,57 @@ class SyncReviewWidget(QWidget):
         if not lines:
             lines.append("No changes were made.")
 
-        if errors:
+        # Partial save banner — explain what happened and reassure the user
+        if partial_save:
+            lines.append("")
+            # Separate storage-full and cancelled into different messages
+            storage_errors = [m for d, m in errors if d == "storage"]
+            cancel_errors = [m for d, m in errors if d == "cancelled"]
+            other_errors = [(d, m) for d, m in errors
+                            if d not in ("storage", "cancelled")]
+            if storage_errors:
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'>"
+                    f"<b>iPod storage ran out during sync.</b></span>"
+                )
+                lines.append(
+                    f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                    + storage_errors[0]
+                    + "</span>"
+                )
+            elif cancel_errors:
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'>"
+                    f"<b>Sync was cancelled.</b></span>"
+                )
+                lines.append(
+                    f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                    + cancel_errors[0]
+                    + "</span>"
+                )
+            if added or removed or updated_file:
+                lines.append(
+                    f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                    f"Your iPod's database has been updated to reflect "
+                    f"everything that completed successfully.</span>"
+                )
+            if other_errors:
+                lines.append("")
+                lines.append(
+                    f"<span style='color: {Colors.DANGER};'>"
+                    f"<b>{len(other_errors)} additional error"
+                    f"{'s' if len(other_errors) != 1 else ''}:</b></span>"
+                )
+                for desc, msg in other_errors[:8]:
+                    lines.append(
+                        f"<span style='color: {Colors.DANGER};'>  {desc}: {msg}</span>"
+                    )
+                if len(other_errors) > 8:
+                    lines.append(
+                        f"<span style='color: {Colors.DANGER};'>"
+                        f"  …and {len(other_errors) - 8} more</span>"
+                    )
+        elif errors:
             lines.append("")
             lines.append(f"<span style='color: {Colors.DANGER};'><b>{len(errors)} error{'s' if len(errors) != 1 else ''}:</b></span>")
             for desc, msg in errors[:10]:  # Show max 10
@@ -2183,7 +2270,7 @@ class SyncReviewWidget(QWidget):
                 lines.append(f"<span style='color: {Colors.DANGER};'>  ...and {len(errors) - 10} more</span>")
 
         # Safe-eject reminder
-        if success and (added or removed or updated_file or updated_meta):
+        if (success or partial_save) and (added or removed or updated_file or updated_meta):
             lines.append("")
             lines.append(f"<span style='color: {Colors.TEXT_TERTIARY};'>Safely eject your iPod before disconnecting.</span>")
 
@@ -2192,7 +2279,10 @@ class SyncReviewWidget(QWidget):
 
         # Update summary
         total_actions = added + removed + updated_file + updated_meta + playcounts + ratings
-        self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} completed")
+        if partial_save:
+            self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} saved (partial sync)")
+        else:
+            self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} completed")
 
     def show_error(self, message: str):
         """Show error message."""
@@ -2277,13 +2367,17 @@ class SyncReviewWidget(QWidget):
                     selected += 1
                     item = row.sync_item
                     if item.action == SyncAction.ADD_TO_IPOD:
-                        if item.pc_track:
+                        if item.estimated_size is not None:
+                            bytes_to_add += item.estimated_size
+                        elif item.pc_track:
                             bytes_to_add += item.pc_track.size
                     elif item.action == SyncAction.REMOVE_FROM_IPOD:
                         if item.ipod_track:
                             bytes_to_remove += item.ipod_track.get("size", 0)
                     elif item.action == SyncAction.UPDATE_FILE:
-                        if item.pc_track:
+                        if item.estimated_size is not None:
+                            bytes_to_add += item.estimated_size
+                        elif item.pc_track:
                             bytes_to_add += item.pc_track.size
 
         # Build git-diff style size string

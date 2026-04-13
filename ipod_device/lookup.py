@@ -14,14 +14,23 @@ def extract_model_number(model_str: str) -> Optional[str]:
     - ``"xA623"`` → ``"MA623"``
     - ``"MC293"`` → ``"MC293"``
     - ``"M9282"`` → ``"M9282"``
+    - ``"P9804"`` → ``"M9804"``  (SysInfo sometimes uses non-M first char)
     """
     if not model_str:
         return None
 
+    # Normalise 'x' prefix: "xA623" → "MA623"
     if model_str.startswith('x'):
         model_str = 'M' + model_str[1:]
 
     match = re.match(r'^(M[A-Z]?\d{3,4})', model_str.upper())
+    if match:
+        return match.group(1)
+
+    # Some SysInfo ModelNumStr values use a non-M first character (e.g. "P9804"
+    # instead of "M9804").  Try substituting M and re-matching.
+    alt = 'M' + model_str[1:]
+    match = re.match(r'^(M[A-Z]?\d{3,4})', alt.upper())
     if match:
         return match.group(1)
 
@@ -39,6 +48,12 @@ def get_model_info(model_number: Optional[str]) -> tuple[str, str, str, str] | N
 
     if model_number in IPOD_MODELS:
         return IPOD_MODELS[model_number]
+
+    # If the first character isn't M, try substituting M (handles SysInfo quirks)
+    if not model_number.startswith('M') and len(model_number) > 1:
+        alt = 'M' + model_number[1:]
+        if alt in IPOD_MODELS:
+            return IPOD_MODELS[alt]
 
     for prefix, info in IPOD_MODELS.items():
         if model_number.startswith(prefix[:4]):

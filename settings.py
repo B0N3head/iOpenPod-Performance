@@ -188,10 +188,27 @@ class AppSettings:
     fpcalc_path: str = ""
 
     # ── Transcoding ─────────────────────────────────────────────────────────
-    # AAC quality preset for lossy transcodes (OGG/Opus/WMA → AAC).
-    # Uses encoder-specific flags (VBR for libfdk_aac, CVBR for aac_at, CBR for aac).
-    # Options: "high", "normal", "compact", "spoken".
-    aac_quality: str = "normal"
+
+    # AAC Encoder Configuration
+    # Which encoder to use: "auto" picks best available (libfdk_aac > aac_at > aac).
+    aac_encoder: str = "auto"
+
+    # Encoding mode. Allowed values depend on encoder:
+    #   libfdk_aac: "cbr" (recommended), "vbr"
+    #   aac_at:     "cbr", "cvbr" (recommended), "abr", "vbr"
+    #   aac:        "cbr" only
+    aac_mode: str = "cbr"
+
+    # Target bitrate in kbps for CBR/CVBR/ABR music encodes.
+    # Sensible range: 64–256. Maximum useful quality for AAC is at 256 kbps.
+    aac_music_bitrate: int = 192
+
+    # VBR quality level for libfdk_aac VBR mode (1 = lowest, 5 = highest).
+    # Level 5 can spike above 256 kbps — may cause instability on pre-Classic iPods.
+    aac_vbr_level: int = 4
+
+    # Bitrate for spoken-word (podcast/audiobook) encodes. Always CBR.
+    aac_spoken_bitrate: int = 64
 
     # Video quality (CRF) for H.264 transcodes. Lower = better quality.
     # 18=high, 20=good, 23=balanced, 26=low, 28=very low.
@@ -222,9 +239,9 @@ class AppSettings:
     # Only affects spoken-word transcodes; music tracks are unchanged.
     mono_for_spoken: bool = True
 
-    # Automatically use "spoken" AAC quality for files whose media type
+    # Automatically use spoken-word bitrate for files whose media type
     # is Podcast, Audiobook, or iTunes U (stik atom values 1, 2, 21).
-    # Music files always use the configured aac_quality preset.
+    # Music files always use the configured music bitrate.
     smart_quality_by_type: bool = True
 
     # ── Library ─────────────────────────────────────────────────────────────
@@ -304,6 +321,15 @@ class AppSettings:
             # stale redirect, so nothing extra to do.
             pass
 
+        # The transcoder caches a few settings-derived decisions. Invalidate
+        # them immediately so new transcoding plans use the freshly-saved
+        # values without requiring an app restart.
+        try:
+            from SyncEngine.transcoder import clear_caches as _clear_transcoder_caches
+            _clear_transcoder_caches()
+        except Exception:
+            pass
+
     @staticmethod
     def _write_redirect(default_dir: str, custom_dir: str) -> None:
         """Write a minimal redirect file at the default location."""
@@ -341,12 +367,22 @@ class AppSettings:
             if "media_folder" not in data and "music_folder" in data:
                 settings.media_folder = data["music_folder"]
 
-            # ── Migration: aac_bitrate (int) → aac_quality (str) ────────
-            if "aac_quality" not in data and "aac_bitrate" in data:
-                _br = data["aac_bitrate"]
-                _map = {64: "spoken", 128: "compact", 192: "normal",
-                        256: "normal", 320: "high"}
-                settings.aac_quality = _map.get(_br, "normal")
+            # ── Migration: aac_bitrate (int) → new encoder config fields ──
+            if "aac_bitrate" in data and "aac_music_bitrate" not in data:
+                _br = int(data["aac_bitrate"])
+                if _br == 64:
+                    settings.aac_spoken_bitrate = 64
+                else:
+                    settings.aac_music_bitrate = min(_br, 256)
+
+            # ── Migration: aac_quality (str) → new encoder config fields ──
+            if "aac_quality" in data and "aac_music_bitrate" not in data:
+                _old_q = data.get("aac_quality", "normal")
+                _q_map = {"high": 256, "normal": 192, "compact": 128}
+                if _old_q == "spoken":
+                    settings.aac_spoken_bitrate = 64
+                else:
+                    settings.aac_music_bitrate = _q_map.get(_old_q, 192)
 
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             pass
