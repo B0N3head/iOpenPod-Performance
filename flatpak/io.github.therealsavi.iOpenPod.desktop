@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=iOpenPod
+Comment=Open-source iPod Classic sync tool
+Exec=iOpenPod
+Icon=io.github.therealsavi.iOpenPod
+Categories=AudioVideo;Audio;Utility;
+Terminal=false
+StartupNotify=true
