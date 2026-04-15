@@ -49,6 +49,9 @@ class MainWindow(QMainWindow):
         self._plan = None
         self._last_pc_folder = settings.media_folder or ""
 
+        # Eject worker (safe-unmount off the UI thread)
+        self._eject_worker: _EjectWorker | None = None
+
         # Quick metadata write (track flags, rating, etc.)
         self._quick_meta_worker: _QuickMetadataWorker | None = None
         self._quick_meta_timer = QTimer(self)
@@ -148,6 +151,7 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar()
         self.sidebar.category_changed.connect(self.musicBrowser.updateCategory)
         self.sidebar.device_renamed.connect(self._onDeviceRenamed)
+        self.sidebar.eject_requested.connect(self._onEjectDevice)
         self.sidebar.deviceButton.clicked.connect(self.selectDevice)
         self.sidebar.rescanButton.clicked.connect(self.resyncDevice)
         self.sidebar.syncButton.clicked.connect(self.startPCSync)
@@ -509,6 +513,62 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(
             self, "Rename Failed",
             f"Failed to rename iPod:\n{error_msg}"
+        )
+
+    # ── Eject ──────────────────────────────────────────────────────────
+
+    def _onEjectDevice(self):
+        """Safely eject the current iPod from the OS."""
+        device = DeviceManager.get_instance()
+        path = device.device_path
+        if not path:
+            return
+
+        if self._is_sync_running():
+            QMessageBox.warning(
+                self, "Sync In Progress",
+                "Please wait for the current sync to finish before ejecting."
+            )
+            return
+
+        # Flush any pending in-memory edits before pulling the volume out.
+        if self._quick_meta_timer.isActive():
+            self._quick_meta_timer.stop()
+            self._start_quick_meta_write()
+
+        self.sidebar.device_card.eject_button.setEnabled(False)
+
+        self._eject_worker = _EjectWorker(path)
+        self._eject_worker.finished_ok.connect(self._onEjectDone)
+        self._eject_worker.failed.connect(self._onEjectFailed)
+        self._eject_worker.start()
+
+    def _onEjectDone(self, message: str):
+        logger.info("iPod ejected: %s", message)
+        if self._eject_worker is not None:
+            self._eject_worker.deleteLater()
+            self._eject_worker = None
+        Notifier.get_instance().notify("iPod Ejected", message)
+        DeviceManager.get_instance().device_path = None
+        # Forget the restored device so it doesn't auto-reconnect next launch.
+        try:
+            s = get_settings()
+            s.last_device_path = ""
+            s.save()
+        except Exception:
+            logger.warning("Failed to clear last_device_path from settings", exc_info=True)
+
+    def _onEjectFailed(self, error_msg: str):
+        logger.error("iPod eject failed: %s", error_msg)
+        if self._eject_worker is not None:
+            self._eject_worker.deleteLater()
+            self._eject_worker = None
+        # Re-enable the button so the user can retry.
+        has_device = bool(DeviceManager.get_instance().device_path)
+        self.sidebar.device_card.eject_button.setEnabled(has_device)
+        QMessageBox.critical(
+            self, "Eject Failed",
+            f"Failed to eject the iPod:\n{error_msg}"
         )
 
     # ── Quick metadata write (track flags, rating, etc.) ────────────────────
@@ -2370,6 +2430,29 @@ def build_genre_list(cache: iTunesDBCache) -> list:
 
 
 # _DeviceRenameWorker — background thread for iPod rename (full DB rewrite)
+class _EjectWorker(QThread):
+    """Run the cross-platform safe-eject off the UI thread."""
+
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, ipod_path: str):
+        super().__init__()
+        self._ipod_path = ipod_path
+
+    def run(self):
+        try:
+            from ipod_device.eject import eject_ipod
+            ok, message = eject_ipod(self._ipod_path)
+            if ok:
+                self.finished_ok.emit(message)
+            else:
+                self.failed.emit(message)
+        except Exception as exc:
+            logger.exception("EjectWorker: unexpected error")
+            self.failed.emit(str(exc))
+
+
 class _DeviceRenameWorker(QThread):
     """Rewrite the iTunesDB after renaming the iPod (master playlist title)."""
 

@@ -44,8 +44,8 @@ class _RenameLineEdit(QLineEdit):
         self.focus_lost.emit()
 
 
-class StatWidget(QWidget):
-    """Widget showing a value and description label."""
+class _InventoryCell(QWidget):
+    """Compact value+label cell used in the DeviceInfoCard inventory grid."""
 
     def __init__(self, value: str, label: str):
         super().__init__()
@@ -55,19 +55,16 @@ class StatWidget(QWidget):
         layout.setSpacing(0)
 
         self.value_label = QLabel(value)
-        self.value_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_XXL, QFont.Weight.Bold))
+        self.value_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG, QFont.Weight.DemiBold))
         self.value_label.setStyleSheet(LABEL_PRIMARY())
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.value_label)
 
         self.desc_label = QLabel(label)
         self.desc_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_XS))
         self.desc_label.setStyleSheet(LABEL_TERTIARY())
-        self.desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.desc_label)
 
     def setValue(self, value: str):
-        """Update the value text."""
         self.value_label.setText(value)
 
 
@@ -103,6 +100,7 @@ class DeviceInfoCard(QFrame):
     """Card showing iPod device information and stats."""
 
     device_renamed = pyqtSignal(str)  # emits the new name
+    eject_requested = pyqtSignal()    # emitted when the Eject button is clicked
 
     def __init__(self):
         super().__init__()
@@ -117,26 +115,26 @@ class DeviceInfoCard(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins((14), (14), (14), (14))
-        layout.setSpacing((8))
+        layout.setSpacing((10))
 
-        # iPod icon and name row
+        # ── Header: 40×40 icon + name + model ──
         header_layout = QHBoxLayout()
-        header_layout.setSpacing((8))
+        header_layout.setSpacing((10))
 
         self.icon_label = QLabel()
-        px = glyph_pixmap("music", (32), Colors.TEXT_SECONDARY)
+        px = glyph_pixmap("music", (30), Colors.TEXT_SECONDARY)
         if px:
             self.icon_label.setPixmap(px)
         else:
             self.icon_label.setText("♪")
-            self.icon_label.setFont(QFont(FONT_FAMILY, (24)))
-        self.icon_label.setFixedSize((52), (52))
+            self.icon_label.setFont(QFont(FONT_FAMILY, (22)))
+        self.icon_label.setFixedSize((48), (48))
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet("background: transparent; border: none;")
-        header_layout.addWidget(self.icon_label)
+        header_layout.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         name_layout = QVBoxLayout()
-        name_layout.setSpacing(0)
+        name_layout.setSpacing((1))
         self._name_layout = name_layout
 
         self.name_label = QLabel("No Device")
@@ -153,34 +151,85 @@ class DeviceInfoCard(QFrame):
         self.model_label.setWordWrap(True)
         name_layout.addWidget(self.model_label)
 
-        header_layout.addLayout(name_layout)
-        header_layout.addStretch()
+        header_layout.addLayout(name_layout, 1)
         layout.addLayout(header_layout)
 
-        # Separator
-        sep = make_separator()
-        layout.addWidget(sep)
+        # ── Capacity row: eject icon · "X free of Y" label + 6px bar ──
+        self._capacity_widget = QWidget()
+        self._capacity_widget.setStyleSheet("background: transparent; border: none;")
+        cap_row = QHBoxLayout(self._capacity_widget)
+        cap_row.setContentsMargins(0, 0, 0, 0)
+        cap_row.setSpacing((8))
 
-        # Stats lines (compact inline text, no column overflow)
-        stats_widget = QWidget()
-        stats_widget.setStyleSheet("background: transparent; border: none;")
-        stats_layout = QVBoxLayout(stats_widget)
-        stats_layout.setContentsMargins(0, (4), 0, (2))
-        stats_layout.setSpacing((2))
+        # Small icon-only eject button
+        self.eject_button = QPushButton()
+        self.eject_button.setFixedSize((26), (26))
+        self.eject_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.eject_button.setToolTip("Safely eject the iPod from your system")
+        self.eject_button.setStyleSheet(btn_css(
+            bg=Colors.SURFACE,
+            bg_hover=Colors.SURFACE_HOVER,
+            bg_press=Colors.SURFACE_ACTIVE,
+            border=f"1px solid {Colors.BORDER_SUBTLE}",
+            padding="0px",
+        ))
+        _ej = glyph_icon("eject", (14), Colors.TEXT_SECONDARY)
+        if _ej:
+            self.eject_button.setIcon(_ej)
+            self.eject_button.setIconSize(QSize((14), (14)))
+        else:
+            self.eject_button.setText("⏏")
+        self.eject_button.setEnabled(False)
+        self.eject_button.clicked.connect(self.eject_requested.emit)
+        cap_row.addWidget(self.eject_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self._stats_line1 = QLabel("—")
-        self._stats_line1.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self._stats_line1.setStyleSheet(LABEL_PRIMARY())
-        self._stats_line1.setWordWrap(True)
-        stats_layout.addWidget(self._stats_line1)
+        # Label + bar stacked on the right
+        cap_info = QWidget()
+        cap_info.setStyleSheet("background: transparent; border: none;")
+        cap_info_layout = QVBoxLayout(cap_info)
+        cap_info_layout.setContentsMargins(0, 0, 0, 0)
+        cap_info_layout.setSpacing((4))
 
-        self._stats_line2 = QLabel("")
-        self._stats_line2.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self._stats_line2.setStyleSheet(LABEL_SECONDARY())
-        self._stats_line2.setWordWrap(True)
-        stats_layout.addWidget(self._stats_line2)
+        self._capacity_label = QLabel("—")
+        self._capacity_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._capacity_label.setStyleSheet(LABEL_SECONDARY())
+        cap_info_layout.addWidget(self._capacity_label)
 
-        layout.addWidget(stats_widget)
+        self.storage_bar = QProgressBar()
+        self.storage_bar.setFixedHeight((6))
+        self.storage_bar.setTextVisible(False)
+        self.storage_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {Colors.BORDER_SUBTLE};
+                border: none;
+                border-radius: {(3)}px;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {Colors.ACCENT}, stop:1 {Colors.ACCENT_LIGHT});
+                border-radius: {(3)}px;
+            }}
+        """)
+        cap_info_layout.addWidget(self.storage_bar)
+        cap_row.addWidget(cap_info, 1)
+
+        self._capacity_widget.hide()  # shown once we have disk info
+        layout.addWidget(self._capacity_widget)
+
+        # ── Inventory: Songs · Hours ──
+        inv_widget = QWidget()
+        inv_widget.setStyleSheet("background: transparent; border: none;")
+        inv_layout = QHBoxLayout(inv_widget)
+        inv_layout.setContentsMargins(0, (2), 0, (2))
+        inv_layout.setSpacing((10))
+
+        self._inv_songs = _InventoryCell("—", "Songs")
+        self._inv_hours = _InventoryCell("—", "Hours")
+
+        inv_layout.addWidget(self._inv_songs, 1)
+        inv_layout.addWidget(self._inv_hours, 1)
+
+        layout.addWidget(inv_widget)
 
         # Technical details section (collapsible)
         self.tech_toggle = QPushButton("Technical Details")
@@ -209,7 +258,7 @@ class DeviceInfoCard(QFrame):
         self.tech_container.setStyleSheet("background: transparent; border: none;")
         self.tech_container.hide()  # Hidden by default
         tech_layout = QVBoxLayout(self.tech_container)
-        tech_layout.setContentsMargins(0, (6), 0, 0)
+        tech_layout.setContentsMargins(0, (4), 0, 0)
         tech_layout.setSpacing(0)
 
         # Technical info rows — identity
@@ -232,36 +281,31 @@ class DeviceInfoCard(QFrame):
         self.free_space_row = TechInfoRow("Free Space:", "—")
         self.art_formats_row = TechInfoRow("Art Formats:", "—")
 
+        # Three grouped sections with hairline separators
+        tech_layout.addWidget(make_section_header("Identity"))
         for w in (
             self.model_num_row, self.serial_row, self.firmware_row,
             self.board_row, self.fw_guid_row, self.usb_pid_row,
             self.id_method_row,
+        ):
+            tech_layout.addWidget(w)
+
+        tech_layout.addWidget(make_separator())
+        tech_layout.addWidget(make_section_header("Database"))
+        for w in (
             self.db_version_row, self.db_id_row,
             self.checksum_row, self.hash_scheme_row,
+        ):
+            tech_layout.addWidget(w)
+
+        tech_layout.addWidget(make_separator())
+        tech_layout.addWidget(make_section_header("Storage"))
+        for w in (
             self.disk_size_row, self.free_space_row, self.art_formats_row,
         ):
             tech_layout.addWidget(w)
 
         layout.addWidget(self.tech_container)
-
-        # Storage bar (optional, for when we have capacity info)
-        self.storage_bar = QProgressBar()
-        self.storage_bar.setFixedHeight((4))
-        self.storage_bar.setTextVisible(False)
-        self.storage_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: {Colors.BORDER_SUBTLE};
-                border: none;
-                border-radius: {(2)}px;
-            }}
-            QProgressBar::chunk {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {Colors.ACCENT}, stop:1 {Colors.ACCENT_LIGHT});
-                border-radius: {(2)}px;
-            }}
-        """)
-        self.storage_bar.hide()  # Hidden until we have capacity data
-        layout.addWidget(self.storage_bar)
 
         # Save indicator — shown briefly after quick metadata writes
         self._save_label = QLabel()
@@ -346,7 +390,7 @@ class DeviceInfoCard(QFrame):
 
     def _fit_name_font(self, text: str):
         """Shrink the device name font if the text is too wide for the card."""
-        max_w = (130)  # approximate width available for the name
+        max_w = (134)  # approximate width available for the name
         for size in (Metrics.FONT_XXL, Metrics.FONT_XL, Metrics.FONT_LG, Metrics.FONT_MD):
             f = QFont(FONT_FAMILY, size, QFont.Weight.Bold)
             if QFontMetrics(f).horizontalAdvance(text) <= max_w:
@@ -360,6 +404,7 @@ class DeviceInfoCard(QFrame):
         self.name_label.setText(display)
         self._fit_name_font(display)
         self.model_label.setText(model)
+        self.eject_button.setEnabled(bool(name) and display != "No Device")
 
         # Try to load real product photo from centralized store
         family = ""
@@ -422,14 +467,17 @@ class DeviceInfoCard(QFrame):
             if dev.free_space_gb > 0:
                 self.free_space_row.setValue(f"{dev.free_space_gb:.1f} GB")
 
-            # Storage bar
+            # Capacity hero: bar + label directly under the device name
             if dev.disk_size_gb > 0:
                 used_pct = int(((dev.disk_size_gb - dev.free_space_gb) / dev.disk_size_gb) * 100)
                 self.storage_bar.setValue(max(0, min(100, used_pct)))
-                self.storage_bar.setToolTip(
+                self._capacity_label.setText(
                     f"{dev.free_space_gb:.1f} GB free of {dev.disk_size_gb:.1f} GB"
                 )
-                self.storage_bar.show()
+                self._capacity_widget.setToolTip(
+                    f"{dev.free_space_gb:.1f} GB free of {dev.disk_size_gb:.1f} GB"
+                )
+                self._capacity_widget.show()
 
             # Artwork formats
             if dev.artwork_formats:
@@ -449,24 +497,26 @@ class DeviceInfoCard(QFrame):
 
     def update_stats(self, tracks: int, albums: int, size_bytes: int, duration_ms: int,
                      videos: int = 0, podcasts: int = 0, audiobooks: int = 0):
-        """Update library statistics."""
-        # Line 1: item counts
-        parts: list[str] = []
-        if tracks > 0:
-            parts.append(f"{tracks:,} songs")
-        if videos > 0:
-            parts.append(f"{videos:,} videos")
-        if podcasts > 0:
-            parts.append(f"{podcasts:,} podcasts")
-        if audiobooks > 0:
-            parts.append(f"{audiobooks:,} audiobooks")
-        self._stats_line1.setText(" · ".join(parts) if parts else "No tracks")
+        """Update library statistics — populates the 2×2 inventory grid."""
+        self._inv_songs.setValue(f"{tracks:,}" if tracks else "0")
 
-        # Line 2: size and playtime
+        hours = (duration_ms or 0) / 3_600_000
+        if hours >= 100:
+            self._inv_hours.setValue(f"{hours:,.0f}")
+        elif hours >= 10:
+            self._inv_hours.setValue(f"{hours:.0f}")
+        elif hours >= 1:
+            self._inv_hours.setValue(f"{hours:.1f}")
+        else:
+            self._inv_hours.setValue("0")
+
+        # Tooltip carries the precise size + playtime that no longer have
+        # a dedicated line in the card.
         size_str = format_size(size_bytes)
         dur_str = format_duration(duration_ms)
-        line2_parts = [p for p in (size_str, dur_str) if p]
-        self._stats_line2.setText(" · ".join(line2_parts))
+        tip_parts = [p for p in (size_str, dur_str) if p]
+        if tip_parts:
+            self._inv_hours.setToolTip(" · ".join(tip_parts))
 
     def show_save_indicator(self, state: str) -> None:
         """Show a brief status indicator after a quick metadata write.
@@ -500,11 +550,13 @@ class DeviceInfoCard(QFrame):
         self.name_label.setText("No Device")
         self._fit_name_font("No Device")
         self.model_label.setText("Press Select to choose your iPod")
-        self._stats_line1.setText("—")
-        self._stats_line2.setText("")
-        self.storage_bar.hide()
+        self._capacity_label.setText("—")
+        self._capacity_widget.hide()
+        for cell in (self._inv_songs, self._inv_hours):
+            cell.setValue("—")
         self._save_label.hide()
         self._save_hide_timer.stop()
+        self.eject_button.setEnabled(False)
         # Clear tech details
         for row in (
             self.model_num_row, self.serial_row, self.firmware_row,
@@ -520,6 +572,7 @@ class DeviceInfoCard(QFrame):
 class Sidebar(QFrame):
     category_changed = pyqtSignal(str)
     device_renamed = pyqtSignal(str)  # emits new iPod name
+    eject_requested = pyqtSignal()    # emitted when the Eject button is clicked
 
     # Categories that only make sense on video-capable iPods
     _VIDEO_CATEGORIES = frozenset({"Videos", "Movies", "TV Shows", "Music Videos"})
@@ -563,6 +616,7 @@ class Sidebar(QFrame):
         # Device info card at top
         self.device_card = DeviceInfoCard()
         self.device_card.device_renamed.connect(self.device_renamed)
+        self.device_card.eject_requested.connect(self.eject_requested)
         self.sidebarLayout.addWidget(self.device_card)
 
         # Device select buttons - row 1

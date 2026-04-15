@@ -15,11 +15,16 @@ ArtworkDB structure:
 import struct
 import os
 import logging
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
-from .rgb565 import (ALL_KNOWN_FORMATS,
-                     IPOD_STRIDE_OVERRIDE, convert_art_for_ipod,
+from PIL.Image import Resampling as _Resampling
+_RESAMPLE = _Resampling.LANCZOS
+
+from .rgb565 import (ALL_KNOWN_FORMATS, image_from_bytes,
+                     rgb888_to_rgb565, IPOD_STRIDE_OVERRIDE,
                      get_artwork_formats)
 from .art_extractor import extract_art_with_folder, art_hash
 
@@ -382,10 +387,23 @@ def _read_existing_artwork(artworkdb_path: str, artwork_dir: str) -> dict:
 
 
 def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional[dict]:
-    """
-    Parse a single MHII entry from existing ArtworkDB and read its ithmb pixel data.
+    """Parse a single MHII entry from the existing ArtworkDB.
 
-    Returns dict with img_id, song_id, src_img_size, formats (raw pixel data).
+    Returns location *references* (path / offset / size) for each format's
+    pixel data rather than the pixel bytes themselves.  The caller resolves
+    only the entries it actually needs, avoiding USB reads for artwork that
+    won't be preserved.
+
+    Return shape::
+
+        {
+          'img_id': int,
+          'song_id': int,
+          'src_img_size': int,
+          'formats': {
+              format_id: {'path': str, 'ithmb_offset': int, 'size': int}
+          }
+        }
     """
     header_size = struct.unpack('<I', data[offset + 4:offset + 8])[0]
     child_count = struct.unpack('<I', data[offset + 12:offset + 16])[0]
@@ -393,8 +411,9 @@ def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional
     song_id = struct.unpack('<Q', data[offset + 20:offset + 28])[0]
     src_img_size = struct.unpack('<I', data[offset + 48:offset + 52])[0]
 
-    # Walk children to find MHOD type 2 containers wrapping MHNI entries
-    formats = {}
+    # Walk children to find MHOD type 2 containers wrapping MHNI entries.
+    # Record location references only — pixel data is NOT read here.
+    formats: dict = {}
     child_offset = offset + header_size
     for _ in range(child_count):
         if child_offset + 14 > len(data) or data[child_offset:child_offset + 4] != b'mhod':
@@ -404,25 +423,19 @@ def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional
         mhod_type = struct.unpack('<H', data[child_offset + 12:child_offset + 14])[0]
 
         if mhod_type == 2:
-            # Container MHOD with MHNI child
             mhni_offset = child_offset + mhod_header
             if (mhni_offset + 28 <= len(data) and data[mhni_offset:mhni_offset + 4] == b'mhni'):
                 format_id = struct.unpack('<I', data[mhni_offset + 16:mhni_offset + 20])[0]
                 ithmb_offset = struct.unpack('<I', data[mhni_offset + 20:mhni_offset + 24])[0]
                 img_size = struct.unpack('<I', data[mhni_offset + 24:mhni_offset + 28])[0]
 
-                # Read pixel data from ithmb file
                 ithmb_path = os.path.join(artwork_dir, f"F{format_id}_1.ithmb")
                 if os.path.exists(ithmb_path) and img_size > 0:
-                    try:
-                        with open(ithmb_path, 'rb') as f:
-                            f.seek(ithmb_offset)
-                            pixel_data = f.read(img_size)
-                        if len(pixel_data) == img_size:
-                            formats[format_id] = pixel_data
-                    except Exception as e:
-                        logger.debug(f"ART: failed to read ithmb data for img_id={img_id} "
-                                     f"format={format_id}: {e}")
+                    formats[format_id] = {
+                        'path': ithmb_path,
+                        'ithmb_offset': ithmb_offset,
+                        'size': img_size,
+                    }
 
         child_offset += mhod_total
 
@@ -470,6 +483,7 @@ def write_artworkdb(
     reference_artdb_path: Optional[str] = None,
     artwork_formats: Optional[dict[int, tuple[int, int]]] = None,
     defer_commit: bool = False,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> dict | PendingArtworkWrite:
     """
     Write ArtworkDB and ithmb files for an iPod.
@@ -510,6 +524,10 @@ def write_artworkdb(
     artwork_dir = os.path.join(ipod_path, "iPod_Control", "Artwork")
     os.makedirs(artwork_dir, exist_ok=True)
 
+    def _prog(msg: str) -> None:
+        if progress_callback is not None:
+            progress_callback(msg)
+
     # Detect device artwork formats if not explicitly provided
     if artwork_formats is None:
         artwork_formats = get_artwork_formats(ipod_path)
@@ -537,6 +555,7 @@ def write_artworkdb(
     # --- Step 1: Extract and deduplicate album art from PC files ---
     # Each track gets its own MHII (with song_id = track db_id) but
     # identical images are written to ithmb only once.
+    _prog(f"Artwork — scanning {len(tracks)} tracks")
     art_map = {}      # art_hash → art_bytes
     track_art = {}    # db_id → art_hash (or preserve_key)
 
@@ -679,36 +698,98 @@ def write_artworkdb(
     # This avoids converting the same source image more than once.
     unique_converted: dict[str, dict] = {}  # art_hash → {formats, src_img_size}
 
-    # New art (from PC JPEG/PNG)
-    for h, art_bytes in art_map.items():
-        formats = {}
-        for fmt_id in sorted(device_formats.keys()):
-            result = convert_art_for_ipod(art_bytes, fmt_id)
-            if result:
-                formats[fmt_id] = result
-        if formats:
-            unique_converted[h] = {
-                'formats': formats,
-                'src_img_size': len(art_bytes),
-            }
-
-    # Preserved art (already RGB565 from existing ithmb files)
-    for preserve_key, existing_entry in preserved_art.items():
-        formats = {}
-        for fmt_id, pixel_data in existing_entry['formats'].items():
-            dims = ALL_KNOWN_FORMATS.get(fmt_id)
-            if dims:
-                w, h_dim = dims
+    def _convert_one(h: str, art_bytes: bytes) -> tuple[str, Optional[dict]]:
+        """Decode once, resize to every target format. Runs in a thread pool."""
+        img = image_from_bytes(art_bytes)
+        if img is None:
+            return h, None
+        fmt_ids = sorted(device_formats.keys())
+        formats: dict = {}
+        for fmt_id in fmt_ids:
+            try:
+                w, h_dim = ALL_KNOWN_FORMATS[fmt_id]
+                stride = IPOD_STRIDE_OVERRIDE.get(fmt_id, w)
+                resized = img.resize((w, h_dim), _RESAMPLE)
+                pixel_data = rgb888_to_rgb565(resized, w, h_dim, stride)
                 formats[fmt_id] = {
                     'data': pixel_data,
                     'width': w,
                     'height': h_dim,
                     'size': len(pixel_data),
                 }
+            except Exception as exc:
+                logger.debug("ART: format %d conversion failed for hash %s: %s", fmt_id, h, exc)
+        return h, {'formats': formats, 'src_img_size': len(art_bytes)} if formats else None
+
+    # Pillow JPEG decode and NumPy RGB565 conversion both release the GIL,
+    # so a thread pool gives real concurrency for CPU-bound conversion.
+    n_new = len(art_map)
+    if n_new:
+        _prog(f"Artwork — converting {n_new} image{'s' if n_new != 1 else ''}")
+    n_workers = max(1, min(n_new, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futs = {pool.submit(_convert_one, h, ab): h for h, ab in art_map.items()}
+        for fut in as_completed(futs):
+            h, result = fut.result()
+            if result:
+                unique_converted[h] = result
+
+    # Preserved art (already RGB565 in existing ithmb files).
+    # Collect only the references that are actually needed, group them by
+    # (source_file, format_id), sort by offset, and read sequentially.
+    # This avoids loading ALL existing pixel data upfront and minimises
+    # USB seeks — typically only 1–2 source ithmb files need to be opened.
+    # (ithmb_path, fmt_id) → sorted list of (ithmb_offset, preserve_key, size)
+    _ref_by_file_fmt: dict[tuple[str, int], list] = defaultdict(list)
+    _preserve_meta: dict[str, dict] = {}  # preserve_key → {fmt_id: {dims…}}
+
+    for preserve_key, existing_entry in preserved_art.items():
+        fmt_meta: dict = {}
+        for fmt_id, ref in existing_entry['formats'].items():
+            dims = ALL_KNOWN_FORMATS.get(fmt_id)
+            if dims:
+                w, h_dim = dims
+                fmt_meta[fmt_id] = {'width': w, 'height': h_dim, 'size': ref['size']}
+                _ref_by_file_fmt[(ref['path'], fmt_id)].append(
+                    (ref['ithmb_offset'], preserve_key, ref['size'])
+                )
+        if fmt_meta:
+            _preserve_meta[preserve_key] = {
+                'fmt_meta': fmt_meta,
+                'src_img_size': existing_entry['src_img_size'],
+            }
+
+    # Read pixel data in sorted offset order per (file, format) pair.
+    _pixel_cache: dict[tuple[str, int], bytes] = {}  # (preserve_key, fmt_id) → bytes
+    for (ithmb_path, fmt_id), items in _ref_by_file_fmt.items():
+        items.sort()  # ascending offset → sequential USB reads
+        try:
+            with open(ithmb_path, 'rb') as src:
+                for ithmb_offset, preserve_key, size in items:
+                    src.seek(ithmb_offset)
+                    pixel_bytes = src.read(size)
+                    if len(pixel_bytes) == size:
+                        _pixel_cache[(preserve_key, fmt_id)] = pixel_bytes
+                    else:
+                        logger.debug("ART: short read for preserved %s fmt %d", preserve_key, fmt_id)
+        except OSError as e:
+            logger.warning("ART: failed to read preserved ithmb %s: %s", ithmb_path, e)
+
+    for preserve_key, meta in _preserve_meta.items():
+        formats = {}
+        for fmt_id, dims in meta['fmt_meta'].items():
+            pixel_bytes = _pixel_cache.get((preserve_key, fmt_id))
+            if pixel_bytes:
+                formats[fmt_id] = {
+                    'data': pixel_bytes,
+                    'width': dims['width'],
+                    'height': dims['height'],
+                    'size': dims['size'],
+                }
         if formats:
             unique_converted[preserve_key] = {
                 'formats': formats,
-                'src_img_size': existing_entry['src_img_size'],
+                'src_img_size': meta['src_img_size'],
             }
 
     # --- Step 2b: Create per-track ArtworkEntry objects ---
@@ -739,6 +820,9 @@ def write_artworkdb(
 
     logger.info(f"ART: created {len(entries)} per-track MHII entries "
                 f"from {len(unique_converted)} unique images")
+
+    n_unique = len(set(e.art_hash for e in entries))
+    _prog(f"Artwork — writing {n_unique} image{'s' if n_unique != 1 else ''} to device")
 
     # --- Step 3: Write ithmb files ---
     format_ids = sorted(device_formats.keys())
@@ -787,10 +871,11 @@ def write_artworkdb(
                 art_hash_written[h] = offsets
                 format_offsets_map[entry.img_id] = dict(offsets)
 
-        # Flush and sync all ithmb temp files
-        for f in ithmb_files.values():
-            f.flush()
-            os.fsync(f.fileno())
+        # Flush ithmb temp files to OS buffers.  No fsync here — these are
+        # .tmp files and the os.replace renames below are the durability
+        # boundary.  Fsyncing each ithmb file over USB adds multiple seconds
+        # of blocked I/O with no safety benefit (the old files remain intact
+        # until the rename succeeds).
     finally:
         for f in ithmb_files.values():
             f.close()

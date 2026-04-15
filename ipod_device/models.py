@@ -403,8 +403,8 @@ SERIAL_LAST3_TO_MODEL: dict[str, str] = {
     "PNU": "M9245",
     # ── iPod 4G (click wheel) ──────────────────────────────────────────
     "PS9": "M9282", "Q8U": "M9282", "PQ7": "M9268",
-    # ── iPod U2 ────────────────────────────────────────────────────────
-    "V9V": "M9787", "S2X": "M9787",
+    # ── iPod U2 (4G click wheel, 20GB) ─────────────────────────────────
+    "S2X": "M9787",
     # ── iPod Photo / Color Display ─────────────────────────────────────
     "TDU": "MA079", "TDS": "MA079", "TM2": "MA127",
     "SAZ": "M9830", "SB1": "M9830", "SAY": "M9829",
@@ -479,6 +479,7 @@ SERIAL_LAST3_TO_MODEL: dict[str, str] = {
     "TXK": "MA146", "TXM": "MA146", "WEF": "MA146",
     "WEJ": "MA146", "WEK": "MA146",
     "SZA": "MA003", "SZU": "MA003", "TXL": "MA147", "TXN": "MA147",
+    "V9V": "MA452",  # iPod Video U2 Special Edition 5G 30GB (Black)
     # ── Video 5.5G ─────────────────────────────────────────────────────
     "V9K": "MA444", "V9L": "MA444", "WU9": "MA444",
     "VQM": "MA446", "V9M": "MA446", "V9N": "MA446", "WEE": "MA446",

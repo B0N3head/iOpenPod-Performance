@@ -18,6 +18,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from pathlib import Path
@@ -659,9 +660,10 @@ class SyncExecutor:
         """Stage 7: assemble final track list, write database, backpatch and finalize."""
         # Define sub-steps so the progress bar advances smoothly through
         # the database-write phase instead of jumping from 0% to 100%.
-        # Steps: prepare tracks → build playlists → prepare db → write artwork
-        #        → build db structure → sign db → write to iPod (+ SQLite)
-        _TOTAL_STEPS = 8
+        # Steps: prepare tracks → build playlists → prepare db → artwork phases
+        #        (scanning / converting / writing) → build db structure → sign db
+        #        → write to iPod (+ SQLite)
+        _TOTAL_STEPS = 10
         _step = 0
 
         def _advance(msg: str) -> None:
@@ -1024,7 +1026,17 @@ class SyncExecutor:
                 filename = source_path.name
 
                 def _make_io_cb(_fn: str, _wid: int, _verb: str) -> Callable[[float], None]:
+                    # Throttle to ~20 fps so parallel workers don't saturate the
+                    # Qt event queue and cause the UI to lag/freeze after copy ends.
+                    # The transcoder uses the same pattern at 250 ms; 50 ms feels
+                    # responsive enough for a copy bar.
+                    _last_report: list[float] = [0.0]
+
                     def _cb(frac: float) -> None:
+                        now = time.monotonic()
+                        if frac < 1.0 and now - _last_report[0] < 0.05:
+                            return
+                        _last_report[0] = now
                         pct = int(frac * 100)
                         with completed_lock:
                             worker_fractions[_wid] = frac

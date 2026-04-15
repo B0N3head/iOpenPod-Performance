@@ -27,11 +27,18 @@ from .formatters import format_size as _format_size, format_duration_mmss as _fo
 from ..glyphs import glyph_pixmap
 from ..styles import Colors, FONT_FAMILY, Metrics, btn_css, make_scroll_area
 
+import html
 import os
 import logging
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Cap the number of per-worker lines rendered in the sync progress detail.
+# Beyond this, an overflow indicator is shown. Without a cap, rich-text
+# `<br>` lines cause the QLabel to grow vertically and push the window
+# taller than the screen during busy multi-worker stages.
+_MAX_DETAIL_LINES = 8
 
 
 class SyncWorker(QThread):
@@ -1143,13 +1150,18 @@ class SyncReviewWidget(QWidget):
 
         loading_layout.addSpacing(16)
 
-        # Detail — current item / worker lines
+        # Detail — current item / worker lines.
+        # Bounded size so a burst of active workers cannot grow the window.
         self.progress_detail = QLabel("", loading_widget)
         self.progress_detail.setStyleSheet(
             f"color: {Colors.TEXT_TERTIARY}; font-size: {Metrics.FONT_LG}px;"
         )
         self.progress_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        loading_layout.addWidget(self.progress_detail)
+        self.progress_detail.setWordWrap(False)
+        self.progress_detail.setMaximumWidth(560)
+        self.progress_detail.setMaximumHeight(200)
+        self.progress_detail.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        loading_layout.addWidget(self.progress_detail, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Hint label (shown only during automatic pre-sync backup stage)
         self._backup_hint = QLabel(
@@ -2107,10 +2119,17 @@ class SyncReviewWidget(QWidget):
 
         # ── Detail: current activity (worker lines or message) ──
         if worker_lines:
+            shown = worker_lines[:_MAX_DETAIL_LINES]
+            extra = len(worker_lines) - len(shown)
             detail_parts = [
-                f"<span style='color: {Colors.TEXT_SECONDARY};'>{line}</span>"
-                for line in worker_lines
+                f"<span style='color: {Colors.TEXT_SECONDARY};'>{html.escape(line)}</span>"
+                for line in shown
             ]
+            if extra > 0:
+                detail_parts.append(
+                    f"<span style='color: {Colors.TEXT_TERTIARY};'>"
+                    f"\u2026 and {extra} more</span>"
+                )
             self.progress_detail.setText("<br>".join(detail_parts))
             self.progress_detail.setTextFormat(Qt.TextFormat.RichText)
         elif message:

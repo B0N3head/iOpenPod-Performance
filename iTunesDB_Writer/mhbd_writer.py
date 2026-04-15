@@ -783,7 +783,6 @@ def write_itunesdb(
     # --- Write ArtworkDB if PC file paths provided ---
     pending_artwork = None  # PendingArtworkWrite if defer_commit used
     if pc_file_paths:
-        _progress("Writing artwork")
         logger.debug("ART: pc_file_paths has %d entries, tracks has %d tracks",
                      len(pc_file_paths), len(tracks))
 
@@ -831,6 +830,7 @@ def write_itunesdb(
                 pc_file_paths=pc_file_paths,
                 reference_artdb_path=ref_artdb_path,
                 defer_commit=True,
+                progress_callback=_progress,
             )
 
             # Extract the mapping — works for both deferred and immediate results
