@@ -3,6 +3,21 @@ import struct
 from ipod_models import ITHMB_FORMAT_MAP
 
 
+def _expected_img_size_bytes(candidate) -> int:
+    pf = candidate.pixel_format
+    if pf in ("RGB565_LE", "RGB565_BE", "RGB565_BE_90", "UYVY", "RGB555_LE", "RGB555_BE"):
+        return candidate.row_bytes * candidate.height
+    if pf.startswith("REC_RGB555"):
+        return candidate.row_bytes * candidate.height
+    if pf == "I420_LE":
+        w = candidate.width & ~1
+        h = candidate.height & ~1
+        return (w * h * 3) // 2
+    if pf == "JPEG":
+        return 0
+    return 0
+
+
 def parse_mhni(data, offset, header_length, chunk_length) -> dict:
     from .chunk_parser import parse_chunk
 
@@ -53,42 +68,64 @@ def parse_mhni(data, offset, header_length, chunk_length) -> dict:
 
     image_format = None
 
-    # PREFERRED: Use format_id (correlationID) lookup — single source of
-    # truth is ipod_models.ITHMB_FORMAT_MAP (replaces local FORMAT_ID_MAP).
     format_id = imageName["correlationID"]
     af = ITHMB_FORMAT_MAP.get(format_id)
+    est_w = imageName["estimatedPixmapWidth"]
+    est_h = imageName["estimatedPixmapHeight"]
+    img_size = imageName["imgSize"]
+
+    # Prefer correlationID mapping only when it is plausibly compatible with
+    # observed MHNI geometry or payload size. Some legacy/corrupt databases
+    # carry mismatched correlation IDs (e.g. 140x140 metadata for ~57x58 data).
     if af is not None:
-        image_format = {
-            "height": af.height,
-            "width": af.width,
-            "format": af.pixel_format,
-            "description": af.description,
-            "format_id": format_id,
-        }
-    else:
-        # FALLBACK: Match by estimated dimensions (less reliable).
-        # Iterate all known formats and pick the closest match within
-        # a 6-pixel tolerance (sum of height + width difference).
-        tolerance_pixels = 6
+        expected = _expected_img_size_bytes(af)
+        corr_exact = expected > 0 and expected == img_size
+        corr_close = (
+            est_w > 0
+            and est_h > 0
+            and (
+                (abs(est_w - af.width) <= 2 and abs(est_h - af.height) <= 2)
+                or (abs(est_w - af.height) <= 2 and abs(est_h - af.width) <= 2)
+            )
+        )
+        # For variable-sized payloads (e.g. JPEG), trust correlation ID + geometry.
+        if expected == 0 and corr_close:
+            corr_exact = True
+        if corr_exact or corr_close:
+            image_format = {
+                "height": af.height,
+                "width": af.width,
+                "format": af.pixel_format,
+                "description": af.description,
+                "format_id": format_id,
+            }
+
+    if image_format is None:
+        # Fallback: choose the candidate that best matches observed geometry
+        # and payload pixel count.
         best_candidate = None
-        best_pixel_diff = float('inf')
+        best_score = float("inf")
 
         for candidate in ITHMB_FORMAT_MAP.values():
-            diff_pixels = (
-                abs(imageName["estimatedPixmapHeight"] - candidate.height)
-                + abs(imageName["estimatedPixmapWidth"] - candidate.width)
-            )
-            if diff_pixels < best_pixel_diff:
-                best_pixel_diff = diff_pixels
+            dim_diff = abs(est_h - candidate.height) + abs(est_w - candidate.width)
+            expected = _expected_img_size_bytes(candidate)
+            if expected > 0:
+                size_delta = abs(img_size - expected)
+                score = dim_diff + (size_delta / max(1, candidate.row_bytes, candidate.width))
+            else:
+                score = dim_diff
+            if score < best_score:
+                best_score = score
                 best_candidate = candidate
 
-        if best_candidate is not None and best_pixel_diff <= tolerance_pixels:
+        if best_candidate is not None:
             image_format = {
                 "height": best_candidate.height,
                 "width": best_candidate.width,
                 "format": best_candidate.pixel_format,
                 "description": best_candidate.description,
-                "pixel_diff": best_pixel_diff,
+                "format_id": best_candidate.format_id,
+                "score": best_score,
             }
 
     imageName["image_format"] = image_format

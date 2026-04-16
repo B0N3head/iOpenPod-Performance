@@ -1641,48 +1641,77 @@ def _resolve_model(
     resolved["hashing_scheme"] = fs.get("hashing_scheme", -1)
 
     # ── Model identification (layered, highest-confidence wins) ────────
-    # Layer 1: SysInfo ModelNumStr → IPOD_MODELS (highest confidence)
+    #
+    # Layers 1 and 2 are evaluated together so they can cross-check each
+    # other.  When they agree the SysInfo result is used (preserving its
+    # provenance).  When they DISAGREE the serial wins: the last-3 suffix
+    # is a manufacturer-encoded identifier that is much harder to corrupt
+    # than the NVRAM-stored ModelNumStr, which can be wrong after a botched
+    # restore, firmware flash, or logic-board swap (e.g. a device whose
+    # NVRAM reports M9787/4th-Gen but whose serial encodes MA452/5th-Gen).
+    #
+    # Layer 1: SysInfo ModelNumStr → IPOD_MODELS
     sysinfo_model = fs.get("model_number", "")
+    sysinfo_mi: tuple | None = None
     if sysinfo_model:
-        info = get_model_info(sysinfo_model)
-        if info:
-            resolved["model_number"] = sysinfo_model
-            resolved["model_family"] = info[0]
-            resolved["generation"] = info[1]
-            resolved["capacity"] = info[2]
-            resolved["color"] = info[3]
-            resolved["identification_method"] = "sysinfo"
-            _mn_src = fs_sources.get("model_number", "sysinfo")
-            sources["model_number"] = _mn_src
-            sources.setdefault("model_family", _mn_src)
-            sources.setdefault("generation", _mn_src)
-            sources.setdefault("capacity", _mn_src)
-            sources.setdefault("color", _mn_src)
-            return resolved
+        sysinfo_mi = get_model_info(sysinfo_model)
 
-    # Layer 2: Serial last-3-char → IPOD_MODELS (very reliable)
-    # The resolved serial is now always the Apple serial (from SysInfo),
-    # never the FireWire GUID, so a single lookup suffices.
+    # Layer 2: Serial last-3-char → IPOD_MODELS
     serial = resolved["serial"]
+    serial_info: dict | None = None
     if serial:
         serial_info = _identify_via_serial_lookup(serial)
-        if serial_info:
-            resolved["serial"] = serial
-            resolved["model_number"] = serial_info.get("model_number", "")
-            resolved["model_family"] = serial_info.get("model_family", "iPod")
-            resolved["generation"] = serial_info.get("generation", "")
-            resolved["capacity"] = serial_info.get("capacity", "")
-            resolved["color"] = serial_info.get("color", "")
-            resolved["identification_method"] = "serial"
-            # Derived fields inherit the serial's authority source,
-            # since the lookup is a deterministic mapping from the serial.
-            _serial_src = sources.get("serial", "serial_lookup")
-            sources["model_number"] = "serial_lookup"
-            sources.setdefault("model_family", _serial_src)
-            sources.setdefault("generation", _serial_src)
-            sources.setdefault("capacity", _serial_src)
-            sources.setdefault("color", _serial_src)
-            return resolved
+
+    # Cross-check: if both resolved and they disagree, serial wins.
+    _use_serial = False
+    if sysinfo_mi and serial_info:
+        sr_model = serial_info.get("model_number", "")
+        if sr_model and sr_model != sysinfo_model:
+            logger.warning(
+                "_resolve_model: SysInfo ModelNumStr %s (%s %s) conflicts "
+                "with serial last-3 '%s' → %s (%s %s); preferring serial "
+                "(USB PID family: %s)",
+                sysinfo_model, sysinfo_mi[0], sysinfo_mi[1],
+                serial[-3:], sr_model,
+                serial_info.get("model_family", "?"),
+                serial_info.get("generation", "?"),
+                hw.get("model_family", "unknown"),
+            )
+            _use_serial = True
+    elif serial_info and not sysinfo_mi:
+        _use_serial = True
+
+    if sysinfo_mi and not _use_serial:
+        resolved["model_number"] = sysinfo_model
+        resolved["model_family"] = sysinfo_mi[0]
+        resolved["generation"] = sysinfo_mi[1]
+        resolved["capacity"] = sysinfo_mi[2]
+        resolved["color"] = sysinfo_mi[3]
+        resolved["identification_method"] = "sysinfo"
+        _mn_src = fs_sources.get("model_number", "sysinfo")
+        sources["model_number"] = _mn_src
+        sources.setdefault("model_family", _mn_src)
+        sources.setdefault("generation", _mn_src)
+        sources.setdefault("capacity", _mn_src)
+        sources.setdefault("color", _mn_src)
+        return resolved
+
+    if _use_serial:
+        resolved["serial"] = serial
+        resolved["model_number"] = serial_info.get("model_number", "")
+        resolved["model_family"] = serial_info.get("model_family", "iPod")
+        resolved["generation"] = serial_info.get("generation", "")
+        resolved["capacity"] = serial_info.get("capacity", "")
+        resolved["color"] = serial_info.get("color", "")
+        resolved["identification_method"] = "serial"
+        # Derived fields inherit the serial's authority source.
+        _serial_src = sources.get("serial", "serial_lookup")
+        sources["model_number"] = "serial_lookup"
+        sources.setdefault("model_family", _serial_src)
+        sources.setdefault("generation", _serial_src)
+        sources.setdefault("capacity", _serial_src)
+        sources.setdefault("color", _serial_src)
+        return resolved
 
     # Layer 3: USB PID → family/generation (coarse)
     # No disk-size rejection — modded iPods often have non-stock storage.

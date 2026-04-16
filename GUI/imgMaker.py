@@ -4,6 +4,7 @@ import threading
 from collections import OrderedDict
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
+from ArtworkDB_Writer.ithmb_codecs import decode_pixels_for_format
 
 logger = logging.getLogger(__name__)
 
@@ -140,23 +141,116 @@ def generate_image(ithmb_filename, image_info):
         logger.warning("Error reading %s: %s", ithmb_filename, e)
         return None
 
-    fmt = image_info["image_format"]["format"]
+    fmt_info = image_info.get("image_format") or {}
+    fmt = fmt_info.get("format")
+    if not fmt:
+        logger.warning("generate_image: missing image_format for %s", ithmb_filename)
+        return None
+
+    format_id = image_info.get("correlationID")
     target_height = image_info["image_format"]["height"]
     target_width = image_info["image_format"]["width"]
+    hpad = max(0, int(image_info.get("horizontalPadding") or 0))
+    vpad = max(0, int(image_info.get("verticalPadding") or 0))
 
     if fmt.startswith("RGB565"):
         num_pixels = image_info["imgSize"] // 2
-        current_height = num_pixels // target_width
-        current_width = target_width
+
+        # The mhni chunk records the actual stored pixmap layout:
+        #   estimatedPixmapWidth  = row stride in pixels  (imageWidth  + horizontalPadding)
+        #   estimatedPixmapHeight = total rows            (imageHeight + verticalPadding)
+        # When both multiply to exactly num_pixels they are unambiguous — use
+        # them directly.  When only the width is available (height missing or
+        # inconsistent) fall back to width-only division.  Finally fall back to
+        # the format-table width.  This handles Nano 7G entries whose
+        # correlationID maps to a 140×140 format table entry but the .ithmb
+        # file contains a much smaller pixmap (e.g. 58×57 = 3306 pixels).
+        mhni_w = image_info.get("estimatedPixmapWidth") or 0
+        mhni_h = image_info.get("estimatedPixmapHeight") or 0
+        image_w = image_info.get("imageWidth") or 0
+        image_h = image_info.get("imageHeight") or 0
+
+        # Prefer exact geometries that consume the payload exactly.
+        # Avoid forcing format-table width (e.g. 140) when payload math disagrees.
+        pref_w = mhni_w or image_w or target_width
+        pref_h = mhni_h or image_h or target_height
+
+        pair_candidates = []
+        for w, h in (
+            (mhni_w, mhni_h),
+            (image_w, image_h),
+            (target_width, target_height),
+        ):
+            if w > 0 and h > 0 and w * h == num_pixels:
+                pair_candidates.append((w, h))
+
+        width_candidates = set()
+        for base in (mhni_w, image_w, target_width):
+            if base and base > 0:
+                width_candidates.add(base)
+                if base > 1:
+                    width_candidates.add(base - 1)
+                width_candidates.add(base + 1)
+
+        div_candidates = []
+        for w in sorted(width_candidates):
+            if w > 0 and num_pixels % w == 0:
+                h = num_pixels // w
+                score = abs(w - pref_w) + abs(h - pref_h)
+                # Ambiguous stride cases (e.g. 57x58 vs 58x57) often shear when
+                # width is chosen too small. Prefer larger width on score ties.
+                target_bias = abs(w - target_width) + abs(h - target_height)
+                div_candidates.append((score, target_bias, -w, w, h))
+
+        if pair_candidates:
+            current_width, current_height = min(
+                pair_candidates,
+                key=lambda wh: abs(wh[0] - pref_w) + abs(wh[1] - pref_h),
+            )
+        elif div_candidates:
+            _score, _bias, _neg_w, current_width, current_height = min(div_candidates)
+        else:
+            logger.warning(
+                "generate_image: no valid geometry for %s imgSize=%d (%d px) "
+                "mhni w=%d h=%d imageWidth=%s imageHeight=%s fmt=%dx%d",
+                ithmb_filename,
+                image_info["imgSize"],
+                num_pixels,
+                mhni_w,
+                mhni_h,
+                image_info.get("imageWidth"),
+                image_info.get("imageHeight"),
+                target_width,
+                target_height,
+            )
+            return None
+
+        if current_width != target_width or current_height * current_width != num_pixels:
+            logger.info(
+                "generate_image: imgSize=%d (%d px) mhni w=%d h=%d → "
+                "decode %dx%d (fmt %dx%d); imageWidth=%s imageHeight=%s "
+                "hPad=%s vPad=%s",
+                image_info["imgSize"], num_pixels, mhni_w, mhni_h,
+                current_width, current_height, target_width, target_height,
+                image_info.get("imageWidth"), image_info.get("imageHeight"),
+                image_info.get("horizontalPadding"),
+                image_info.get("verticalPadding"),
+            )
+
+        expected_pixels = current_height * current_width
 
         # Use byte-order-aware pixel reader
         pixels = read_rgb565_pixels(img_data, fmt)
-        rgb_array = rgb565_to_rgb888_vectorized(pixels)
 
         # Guard against empty/truncated ithmb data
-        expected_size = current_height * current_width * 3
-        if rgb_array.size == 0 or rgb_array.size < expected_size:
+        if len(pixels) == 0 or len(pixels) < expected_pixels:
             return None
+
+        # Trim any partial-row trailing padding before conversion
+        if len(pixels) > expected_pixels:
+            pixels = pixels[:expected_pixels]
+
+        rgb_array = rgb565_to_rgb888_vectorized(pixels)
 
         # Reshape image
         rgb_array = rgb_array.reshape((current_height, current_width, 3))
@@ -171,6 +265,24 @@ def generate_image(ithmb_filename, image_info):
             img_pil = img_pil.resize(
                 (target_width, target_height), Image.Resampling.LANCZOS)
         return _enhance_decoded_artwork(img_pil)
+
+    # Non-RGB565 formats (UYVY, I420, RGB555 variants, JPEG) go through
+    # the shared format-aware decoder.
+    if format_id is not None:
+        decoded = decode_pixels_for_format(
+            int(format_id),
+            img_data,
+            int(image_info.get("imageWidth") or target_width),
+            int(image_info.get("imageHeight") or target_height),
+            hpad,
+            vpad,
+        )
+        if decoded is None:
+            logger.warning("Unsupported/failed decode for format %s (id=%s)", fmt, format_id)
+            return None
+        if decoded.size != (target_width, target_height):
+            decoded = decoded.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        return _enhance_decoded_artwork(decoded)
 
     logger.warning("Unsupported image format: %s", fmt)
     return None

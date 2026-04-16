@@ -6,7 +6,7 @@
 [![Platform: Win | Mac | Linux](https://img.shields.io/badge/Platform-Win%20%7C%20Mac%20%7C%20Linux-lightgrey.svg)](#download)
 [![GitHub Release](https://img.shields.io/github/v/release/TheRealSavi/iOpenPod)](https://github.com/TheRealSavi/iOpenPod/releases/latest)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/9Yy499Tf5d)
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/U7U61W4PK1)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/johngibbons)
 
 iOpenPod is a free, open-source desktop app that lets you manage your iPod without iTunes. Plug in your iPod, and sync. FLAC, OGG, MP3, any file format, it automatically handles the conversion. Access to all the features your iPod makes possible. Works on Windows, macOS, and Linux.
 
@@ -173,6 +173,14 @@ Please open an issue before starting major changes so we can coordinate, or [joi
 - [libgpod](https://github.com/gtkpod/libgpod) — C library for iPod database access (the reference implementation this project learned from)
 - [gtkpod](https://github.com/gtkpod/gtkpod) — GTK+ iPod manager
 - [Rockbox](https://www.rockbox.org/) — Open-source firmware replacement for iPods
+
+---
+
+## Support
+
+iOpenPod is and always will be completely free and open source. If you like it and would like to support me, it is so very appreciated.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/johngibbons)
 
 ## License
 

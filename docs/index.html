@@ -8,14 +8,12 @@
     <meta name="keywords" content="iPod sync tool, iPod Classic manager, iTunes alternative, iTunesDB, iPod music sync, open source iPod, iPod Linux, iPod Windows, iPod manager without iTunes, FLAC to iPod, iPod Nano sync, iPod podcast manager, download iPod manager">
     <meta name="author" content="John Gibbons">
 
-    <!-- Open Graph / Social -->
     <meta property="og:type" content="website">
     <meta property="og:title" content="iOpenPod — Sync Your iPod Without iTunes">
     <meta property="og:description" content="Ditch iTunes. iOpenPod syncs music, play counts, ratings, and album art to your iPod Classic directly. Open-source and cross-platform.">
     <meta property="og:url" content="https://therealsavi.github.io/iOpenPod/">
     <meta property="og:image" content="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/hero.png">
 
-    <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="iOpenPod — Sync Your iPod Without iTunes">
     <meta name="twitter:description" content="Free iPod sync app. Music, podcasts, audiobooks, scrobbling, and drag-and-drop. No iTunes required.">
@@ -26,16 +24,43 @@
 
     <style>
         :root {
-            --bg: #0d1117;
-            --surface: #161b22;
-            --border: #30363d;
-            --text: #e6edf3;
-            --text-secondary: #8b949e;
-            --accent: #58a6ff;
-            --accent-hover: #79c0ff;
-            --success: #3fb950;
-            --warning: #d29922;
-            --danger: #f85149;
+            /* Surfaces — same blue-gray hue, shifting lightness only */
+            --bg:             #0c1117;
+            --surface:        #141c26;
+            --surface-raised: #1b2535;
+            --surface-hover:  #212e42;
+
+            /* Borders — rgba so they blend with the surface beneath */
+            --border:         rgba(148, 163, 184, 0.10);
+            --border-subtle:  rgba(148, 163, 184, 0.06);
+            --border-strong:  rgba(148, 163, 184, 0.22);
+
+            /* Text — four levels */
+            --text:           #e2e8f0;
+            --text-2:         #94a3b8;
+            --text-3:         #64748b;
+            --text-4:         #475569;
+
+            /* Accent */
+            --accent:         #60a5fa;
+            --accent-hover:   #93c5fd;
+            --accent-muted:   rgba(96, 165, 250, 0.10);
+            --accent-border:  rgba(96, 165, 250, 0.25);
+
+            /* Semantic */
+            --success:        #4ade80;
+
+            /* Ko-fi */
+            --kofi:           #ff5f75;
+            --kofi-hover:     #ff7a8a;
+            --kofi-surface:   rgba(255, 95, 117, 0.07);
+            --kofi-border:    rgba(255, 95, 117, 0.22);
+
+            /* Radius scale */
+            --r-sm:  6px;
+            --r-md:  10px;
+            --r-lg:  14px;
+            --r-xl:  20px;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -48,32 +73,37 @@
         }
 
         .container {
-            max-width: 960px;
+            max-width: 980px;
             margin: 0 auto;
             padding: 0 24px;
         }
 
-        /* Header */
+        /* ── Header ─────────────────────────────────────── */
         header {
             border-bottom: 1px solid var(--border);
-            padding: 48px 0 40px;
+            padding: 64px 0 52px;
             text-align: center;
         }
 
-        header h1 {
-            font-size: 3rem;
+        .wordmark {
+            font-size: 3.2rem;
             font-weight: 800;
-            margin-bottom: 12px;
-            letter-spacing: -0.02em;
+            letter-spacing: -0.035em;
+            line-height: 1;
+            margin-bottom: 16px;
         }
 
-        header h1 span { color: var(--accent); }
+        .wordmark em {
+            font-style: normal;
+            color: var(--accent);
+        }
 
-        header p {
-            font-size: 1.25rem;
-            color: var(--text-secondary);
-            max-width: 600px;
-            margin: 0 auto 24px;
+        .tagline {
+            font-size: 1.2rem;
+            color: var(--text-2);
+            max-width: 520px;
+            margin: 0 auto 28px;
+            line-height: 1.5;
         }
 
         .badges {
@@ -81,277 +111,452 @@
             gap: 8px;
             justify-content: center;
             flex-wrap: wrap;
-            margin-top: 16px;
+            margin-bottom: 28px;
         }
 
-        .badges img { height: 22px; }
+        .badges img { height: 20px; }
 
-        /* CTA */
+        /* ── Buttons ─────────────────────────────────────── */
         .cta {
             display: flex;
-            gap: 12px;
+            gap: 10px;
             justify-content: center;
-            margin-top: 28px;
             flex-wrap: wrap;
         }
 
         .btn {
-            display: inline-block;
-            padding: 12px 28px;
-            border-radius: 8px;
-            font-size: 1rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 11px 24px;
+            border-radius: var(--r-md);
+            font-size: 0.95rem;
             font-weight: 600;
             text-decoration: none;
-            transition: all 0.15s ease;
+            transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
         }
 
         .btn-primary {
             background: var(--accent);
-            color: var(--bg);
+            color: #0c1117;
         }
-
         .btn-primary:hover { background: var(--accent-hover); }
+        .btn-primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
         .btn-secondary {
             background: var(--surface);
             color: var(--text);
-            border: 1px solid var(--border);
+            border: 1px solid var(--border-strong);
         }
-
-        .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
-
-        /* Sections */
-        section {
-            padding: 56px 0;
-            border-bottom: 1px solid var(--border);
+        .btn-secondary:hover {
+            background: var(--surface-hover);
+            border-color: var(--accent-border);
+            color: var(--accent);
         }
+        .btn-secondary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
-        section:last-child { border-bottom: none; }
-
-        section h2 {
-            font-size: 1.75rem;
-            font-weight: 700;
-            margin-bottom: 24px;
-            text-align: center;
+        .btn-kofi {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 11px 24px;
+            border-radius: var(--r-md);
+            font-size: 0.95rem;
+            font-weight: 600;
+            text-decoration: none;
+            background: var(--kofi);
+            color: #fff;
+            transition: background 0.12s ease, transform 0.1s ease;
+            flex-shrink: 0;
         }
+        .btn-kofi:hover { background: var(--kofi-hover); transform: translateY(-1px); }
+        .btn-kofi svg { width: 16px; height: 16px; stroke: #fff; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
-        section > p {
-            color: var(--text-secondary);
-            text-align: center;
-            max-width: 640px;
-            margin: -12px auto 28px;
-            font-size: 1.05rem;
-        }
-
-        /* Hero screenshot */
+        /* ── Hero screenshot ─────────────────────────────── */
         .hero-screenshot {
-            margin-top: 32px;
+            margin-top: 40px;
             text-align: center;
         }
 
         .hero-screenshot img {
             max-width: 100%;
-            border-radius: 12px;
+            border-radius: var(--r-lg);
             border: 1px solid var(--border);
-            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
         }
 
-        /* Feature grid */
+        /* ── Sections ────────────────────────────────────── */
+        .section {
+            padding: 64px 0;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .section:last-child { border-bottom: none; }
+
+        .section-header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .section-header h2 {
+            font-size: 1.7rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin-bottom: 8px;
+        }
+
+        .section-header p {
+            color: var(--text-2);
+            font-size: 1rem;
+            max-width: 520px;
+            margin: 0 auto;
+        }
+
+        /* ── Support banner ──────────────────────────────── */
+        .support-banner {
+            background: var(--kofi-surface);
+            border: 1px solid var(--kofi-border);
+            border-radius: var(--r-lg);
+            padding: 20px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+        }
+
+        .support-banner-text {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex: 1;
+        }
+
+        .support-banner-text svg {
+            width: 20px;
+            height: 20px;
+            flex-shrink: 0;
+            color: var(--kofi);
+            stroke: var(--kofi);
+            fill: none;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        .support-banner-text span {
+            color: var(--text-2);
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        /* ── Feature grid ────────────────────────────────── */
+
+        /* Three primary pillars — full emphasis */
+        .feature-pillars {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .feature-pillar {
+            background: var(--surface);
+            border: 1px solid var(--accent-border);
+            border-radius: var(--r-lg);
+            padding: 28px;
+        }
+
+        .feature-pillar h3 {
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            letter-spacing: -0.01em;
+        }
+
+        .feature-pillar p {
+            color: var(--text-2);
+            font-size: 0.9rem;
+            line-height: 1.55;
+        }
+
+        .pillar-label {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--accent);
+            margin-bottom: 12px;
+        }
+
+        /* Supporting features — quieter grid */
         .feature-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
         }
 
         .feature-card {
             background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 24px;
+            border-radius: var(--r-md);
+            padding: 20px 22px;
+            transition: border-color 0.12s ease, background 0.12s ease;
+        }
+
+        .feature-card:hover {
+            border-color: var(--border-strong);
+            background: var(--surface-raised);
         }
 
         .feature-card h3 {
-            font-size: 1.1rem;
-            margin-bottom: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: var(--text);
         }
 
         .feature-card p {
-            color: var(--text-secondary);
-            font-size: 0.95rem;
+            color: var(--text-2);
+            font-size: 0.85rem;
+            line-height: 1.5;
         }
 
-        .feature-card .icon {
-            font-size: 1.5rem;
-            margin-bottom: 8px;
-            display: block;
-        }
-
-        /* Screenshot gallery */
+        /* ── Screenshot gallery ──────────────────────────── */
         .screenshot-gallery {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 24px;
-            margin-top: 8px;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
         }
 
-        .screenshot-item {
-            text-align: center;
-        }
+        .screenshot-item { text-align: center; }
 
         .screenshot-item img {
             width: 100%;
-            border-radius: 10px;
+            border-radius: var(--r-md);
             border: 1px solid var(--border);
-            box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-            transition: transform 0.2s ease;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+            transition: transform 0.18s ease, box-shadow 0.18s ease;
+            display: block;
         }
 
         .screenshot-item img:hover {
-            transform: scale(1.02);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
         }
 
-        .screenshot-item .caption {
-            color: var(--text-secondary);
-            font-size: 0.85rem;
+        .caption {
+            color: var(--text-3);
+            font-size: 0.8rem;
             margin-top: 10px;
+            letter-spacing: 0.01em;
         }
 
-        /* Device table */
-        table {
+        /* ── Device table ────────────────────────────────── */
+        .device-table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 16px;
+            margin-top: 8px;
         }
 
-        th, td {
+        .device-table th {
             text-align: left;
-            padding: 10px 16px;
+            padding: 8px 16px;
+            color: var(--text-3);
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
             border-bottom: 1px solid var(--border);
         }
 
-        th {
-            color: var(--text-secondary);
-            font-weight: 600;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
+        .device-table td {
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.9rem;
         }
 
-        /* Install */
-        .install-steps {
+        .device-table tbody tr:last-child td { border-bottom: none; }
+
+        .device-table tbody tr:hover td { background: var(--surface-raised); }
+
+        .status-ok   { color: var(--success); font-weight: 500; }
+        .status-soon { color: var(--text-3); }
+
+        /* ── Download section ────────────────────────────── */
+        .download-cta {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .download-table-wrap {
+            max-width: 640px;
+            margin: 0 auto;
             background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 24px 28px;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-
-        .install-steps code {
-            display: block;
-            padding: 4px 0;
-            color: var(--accent);
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-            font-size: 0.9rem;
-        }
-
-        .install-steps .comment {
-            color: var(--text-secondary);
-            font-style: italic;
-        }
-
-        .prereqs {
-            text-align: center;
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            margin-bottom: 20px;
-        }
-
-        .prereqs a {
-            color: var(--accent);
-            text-decoration: none;
-        }
-
-        .prereqs a:hover { text-decoration: underline; }
-
-        /* Footer */
-        footer {
-            text-align: center;
-            padding: 40px 0;
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }
-
-        footer a { color: var(--accent); text-decoration: none; }
-        footer a:hover { text-decoration: underline; }
-
-        /* SEO hidden heading */
-        .sr-only {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
-            margin: -1px;
+            border-radius: var(--r-lg);
             overflow: hidden;
-            clip: rect(0, 0, 0, 0);
-            border: 0;
         }
 
-        /* FAQ */
+        .download-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .download-table th {
+            text-align: left;
+            padding: 10px 20px;
+            color: var(--text-3);
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+        }
+
+        .download-table td {
+            text-align: left;
+            padding: 13px 20px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.88rem;
+            color: var(--text-2);
+        }
+
+        .download-table td:first-child { color: var(--text); font-weight: 600; }
+        .download-table tbody tr:last-child td { border-bottom: none; }
+
+        .prereq-note {
+            text-align: center;
+            color: var(--text-3);
+            font-size: 0.88rem;
+            margin-top: 20px;
+        }
+
+        .prereq-note a { color: var(--accent); text-decoration: none; }
+        .prereq-note a:hover { text-decoration: underline; }
+
+        /* ── Dev section / terminal ──────────────────────── */
+        .terminal {
+            background: #080d12;
+            border: 1px solid var(--border);
+            border-radius: var(--r-lg);
+            padding: 24px 28px;
+            max-width: 560px;
+            margin: 0 auto;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        }
+
+        .terminal-line {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            padding: 3px 0;
+            font-size: 0.88rem;
+            line-height: 1.6;
+        }
+
+        .terminal-prompt {
+            color: var(--success);
+            user-select: none;
+            flex-shrink: 0;
+        }
+
+        .terminal-cmd { color: var(--text-2); }
+        .terminal-cmd em { font-style: normal; color: var(--accent); }
+
+        /* ── FAQ ─────────────────────────────────────────── */
         .faq-list {
-            max-width: 700px;
+            max-width: 680px;
             margin: 0 auto;
         }
 
         .faq-list details {
             background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 10px;
-            margin-bottom: 12px;
-            padding: 0;
+            border-radius: var(--r-md);
+            margin-bottom: 8px;
             overflow: hidden;
+            transition: border-color 0.12s ease;
         }
 
+        .faq-list details[open] { border-color: var(--border-strong); }
+
         .faq-list summary {
-            padding: 16px 20px;
+            padding: 15px 20px;
             font-weight: 600;
-            font-size: 1.05rem;
+            font-size: 0.95rem;
             cursor: pointer;
             list-style: none;
             display: flex;
             align-items: center;
-            gap: 10px;
-        }
-
-        .faq-list summary::before {
-            content: "+";
-            font-size: 1.2rem;
-            color: var(--accent);
-            font-weight: 700;
-            flex-shrink: 0;
-        }
-
-        .faq-list details[open] summary::before {
-            content: "−";
+            justify-content: space-between;
+            gap: 12px;
+            color: var(--text);
         }
 
         .faq-list summary::-webkit-details-marker { display: none; }
 
-        .faq-list details p {
-            padding: 0 20px 16px;
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            line-height: 1.6;
+        .faq-chevron {
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+            color: var(--text-3);
+            transition: transform 0.15s ease;
         }
 
-        @media (max-width: 480px) {
-            header h1 { font-size: 2.2rem; }
+        .faq-list details[open] .faq-chevron { transform: rotate(180deg); }
+
+        .faq-list details p {
+            padding: 0 20px 16px;
+            color: var(--text-2);
+            font-size: 0.9rem;
+            line-height: 1.65;
+        }
+
+        /* ── Footer ──────────────────────────────────────── */
+        footer {
+            border-top: 1px solid var(--border-subtle);
+            padding: 36px 0;
+            text-align: center;
+            color: var(--text-3);
+            font-size: 0.85rem;
+        }
+
+        footer a { color: var(--text-2); text-decoration: none; }
+        footer a:hover { color: var(--accent); }
+
+        .footer-links {
+            display: flex;
+            gap: 24px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+
+        /* ── Accessibility ───────────────────────────────── */
+        .sr-only {
+            position: absolute; width: 1px; height: 1px;
+            padding: 0; margin: -1px; overflow: hidden;
+            clip: rect(0,0,0,0); border: 0;
+        }
+
+        /* ── Responsive ──────────────────────────────────── */
+        @media (max-width: 700px) {
+            .wordmark { font-size: 2.4rem; }
+            .feature-pillars { grid-template-columns: 1fr; }
+            .feature-grid { grid-template-columns: 1fr 1fr; }
             .screenshot-gallery { grid-template-columns: 1fr; }
+            .support-banner { flex-direction: column; align-items: flex-start; }
+        }
+
+        @media (max-width: 460px) {
+            .feature-grid { grid-template-columns: 1fr; }
         }
     </style>
 
-    <!-- Structured Data for Google -->
+    <!-- Structured Data -->
     <script type="application/ld+json">
     {
         "@context": "https://schema.org",
@@ -362,17 +567,10 @@
         "operatingSystem": "Windows, macOS, Linux",
         "screenshot": "https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/hero.png",
         "downloadUrl": "https://github.com/TheRealSavi/iOpenPod/releases/latest",
-        "offers": {
-            "@type": "Offer",
-            "price": "0",
-            "priceCurrency": "USD"
-        },
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "license": "https://opensource.org/licenses/MIT",
         "programmingLanguage": "Python",
-        "author": {
-            "@type": "Person",
-            "name": "John Gibbons"
-        }
+        "author": { "@type": "Person", "name": "John Gibbons" }
     }
     </script>
     <script type="application/ld+json">
@@ -380,54 +578,18 @@
         "@context": "https://schema.org",
         "@type": "FAQPage",
         "mainEntity": [
-            {
-                "@type": "Question",
-                "name": "How do I sync my iPod without iTunes?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "Download iOpenPod from the releases page, extract it, and run it. Connect your iPod via USB, select your media folder, and click sync. No Python or iTunes needed."
-                }
-            },
-            {
-                "@type": "Question",
-                "name": "Can I put FLAC files on an iPod?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "Yes. iOpenPod automatically converts FLAC files to Apple Lossless (ALAC) during sync, so your iPod can play them natively with no quality loss."
-                }
-            },
-            {
-                "@type": "Question",
-                "name": "Does iOpenPod work on Linux and macOS?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "Yes. Precompiled binaries are available for Windows, macOS, and Linux. Just download, extract, and run — no Python installation required."
-                }
-            },
-            {
-                "@type": "Question",
-                "name": "Which iPod models are supported?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "All iPod Classic generations, iPod Mini, iPod Photo, and iPod Nano 1G through 7G have full read and write support. Shuffle support is coming soon."
-                }
-            },
-            {
-                "@type": "Question",
-                "name": "Will syncing with iOpenPod erase my iPod?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "No. iOpenPod shows you exactly what will change before anything is written, and automatically backs up your database before every sync. You can roll back with one click."
-                }
-            },
-            {
-                "@type": "Question",
-                "name": "Do I need Python to use iOpenPod?",
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": "No. The releases page provides precompiled binaries for Windows, macOS, and Linux. Just download, extract, and run. Python is only needed if you want to contribute to development."
-                }
-            }
+            { "@type": "Question", "name": "How do I sync my iPod without iTunes?",
+              "acceptedAnswer": { "@type": "Answer", "text": "Download iOpenPod from the releases page, extract it, and run it. Connect your iPod via USB, select your media folder, and click sync. No Python or iTunes needed." }},
+            { "@type": "Question", "name": "Can I put FLAC files on an iPod?",
+              "acceptedAnswer": { "@type": "Answer", "text": "Yes. iOpenPod automatically converts FLAC files to Apple Lossless (ALAC) during sync, so your iPod can play them natively with no quality loss." }},
+            { "@type": "Question", "name": "Does iOpenPod work on Linux and macOS?",
+              "acceptedAnswer": { "@type": "Answer", "text": "Yes. Precompiled binaries are available for Windows, macOS, and Linux. Just download, extract, and run — no Python installation required." }},
+            { "@type": "Question", "name": "Which iPod models are supported?",
+              "acceptedAnswer": { "@type": "Answer", "text": "All iPod Classic generations, iPod Mini, iPod Photo, and iPod Nano 1G through 7G have full read and write support. Shuffle support is coming soon." }},
+            { "@type": "Question", "name": "Will syncing with iOpenPod erase my iPod?",
+              "acceptedAnswer": { "@type": "Answer", "text": "No. iOpenPod shows you exactly what will change before anything is written, and automatically backs up your database before every sync. You can roll back with one click." }},
+            { "@type": "Question", "name": "Do I need Python to use iOpenPod?",
+              "acceptedAnswer": { "@type": "Answer", "text": "No. The releases page provides precompiled binaries for Windows, macOS, and Linux. Just download, extract, and run. Python is only needed if you want to contribute to development." }}
         ]
     }
     </script>
@@ -437,16 +599,13 @@
 
     <header>
         <div class="container">
-            <h1><span>i</span>OpenPod</h1>
-            <p>Ditch iTunes. Sync your iPod the open way.</p>
+            <h1 class="wordmark"><em>i</em>OpenPod</h1>
+            <p class="tagline">Ditch iTunes. Sync your iPod the open way.</p>
 
             <div class="badges">
                 <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License">
                 <img src="https://img.shields.io/badge/Platform-Win%20%7C%20Mac%20%7C%20Linux-lightgrey.svg" alt="Cross-platform">
                 <img src="https://img.shields.io/github/v/release/TheRealSavi/iOpenPod" alt="Latest Release">
-            </div>
-            <div style="margin-top:10px;">
-                <a href="https://ko-fi.com/U7U61W4PK1" target="_blank"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support on Ko-fi"></a>
             </div>
 
             <div class="cta">
@@ -456,223 +615,325 @@
             </div>
 
             <div class="hero-screenshot">
-                <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/hero.png" alt="iOpenPod — open source iPod Classic sync tool showing album grid with artwork on Windows">
+                <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/hero.png"
+                     alt="iOpenPod — open source iPod Classic sync tool showing album grid with artwork on Windows">
             </div>
         </div>
     </header>
 
     <main class="container">
-        <section>
-            <h2>What It Does</h2>
-            <p>Everything you need to keep your iPod alive — no iTunes, no hassle.</p>
+
+        <!-- Support banner -->
+        <div class="section" style="padding: 28px 0;">
+            <div class="support-banner">
+                <div class="support-banner-text">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12Z"/>
+                    </svg>
+                    <span>iOpenPod is and always will be completely free and open source. If you like it and would like to support me, it is so very appreciated.</span>
+                </div>
+                <a href="https://ko-fi.com/johngibbons" target="_blank" rel="noopener" class="btn-kofi">
+                    <svg viewBox="0 0 24 24"><path d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12Z"/></svg>
+                    Support on Ko-fi
+                </a>
+            </div>
+        </div>
+
+        <!-- Features -->
+        <section class="section">
+            <div class="section-header">
+                <h2>Everything Your iPod Needs</h2>
+                <p>No iTunes. No setup wizards. Just your music, on your iPod.</p>
+            </div>
+
+            <!-- Three primary pillars -->
+            <div class="feature-pillars">
+                <div class="feature-pillar">
+                    <span class="pillar-label">Core</span>
+                    <h3>Any Format, Any iPod</h3>
+                    <p>FLAC, OGG, WMA, MP3, AAC — drop in whatever you have. Non-native formats are automatically transcoded to ALAC or AAC, cached so repeat syncs are instant.</p>
+                </div>
+                <div class="feature-pillar">
+                    <span class="pillar-label">Safety</span>
+                    <h3>Review Every Change</h3>
+                    <p>Every sync shows you exactly what's happening — adds, removes, metadata updates — with a checkbox on each item. Your database is snapshotted before anything writes.</p>
+                </div>
+                <div class="feature-pillar">
+                    <span class="pillar-label">Identity</span>
+                    <h3>Fingerprint, Not Filename</h3>
+                    <p>Tracks are matched by acoustic fingerprint, not path or tags. Re-encode, re-tag, or change quality — your sync history follows without losing anything.</p>
+                </div>
+            </div>
+
+            <!-- Supporting features -->
             <div class="feature-grid">
                 <div class="feature-card">
-                    <span class="icon">🎵</span>
-                    <h3>Any Format In, iPod Out</h3>
-                    <p>FLAC, OGG, WMA, MP3, AAC — drop in whatever you have. Non-native formats get transcoded to ALAC or AAC automatically.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">📻</span>
                     <h3>Podcasts Built In</h3>
-                    <p>Search, subscribe, and download podcast episodes right inside iOpenPod. Sync them to your iPod without a separate app.</p>
+                    <p>Search, subscribe, and download episodes right inside iOpenPod. Sync to your iPod without a separate app.</p>
                 </div>
                 <div class="feature-card">
-                    <span class="icon">🎧</span>
                     <h3>ListenBrainz Scrobbling</h3>
-                    <p>Sign into ListenBrainz and your listening history scrobbles automatically every time you sync. Keep your music profile current.</p>
+                    <p>Sign in and your listening history scrobbles automatically every time you sync.</p>
                 </div>
                 <div class="feature-card">
-                    <span class="icon">📚</span>
-                    <h3>More Than Music</h3>
-                    <p>Audiobooks, movies, and TV shows are all supported. Your iPod sorts them into the right categories automatically.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">🖱️</span>
-                    <h3>Drag and Drop</h3>
-                    <p>Don't need full sync? Just drag files into the app and they'll land on your iPod — no setup, no fuss.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">📊</span>
-                    <h3>Play Counts &amp; Ratings</h3>
-                    <p>Listen on your iPod, plug it in, and your play counts, ratings, and skip counts sync back to your PC library.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">🖼️</span>
-                    <h3>Album Art Included</h3>
-                    <p>Art is pulled from your files, resized, and written in the iPod's native format. No extra steps required.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">✅</span>
-                    <h3>Review Before Syncing</h3>
-                    <p>Every sync shows you exactly what's changing — adds, removes, updates — with checkboxes for each item.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">🛡️</span>
-                    <h3>Backup &amp; Rollback</h3>
-                    <p>Your iPod database is snapshotted before every sync. One click to undo if something goes wrong.</p>
-                </div>
-                <div class="feature-card">
-                    <span class="icon">📋</span>
                     <h3>Playlists &amp; Smart Playlists</h3>
-                    <p>Browse, create, and manage playlists. Smart playlists with rule-based filtering are supported too.</p>
+                    <p>Browse and manage standard playlists. Smart playlists with rule-based filtering are supported too.</p>
                 </div>
                 <div class="feature-card">
-                    <span class="icon">🌗</span>
-                    <h3>Light &amp; Dark Mode</h3>
-                    <p>Choose your theme. The UI scales beautifully on high-DPI retina displays and low-res monitors alike.</p>
+                    <h3>Play Counts &amp; Ratings</h3>
+                    <p>Listen on your iPod, plug it in. Play counts, ratings, and skip counts sync back to your PC library.</p>
                 </div>
                 <div class="feature-card">
-                    <span class="icon">🔄</span>
-                    <h3>Auto-Updater</h3>
-                    <p>iOpenPod checks for updates automatically and can update itself right from the app. Always stay current.</p>
+                    <h3>Drag and Drop</h3>
+                    <p>Don't need full sync? Drag files into the app and they land on your iPod — no fingerprinting, no setup.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Album Art Included</h3>
+                    <p>Art is extracted from your files, resized, and written in the iPod's native RGB565 format automatically.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Audiobooks, Movies &amp; TV</h3>
+                    <p>All supported and sorted into the correct categories on your iPod automatically.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Backup &amp; Rollback</h3>
+                    <p>Your iPod database is snapshotted before every sync. One click to roll back if something goes wrong.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Light, Dark &amp; Catppuccin</h3>
+                    <p>Multiple themes including Catppuccin. Scales correctly on high-DPI and standard displays.</p>
                 </div>
             </div>
         </section>
 
-        <section>
-            <h2>See It In Action</h2>
+        <!-- Screenshots -->
+        <section class="section">
+            <div class="section-header">
+                <h2>See It In Action</h2>
+            </div>
             <div class="screenshot-gallery">
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/syncreview.png" alt="iPod sync review — see tracks being added and removed before syncing without iTunes">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/syncreview.png"
+                         alt="iPod sync review — see tracks being added and removed before syncing without iTunes">
                     <div class="caption">Review every change before it hits your iPod</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/devicepicker.png" alt="iPod device detection — auto-detect iPod Classic and Nano models on Windows, Mac, Linux">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/devicepicker.png"
+                         alt="iPod device detection — auto-detect iPod Classic and Nano models on Windows, Mac, Linux">
                     <div class="caption">Detect and pick your connected iPod</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/podcasts.png" alt="Podcast manager — search, subscribe, and sync podcasts to your iPod">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/podcasts.png"
+                         alt="Podcast manager — search, subscribe, and sync podcasts to your iPod">
                     <div class="caption">Built-in podcast manager</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/managetracks.png" alt="Drag and drop tracks onto your iPod without a full sync">
-                    <div class="caption">Drag and drop tracks onto your iPod</div>
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/managetracks.png"
+                         alt="Drag and drop tracks onto your iPod without a full sync">
+                    <div class="caption">Drag and drop tracks directly</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/playlists.png" alt="iPod playlist manager — browse and edit playlists without iTunes">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/playlists.png"
+                         alt="iPod playlist manager — browse and edit playlists without iTunes">
                     <div class="caption">Browse and manage playlists</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/smartplaylist.png" alt="iPod smart playlists — rule-based playlist filtering for iPod Classic">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/smartplaylist.png"
+                         alt="iPod smart playlists — rule-based playlist filtering for iPod Classic">
                     <div class="caption">Smart playlists with rule-based filtering</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/lightmode.png" alt="iOpenPod light mode — choose between dark and light themes">
-                    <div class="caption">Light mode for a brighter look</div>
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/lightmode.png"
+                         alt="iOpenPod light mode — choose between dark and light themes">
+                    <div class="caption">Light mode</div>
                 </div>
                 <div class="screenshot-item">
-                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/backup.png" alt="iPod database backup and restore — one-click rollback for safe syncing">
+                    <img src="https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/backup.png"
+                         alt="iPod database backup and restore — one-click rollback for safe syncing">
                     <div class="caption">One-click backup and restore</div>
                 </div>
             </div>
         </section>
 
-        <section>
-            <h2>Supported iPods</h2>
-            <p>Works with every click-wheel iPod Apple ever made. Shuffle support coming soon!</p>
-            <table>
+        <!-- Supported devices -->
+        <section class="section">
+            <div class="section-header">
+                <h2>Supported iPods</h2>
+                <p>Every click-wheel iPod Apple ever made. Shuffle support coming soon.</p>
+            </div>
+            <table class="device-table">
                 <thead>
                     <tr><th>Device</th><th>Status</th><th>Notes</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>iPod 1G–5G, Mini, Photo</td><td>✅ Fully supported</td><td>No hash required</td></tr>
-                    <tr><td>iPod Classic (all gens)</td><td>✅ Fully supported</td><td>Uses FireWire ID</td></tr>
-                    <tr><td>iPod Nano 1G–2G</td><td>✅ Fully supported</td><td>No hash required</td></tr>
-                    <tr><td>iPod Nano 3G–4G</td><td>✅ Fully supported</td><td>Uses FireWire ID</td></tr>
-                    <tr><td>iPod Nano 5G</td><td>✅ Fully supported</td><td>Needs one iTunes sync first</td></tr>
-                    <tr><td>iPod Nano 6G–7G</td><td>✅ Fully supported</td><td>Uses FireWire ID (WASM)</td></tr>
-                    <tr><td>iPod Shuffle</td><td>🔜 Coming soon</td><td></td></tr>
+                    <tr><td>iPod 1G–5G, Mini, Photo</td><td class="status-ok">Fully supported</td><td>No hash required</td></tr>
+                    <tr><td>iPod Classic (all gens)</td><td class="status-ok">Fully supported</td><td>Uses FireWire ID</td></tr>
+                    <tr><td>iPod Nano 1G–2G</td><td class="status-ok">Fully supported</td><td>No hash required</td></tr>
+                    <tr><td>iPod Nano 3G–4G</td><td class="status-ok">Fully supported</td><td>Uses FireWire ID</td></tr>
+                    <tr><td>iPod Nano 5G</td><td class="status-ok">Fully supported</td><td>Needs one iTunes sync for HashInfo</td></tr>
+                    <tr><td>iPod Nano 6G–7G</td><td class="status-ok">Fully supported</td><td>HASHAB via WebAssembly</td></tr>
+                    <tr><td>iPod Shuffle</td><td class="status-soon">Coming soon</td><td>—</td></tr>
                 </tbody>
             </table>
         </section>
 
-        <section id="install">
-            <h2>Download &amp; Install</h2>
-            <p>No Python needed. Just download, extract, and run.</p>
-            <div style="text-align: center; margin-bottom: 24px;">
-                <a href="https://github.com/TheRealSavi/iOpenPod/releases/latest" class="btn btn-primary" style="font-size: 1.1rem; padding: 14px 36px;">Download Latest Release</a>
+        <!-- Download -->
+        <section class="section" id="install">
+            <div class="section-header">
+                <h2>Download &amp; Install</h2>
+                <p>No Python needed. Download, extract, run.</p>
             </div>
-            <table style="max-width: 600px; margin: 0 auto;">
-                <thead>
-                    <tr><th>Platform</th><th>File</th><th>Instructions</th></tr>
-                </thead>
-                <tbody>
-                    <tr><td><strong>Windows</strong></td><td>iOpenPod-windows.zip</td><td>Extract the zip, run iOpenPod.exe</td></tr>
-                    <tr><td><strong>macOS</strong></td><td>iOpenPod-macos.tar.gz</td><td>Extract, right-click iOpenPod.app → Open</td></tr>
-                    <tr><td><strong>Linux</strong></td><td>iOpenPod-linux.tar.gz</td><td>Extract, run ./iOpenPod</td></tr>
-                </tbody>
-            </table>
-            <p class="prereqs" style="margin-top: 20px;">
-                <strong>Optional extras:</strong>
-                <a href="https://ffmpeg.org/">FFmpeg</a> for transcoding (FLAC&nbsp;→&nbsp;ALAC, etc.) and
-                <a href="https://acoustid.org/chromaprint">Chromaprint</a> for acoustic fingerprinting.
-            </p>
-            <p class="prereqs" style="margin-top: 8px;">
-                Once installed, iOpenPod checks for updates automatically and can update itself right from the app.
+            <div class="download-cta">
+                <a href="https://github.com/TheRealSavi/iOpenPod/releases/latest" class="btn btn-primary" style="font-size: 1rem; padding: 13px 32px;">Download Latest Release</a>
+            </div>
+            <div class="download-table-wrap">
+                <table class="download-table">
+                    <thead>
+                        <tr><th>Platform</th><th>File</th><th>Instructions</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>Windows</td><td>iOpenPod-windows.zip</td><td>Extract, run iOpenPod.exe</td></tr>
+                        <tr><td>macOS</td><td>iOpenPod-macos.tar.gz</td><td>Extract, right-click iOpenPod.app → Open</td></tr>
+                        <tr><td>Linux (AppImage)</td><td>iOpenPod-Linux-x86_64.AppImage</td><td><code style="font-size:0.8rem;color:var(--accent)">chmod a+x</code> then run</td></tr>
+                        <tr><td>Linux (Arch)</td><td><a href="https://aur.archlinux.org/packages/iopenpod" style="color:var(--accent);text-decoration:none">iopenpod</a> (AUR)</td><td>Available in the AUR</td></tr>
+                        <tr><td>Linux (tarball)</td><td>iOpenPod-linux.tar.gz</td><td>Extract, run ./iOpenPod</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <p class="prereq-note">
+                Once installed, iOpenPod checks for updates and can update itself from the app (except AUR).<br>
+                Optional: <a href="https://ffmpeg.org/">FFmpeg</a> for transcoding and <a href="https://acoustid.org/chromaprint">Chromaprint</a> for fingerprinting.
             </p>
         </section>
 
-        <section id="developers">
-            <h2>For Developers</h2>
-            <p>Want to hack on iOpenPod? Clone the repo and get running in seconds.</p>
-            <p class="prereqs">
-                Requires <strong>Python 3.13+</strong> and <a href="https://docs.astral.sh/uv/">uv</a>.
-            </p>
-            <div class="install-steps">
-                <code>git clone https://github.com/TheRealSavi/iOpenPod.git</code>
-                <code>cd iOpenPod</code>
-                <code>uv sync</code>
-                <code>uv run python main.py</code>
+        <!-- Developers -->
+        <section class="section" id="developers">
+            <div class="section-header">
+                <h2>For Developers</h2>
+                <p>Requires Python 3.13+ and <a href="https://docs.astral.sh/uv/" style="color:var(--accent);text-decoration:none">uv</a>.</p>
             </div>
-            <p class="prereqs" style="margin-top: 16px;">
-                That's it. <code style="color: var(--accent);">uv sync</code> installs all dependencies into a virtual environment automatically.
+            <div class="terminal">
+                <div class="terminal-line">
+                    <span class="terminal-prompt">$</span>
+                    <span class="terminal-cmd">git clone https://github.com/TheRealSavi/iOpenPod.git</span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">$</span>
+                    <span class="terminal-cmd">cd iOpenPod</span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">$</span>
+                    <span class="terminal-cmd"><em>uv sync</em></span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">$</span>
+                    <span class="terminal-cmd"><em>uv run python main.py</em></span>
+                </div>
+            </div>
+            <p class="prereq-note" style="margin-top: 16px;">
+                <code style="color:var(--accent);font-family:monospace">uv sync</code> installs all dependencies into a virtual environment automatically.
             </p>
         </section>
 
-        <section>
-            <h2>Frequently Asked Questions</h2>
+        <!-- FAQ -->
+        <section class="section">
+            <div class="section-header">
+                <h2>Frequently Asked Questions</h2>
+            </div>
             <div class="faq-list">
                 <details>
-                    <summary>How do I sync my iPod without iTunes?</summary>
+                    <summary>How do I sync my iPod without iTunes?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
                     <p>Download iOpenPod from the releases page, extract it, and run it. Connect your iPod via USB, select your media folder, and click sync — no iTunes or Python needed.</p>
                 </details>
                 <details>
-                    <summary>Do I need Python to use iOpenPod?</summary>
-                    <p>No. The releases page provides precompiled binaries for Windows, macOS, and Linux. Just download, extract, and run. Python is only needed if you want to contribute to development.</p>
+                    <summary>Do I need Python to use iOpenPod?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>No. Precompiled binaries are available for Windows, macOS, and Linux. Just download, extract, and run. Python is only needed to contribute to development.</p>
                 </details>
                 <details>
-                    <summary>Can I put FLAC files on an iPod?</summary>
+                    <summary>Can I put FLAC files on an iPod?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
                     <p>Yes. iOpenPod automatically converts FLAC to Apple Lossless (ALAC) during sync, so your iPod plays them natively with no quality loss.</p>
                 </details>
                 <details>
-                    <summary>Does it work on Linux and macOS?</summary>
-                    <p>Yes. Precompiled downloads are available for Windows, macOS, and Linux. Just extract and run.</p>
+                    <summary>Does it work on Linux and macOS?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>Yes. Precompiled downloads are available for all three platforms. Just extract and run.</p>
                 </details>
                 <details>
-                    <summary>Which iPod models are supported?</summary>
-                    <p>All iPod Classic generations, iPod Mini, iPod Photo, and iPod Nano 1G–7G have full read/write support. Shuffle support is coming soon.</p>
-                </details>
-                <details>
-                    <summary>Will syncing erase my iPod?</summary>
+                    <summary>Will syncing erase my iPod?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
                     <p>No. iOpenPod shows you exactly what will change before writing anything, and backs up your database before every sync. Roll back with one click.</p>
                 </details>
                 <details>
-                    <summary>Can I just drag files onto my iPod without syncing?</summary>
-                    <p>No, the iPod needs to have its database updated. But you can drag and drop files into iOpenPod and they'll be added to your iPod. No sync setup required.</p>
+                    <summary>Can I add files without a full sync?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>Yes. Drag and drop files into iOpenPod and they'll be added to your iPod directly — no sync configuration required.</p>
+                </details>
+                <details>
+                    <summary>My iPod was previously managed by iTunes. Will I lose my music?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>No. iOpenPod reads the existing iTunesDB on your iPod and shows you everything already on it. You can browse, edit, and add tracks without touching what's already there. A sync will only change what you explicitly approve in the review step.</p>
+                </details>
+                <details>
+                    <summary>My iPod isn't being detected. What should I do?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>Make sure the iPod is mounted as a drive (visible in File Explorer or Finder) and not in disk mode lock. iOpenPod also has a manual folder picker if auto-detection misses it. If it's still not working, open an issue on GitHub with your iPod model and OS.</p>
+                </details>
+                <details>
+                    <summary>Do I need FFmpeg and Chromaprint installed?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>They're optional but recommended. Without FFmpeg, iOpenPod can't transcode non-native formats like FLAC or OGG — you'd be limited to MP3 and AAC. Without Chromaprint, fingerprint-based sync isn't available, though drag-and-drop still works.</p>
+                </details>
+                <details>
+                    <summary>What happens if something goes wrong mid-sync?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>iOpenPod takes a full snapshot of your iPod's database before every sync begins. If anything goes wrong, open the Backups panel and restore the previous snapshot with one click — your iPod goes back to exactly how it was.</p>
+                </details>
+                <details>
+                    <summary>Does iOpenPod send any data to the internet?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>Only when you explicitly trigger it: checking for updates, scrobbling to ListenBrainz, or searching for podcasts. Nothing is sent in the background. There's no telemetry.</p>
+                </details>
+                <details>
+                    <summary>Can I sync the same iPod from multiple computers?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>Yes, with a caveat. The fingerprint-to-database mapping is stored in a file on the iPod itself, so the iPod carries its own identity. Each PC will re-fingerprint its local library on first sync, then match against what's already on the device.</p>
+                </details>
+                <details>
+                    <summary>Does iOpenPod support iPod Touch?
+                        <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <p>No. iPod Touch runs iOS and uses a completely different sync protocol. iOpenPod is built specifically for the click-wheel iPods (Classic, Mini, Photo, Nano) that use the iTunesDB binary format.</p>
                 </details>
             </div>
         </section>
+
     </main>
 
     <footer>
         <div class="container">
-            <p>
-                Built by <a href="https://github.com/TheRealSavi">John Gibbons</a> ·
-                <a href="https://github.com/TheRealSavi/iOpenPod">Source Code</a> ·
-                <a href="https://github.com/TheRealSavi/iOpenPod/issues">Report Issues</a> ·
+            <div class="footer-links">
+                <a href="https://github.com/TheRealSavi">John Gibbons</a>
+                <a href="https://github.com/TheRealSavi/iOpenPod">Source Code</a>
+                <a href="https://github.com/TheRealSavi/iOpenPod/issues">Report Issues</a>
                 <a href="https://discord.gg/9Yy499Tf5d">Discord</a>
-            </p>
-            <p style="margin-top: 8px;">MIT License &copy; 2025–2026</p>
+                <a href="https://ko-fi.com/johngibbons">Ko-fi</a>
+            </div>
+            <p>MIT License &copy; 2025–2026</p>
         </div>
     </footer>
 </body>

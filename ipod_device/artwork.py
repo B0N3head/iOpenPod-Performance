@@ -19,6 +19,7 @@ _EXTRA_FORMATS = (
     ArtworkFormat(1013, 220, 176, 440, "RGB565_BE_90", "photo_full", "Photo full screen (rotated)"),
     ArtworkFormat(1015, 130, 88, 260, "RGB565_LE", "photo_preview", "Photo/Video preview"),
     ArtworkFormat(1019, 720, 480, 1440, "UYVY", "tv_out", "Photo/Video NTSC TV output"),
+    ArtworkFormat(1020, 220, 176, 440, "RGB565_BE_90", "photo_full", "Photo full screen (alt rotated)"),
     # iPod Nano 1G/2G photos
     ArtworkFormat(1023, 176, 132, 352, "RGB565_BE", "photo_full", "Nano full screen"),
     ArtworkFormat(1032, 42, 37, 84, "RGB565_LE", "photo_list", "Nano list thumbnail"),
@@ -35,6 +36,14 @@ _EXTRA_FORMATS = (
     ArtworkFormat(1079, 80, 80, 160, "RGB565_LE", "photo_thumb", "Nano 4G/5G photo thumbnail"),
     ArtworkFormat(1083, 320, 240, 640, "RGB565_LE", "photo_full", "Nano 4G photo full screen"),
     ArtworkFormat(1087, 384, 384, 768, "RGB565_LE", "photo_large", "Nano 5G photo large"),
+    # Legacy/mobile/touch formats documented in libgpod reverse-engineering
+    ArtworkFormat(1081, 640, 480, 0, "JPEG", "photo_full", "JPEG photo format (experimental/legacy)"),
+    ArtworkFormat(2002, 50, 50, 100, "RGB565_BE", "cover_small", "iPod Mobile cover art small"),
+    ArtworkFormat(2003, 150, 150, 300, "RGB565_BE", "cover_large", "iPod Mobile cover art large"),
+    ArtworkFormat(3001, 256, 256, 512, "REC_RGB555_LE", "cover_large", "iPod touch cover art large"),
+    ArtworkFormat(3002, 128, 128, 256, "REC_RGB555_LE", "cover_medium", "iPod touch cover art medium"),
+    ArtworkFormat(3003, 64, 64, 128, "REC_RGB555_LE", "cover_small", "iPod touch cover art small"),
+    ArtworkFormat(3005, 320, 320, 640, "RGB555_LE", "cover_xlarge", "iPod touch cover art xlarge"),
 )
 
 ITHMB_FORMAT_MAP: dict[int, ArtworkFormat] = {}

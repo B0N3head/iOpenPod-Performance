@@ -585,14 +585,13 @@ def enrich(info: DeviceInfo) -> None:
 
     # ── 3b. Serial-last-3 model lookup ────────────────────────────────
     #   Very reliable — the last 3 chars of the serial encode the exact
-    #   model (incl. capacity and color).  Always run when the serial is
-    #   available and ANY identity field is still missing — serial lookup
-    #   is higher confidence than USB PID and provides the exact variant
-    #   including generation, capacity, and color.
-    if info.serial and (
-        not info.model_number or not info.generation
-        or not info.capacity or not info.color
-    ):
+    #   model (incl. capacity and color).  Run whenever the serial is
+    #   available: the lookup is cheap and _enrich_from_serial_lookup
+    #   uses authority-rank comparison, so it only overwrites fields
+    #   whose current source is less reliable than the serial.  This
+    #   catches devices where ModelNumStr is wrong (e.g. corrupted NVRAM
+    #   or logic-board swap) even when all fields appear "populated".
+    if info.serial:
         _enrich_from_serial_lookup(info)
 
     # ── 3c. USB PID-based family/generation (if nothing else worked) ──
@@ -1221,13 +1220,31 @@ def _enrich_from_serial_lookup(info: DeviceInfo) -> None:
     # trustworthy as the serial they came from.
     _src = info._field_sources.get("serial", "serial_lookup")
 
-    if not info.model_number:
+    from .authority import SOURCE_RANK, _WORST_RANK
+    _serial_rank = SOURCE_RANK.get(_src, _WORST_RANK)
+
+    # Apply model_number with the same rank comparison used for other fields.
+    # This lets a high-authority serial (e.g. from VPD) override a stale or
+    # wrong ModelNumStr that was read from SysInfo (e.g. a device whose NVRAM
+    # reports the wrong model after a botched restore or board swap).
+    _cur_mn_rank = SOURCE_RANK.get(
+        info._field_sources.get("model_number", "unknown"), _WORST_RANK,
+    )
+    if not info.model_number or _serial_rank <= _cur_mn_rank:
+        if info.model_number and info.model_number != model_num:
+            logger.warning(
+                "enrich: serial last-3 '%s' gives model %s but current "
+                "model_number is %s (source: %s, rank %d); overriding with "
+                "serial result (serial source: %s, rank %d)",
+                info.serial[-3:], model_num, info.model_number,
+                info._field_sources.get("model_number", "unknown"),
+                _cur_mn_rank, _src, _serial_rank,
+            )
         info.model_number = model_num
-        info._field_sources.setdefault("model_number", _src)
+        info._field_sources["model_number"] = _src
 
     # Serial lookup is authoritative for family/gen — always set these
     # (unless a higher-authority source already has them).
-    from .authority import SOURCE_RANK, _WORST_RANK
     _serial_rank = SOURCE_RANK.get(_src, _WORST_RANK)
 
     _cur_family_rank = SOURCE_RANK.get(

@@ -473,6 +473,25 @@ SERIAL_LAST3_TO_MODEL: dict[str, str] = {
     "DW2": "MC692", "DW3": "MC693",
     "DW4": "MC694", "DW5": "MC695", "DW6": "MC696", "DW7": "MC697",
     "DW8": "MC698", "DW9": "MC699",
+    # ── Nano 7G ────────────────────────────────────────────────────────
+    # Source: TheAppleWiki Models/iPod (serial suffix table). Entries there
+    # are 4-char suffixes (e.g. F0GN); this map stores last-3 to match our
+    # lookup_by_serial(serial[-3:]) convention.
+    "0GD": "MD475", "0GM": "MD475",  # pink
+    "0GF": "MD476", "0GN": "MD476",  # yellow
+    "0GG": "MD477", "0GP": "MD477",  # blue
+    "0GH": "MD478", "0GQ": "MD478",  # green
+    "0GJ": "MD479", "0GR": "MD479",  # purple
+    "0GK": "MD480", "0GT": "MD480",  # silver
+    "0GL": "MD481", "0GV": "MD481",  # slate
+    "4LN": "MD744", "4LP": "MD744",  # product red
+    "JQ1": "ME971",  # space gray (2013)
+    "K60": "MKMV2",  # pink (2015)
+    "K61": "MKMX2",  # gold (2015)
+    "K62": "MKN02",  # blue (2015)
+    "K63": "MKN22",  # silver (2015)
+    "K64": "MKN52",  # space gray (2015)
+    "K65": "MKN72",  # product red (2015)
     # ── Video 5G ───────────────────────────────────────────────────────
     "SZ9": "MA002", "WEC": "MA002", "WED": "MA002", "WEG": "MA002",
     "WEH": "MA002", "WEL": "MA002",

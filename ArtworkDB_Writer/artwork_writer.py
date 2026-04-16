@@ -16,16 +16,19 @@ import struct
 import os
 import logging
 from collections import defaultdict
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from PIL.Image import Resampling as _Resampling
-_RESAMPLE = _Resampling.LANCZOS
-
-from .rgb565 import (ALL_KNOWN_FORMATS, image_from_bytes,
-                     rgb888_to_rgb565, IPOD_STRIDE_OVERRIDE,
+from .rgb565 import (image_from_bytes,
+                     IPOD_STRIDE_OVERRIDE,
                      get_artwork_formats)
+from .ithmb_codecs import (
+    decode_pixels_for_format,
+    encode_image_for_format,
+    expected_size_bytes,
+)
 from .art_extractor import extract_art_with_folder, art_hash
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,7 @@ class PendingArtworkWrite:
     """
     db_id_to_art_info: dict          # db_id → (img_id, src_img_size)
     _pending_renames: list = field(default_factory=list)  # [(temp, final), ...]
+    _post_commit_cleanup: Optional[Callable[[], None]] = None
     _committed: bool = False
 
     def commit(self) -> None:
@@ -72,6 +76,8 @@ class PendingArtworkWrite:
             return
         for temp, final in self._pending_renames:
             os.replace(temp, final)
+        if self._post_commit_cleanup is not None:
+            self._post_commit_cleanup()
         self._committed = True
 
     def abort(self) -> None:
@@ -139,6 +145,26 @@ def _write_mhni(format_id: int, ithmb_offset: int, img_info: dict) -> bytes:
 
     total_len = MHNI_HEADER_SIZE + len(mhod3)
 
+    visible_h = int(img_info['height'])
+    visible_w = int(img_info['width'])
+    img_size = int(img_info['size'])
+
+    stride = int(img_info.get('stride_pixels', IPOD_STRIDE_OVERRIDE.get(format_id, visible_w)))
+    if stride < visible_w:
+        stride = visible_w
+
+    vertical_padding = max(0, int(img_info.get('vpad', 0) or 0))
+    horizontal_padding = max(0, int(img_info.get('hpad', 0) or 0))
+    if vertical_padding == 0 and horizontal_padding == 0:
+        expected_size = expected_size_bytes(format_id, visible_w, visible_h, stride_pixels=stride)
+        if expected_size > 0 and expected_size != img_size:
+            logger.debug(
+                "ART: MHNI size mismatch for fmt %d: size=%d expected=%d; preserving stored dims",
+                format_id,
+                img_size,
+                expected_size,
+            )
+
     header = bytearray(MHNI_HEADER_SIZE)
     header[0:4] = b'mhni'
     struct.pack_into('<I', header, 4, MHNI_HEADER_SIZE)
@@ -146,13 +172,17 @@ def _write_mhni(format_id: int, ithmb_offset: int, img_info: dict) -> bytes:
     struct.pack_into('<I', header, 12, 1)               # child count (1 = the filename MHOD)
     struct.pack_into('<I', header, 16, format_id)        # correlationID
     struct.pack_into('<I', header, 20, ithmb_offset)     # offset in ithmb file
-    struct.pack_into('<I', header, 24, img_info['size'])  # image data size in bytes
-    struct.pack_into('<h', header, 28, 0)                # vertical padding
-    struct.pack_into('<h', header, 30, 0)                # horizontal padding
-    struct.pack_into('<H', header, 32, img_info['height'])
-    struct.pack_into('<H', header, 34, img_info['width'])
+    struct.pack_into('<I', header, 24, img_size)          # image data size in bytes
+    if vertical_padding > 0x7FFF or horizontal_padding > 0x7FFF:
+        raise ValueError(
+            f"MHNI padding too large for format {format_id}: vpad={vertical_padding} hpad={horizontal_padding}"
+        )
+    struct.pack_into('<h', header, 28, vertical_padding)
+    struct.pack_into('<h', header, 30, horizontal_padding)
+    struct.pack_into('<H', header, 32, visible_h)
+    struct.pack_into('<H', header, 34, visible_w)
     # offset 36: unk1 = 0
-    struct.pack_into('<I', header, 40, img_info['size'])  # imgSize2 (same as imgSize)
+    struct.pack_into('<I', header, 40, img_size)          # imgSize2 (same as imgSize)
 
     return bytes(header) + mhod3
 
@@ -431,10 +461,18 @@ def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional
 
                 ithmb_path = os.path.join(artwork_dir, f"F{format_id}_1.ithmb")
                 if os.path.exists(ithmb_path) and img_size > 0:
+                    vpad = struct.unpack('<h', data[mhni_offset + 28:mhni_offset + 30])[0]
+                    hpad = struct.unpack('<h', data[mhni_offset + 30:mhni_offset + 32])[0]
+                    img_h = struct.unpack('<H', data[mhni_offset + 32:mhni_offset + 34])[0]
+                    img_w = struct.unpack('<H', data[mhni_offset + 34:mhni_offset + 36])[0]
                     formats[format_id] = {
                         'path': ithmb_path,
                         'ithmb_offset': ithmb_offset,
                         'size': img_size,
+                        'width': img_w,
+                        'height': img_h,
+                        'hpad': hpad,
+                        'vpad': vpad,
                     }
 
         child_offset += mhod_total
@@ -450,13 +488,8 @@ def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional
     }
 
 
-def _cleanup_stale_ithmb_files(artwork_dir: str, target_format_ids: set[int]) -> None:
-    """Remove ithmb files whose format ID doesn't belong to the target device.
-
-    When switching from one device family's formats to another (e.g. Classic
-    format IDs 1055/1060/1061 on a Nano 2G that expects 1027/1031), stale
-    ithmb files from the old format set can confuse the iPod firmware.
-    """
+def _cleanup_stale_ithmb_files(artwork_dir: str, keep_format_ids: set[int]) -> None:
+    """Remove ithmb files whose format ID is not referenced by the final DB."""
     import re
     pattern = re.compile(r'^F(\d+)_\d+\.ithmb$', re.IGNORECASE)
     if not os.path.isdir(artwork_dir):
@@ -465,14 +498,23 @@ def _cleanup_stale_ithmb_files(artwork_dir: str, target_format_ids: set[int]) ->
         m = pattern.match(name)
         if m:
             fmt_id = int(m.group(1))
-            if fmt_id not in target_format_ids:
+            if fmt_id not in keep_format_ids:
                 path = os.path.join(artwork_dir, name)
                 try:
                     os.remove(path)
-                    logger.info("ART: removed stale ithmb file %s (format %d not in target set)",
+                    logger.info("ART: removed unreferenced ithmb file %s (format %d)",
                                 name, fmt_id)
                 except OSError as e:
                     logger.warning("ART: failed to remove stale ithmb %s: %s", name, e)
+
+
+def _decode_preserved_frame(ref: dict, format_id: int, pixel_bytes: bytes):
+    """Decode one preserved frame using format-aware codec rules."""
+    width = max(1, int(ref.get('width', 0) or 0))
+    height = max(1, int(ref.get('height', 0) or 0))
+    hpad = max(0, int(ref.get('hpad', 0) or 0))
+    vpad = max(0, int(ref.get('vpad', 0) or 0))
+    return decode_pixels_for_format(format_id, pixel_bytes, width, height, hpad, vpad)
 
 
 def write_artworkdb(
@@ -533,12 +575,6 @@ def write_artworkdb(
         artwork_formats = get_artwork_formats(ipod_path)
     device_formats = artwork_formats
     logger.info("ART: using formats %s", list(device_formats.keys()))
-
-    # Clean up stale ithmb files whose format IDs don't match the target
-    # device.  This prevents leftover files from a previous sync with wrong
-    # formats (e.g. Classic formats written to a Nano) from confusing the
-    # iPod firmware.
-    _cleanup_stale_ithmb_files(artwork_dir, set(device_formats.keys()))
 
     # Read reference ArtworkDB for header fields
     ref_mhfd = None
@@ -707,16 +743,8 @@ def write_artworkdb(
         formats: dict = {}
         for fmt_id in fmt_ids:
             try:
-                w, h_dim = ALL_KNOWN_FORMATS[fmt_id]
-                stride = IPOD_STRIDE_OVERRIDE.get(fmt_id, w)
-                resized = img.resize((w, h_dim), _RESAMPLE)
-                pixel_data = rgb888_to_rgb565(resized, w, h_dim, stride)
-                formats[fmt_id] = {
-                    'data': pixel_data,
-                    'width': w,
-                    'height': h_dim,
-                    'size': len(pixel_data),
-                }
+                encoded = encode_image_for_format(img, fmt_id, *device_formats[fmt_id])
+                formats[fmt_id] = encoded
             except Exception as exc:
                 logger.debug("ART: format %d conversion failed for hash %s: %s", fmt_id, h, exc)
         return h, {'formats': formats, 'src_img_size': len(art_bytes)} if formats else None
@@ -742,20 +770,48 @@ def write_artworkdb(
     # (ithmb_path, fmt_id) → sorted list of (ithmb_offset, preserve_key, size)
     _ref_by_file_fmt: dict[tuple[str, int], list] = defaultdict(list)
     _preserve_meta: dict[str, dict] = {}  # preserve_key → {fmt_id: {dims…}}
+    _preserve_fallback: dict[str, dict] = {}  # preserve_key → {refs, src_img_size}
 
     for preserve_key, existing_entry in preserved_art.items():
         fmt_meta: dict = {}
         for fmt_id, ref in existing_entry['formats'].items():
-            dims = ALL_KNOWN_FORMATS.get(fmt_id)
-            if dims:
-                w, h_dim = dims
-                fmt_meta[fmt_id] = {'width': w, 'height': h_dim, 'size': ref['size']}
-                _ref_by_file_fmt[(ref['path'], fmt_id)].append(
-                    (ref['ithmb_offset'], preserve_key, ref['size'])
+            w = max(1, int(ref.get('width', 0) or 0))
+            h_dim = max(1, int(ref.get('height', 0) or 0))
+            hpad = max(0, int(ref.get('hpad', 0) or 0))
+            vpad = max(0, int(ref.get('vpad', 0) or 0))
+            stored_w = max(1, w + hpad)
+            stored_h = max(1, h_dim + vpad)
+            expected_size = expected_size_bytes(fmt_id, stored_w, stored_h, stride_pixels=stored_w)
+            if expected_size > 0 and ref['size'] != expected_size:
+                logger.debug(
+                    "ART: skipping malformed preserved %s fmt %d (size=%d expected=%d)",
+                    preserve_key,
+                    fmt_id,
+                    ref['size'],
+                    expected_size,
                 )
+                continue
+
+            fmt_meta[fmt_id] = {
+                'width': w,
+                'height': h_dim,
+                'size': ref['size'],
+                'hpad': hpad,
+                'vpad': vpad,
+                'stride_pixels': stored_w,
+            }
+
+            _ref_by_file_fmt[(ref['path'], fmt_id)].append(
+                (ref['ithmb_offset'], preserve_key, ref['size'])
+            )
         if fmt_meta:
             _preserve_meta[preserve_key] = {
                 'fmt_meta': fmt_meta,
+                'src_img_size': existing_entry['src_img_size'],
+            }
+        elif preserve_key not in _preserve_fallback:
+            _preserve_fallback[preserve_key] = {
+                'refs': existing_entry['formats'],
                 'src_img_size': existing_entry['src_img_size'],
             }
 
@@ -785,6 +841,9 @@ def write_artworkdb(
                     'width': dims['width'],
                     'height': dims['height'],
                     'size': dims['size'],
+                    'hpad': dims.get('hpad', 0),
+                    'vpad': dims.get('vpad', 0),
+                    'stride_pixels': dims.get('stride_pixels', dims['width']),
                 }
         if formats:
             unique_converted[preserve_key] = {
@@ -792,15 +851,53 @@ def write_artworkdb(
                 'src_img_size': meta['src_img_size'],
             }
 
+    salvaged_preserved = 0
+    for preserve_key, meta in _preserve_fallback.items():
+        if preserve_key in unique_converted:
+            continue
+
+        source_img = None
+        for _fmt_id, ref in meta['refs'].items():
+            try:
+                with open(ref['path'], 'rb') as src:
+                    src.seek(ref['ithmb_offset'])
+                    pixel_bytes = src.read(ref['size'])
+                if len(pixel_bytes) != ref['size']:
+                    continue
+                source_img = _decode_preserved_frame(ref, int(_fmt_id), pixel_bytes)
+                if source_img is not None:
+                    break
+            except OSError:
+                continue
+
+        if source_img is None:
+            continue
+
+        formats = {}
+        for fmt_id in sorted(device_formats.keys()):
+            formats[fmt_id] = encode_image_for_format(source_img, fmt_id, *device_formats[fmt_id])
+
+        unique_converted[preserve_key] = {
+            'formats': formats,
+            'src_img_size': meta['src_img_size'],
+        }
+        salvaged_preserved += 1
+
+    if salvaged_preserved:
+        logger.info("ART: salvaged %d preserved artwork entries via decode/re-encode fallback", salvaged_preserved)
+
     # --- Step 2b: Create per-track ArtworkEntry objects ---
     # Each track gets its OWN MHII entry with song_id = track db_id.
     # The iPod firmware (especially Nano) checks song_id to match the
     # requesting track, so a shared MHII only works for one track.
     entries: list[ArtworkEntry] = []
     img_id = start_img_id
+    skipped_preserved = 0
 
     for db_id, h in track_art.items():
         if h not in unique_converted:
+            if isinstance(h, str) and h.startswith("__preserved_"):
+                skipped_preserved += 1
             continue
         uc = unique_converted[h]
         entry = ArtworkEntry(
@@ -818,6 +915,12 @@ def write_artworkdb(
         logger.warning("Failed to convert any album art to iPod format")
         return {}
 
+    if skipped_preserved:
+        logger.warning(
+            "ART: dropped %d preserved tracks due to incompatible/malformed existing formats",
+            skipped_preserved,
+        )
+
     logger.info(f"ART: created {len(entries)} per-track MHII entries "
                 f"from {len(unique_converted)} unique images")
 
@@ -825,17 +928,32 @@ def write_artworkdb(
     _prog(f"Artwork — writing {n_unique} image{'s' if n_unique != 1 else ''} to device")
 
     # --- Step 3: Write ithmb files ---
-    format_ids = sorted(device_formats.keys())
+    format_ids = sorted({fmt_id for entry in entries for fmt_id in entry.formats.keys()})
     # Track current offset per format (for ithmb file append position)
     ithmb_offsets = {fmt_id: 0 for fmt_id in format_ids}
     # Map entry img_id → {format_id: offset} for MHNI
     format_offsets_map = {}
-    # Track image sizes for MHIF — use stride × h × 2 to match ithmb entry size
+    # Track image sizes for MHIF (one size per format across all entries).
+    # Use observed payload sizes so preserved mixed-format databases don't get
+    # forced into current-device assumptions.
     image_sizes = {}
     for fmt_id in format_ids:
-        w, h = device_formats[fmt_id]
-        stride = IPOD_STRIDE_OVERRIDE.get(fmt_id, w)
-        image_sizes[fmt_id] = stride * h * 2
+        observed_sizes = [
+            int(entry.formats[fmt_id]['size'])
+            for entry in entries
+            if fmt_id in entry.formats and int(entry.formats[fmt_id]['size']) > 0
+        ]
+        if not observed_sizes:
+            continue
+        c = Counter(observed_sizes)
+        image_sizes[fmt_id] = c.most_common(1)[0][0]
+        if len(c) > 1:
+            logger.warning(
+                "ART: format %d has mixed payload sizes %s; using most common %d in MHIF",
+                fmt_id,
+                sorted(c.keys()),
+                image_sizes[fmt_id],
+            )
 
     # Write ithmb files to temp paths first — originals stay intact until
     # both ithmb AND ArtworkDB are fully written and verified.
@@ -935,18 +1053,26 @@ def write_artworkdb(
         pending_renames.append((ithmb_temp_paths[fmt_id], ithmb_final_paths[fmt_id]))
     pending_renames.append((artdb_temp, artdb_path))
 
+    def _post_commit_cleanup() -> None:
+        # Prune only unreferenced ithmb files after the new ArtworkDB and
+        # target ithmb files are fully committed.
+        keep_format_ids = set(format_ids)
+        _cleanup_stale_ithmb_files(artwork_dir, keep_format_ids)
+
     if defer_commit:
         logger.info(f"ART: prepared {len(art_hash_written)} unique images, "
                     f"{len(entries)} MHII entries (per-track) — commit deferred")
         return PendingArtworkWrite(
             db_id_to_art_info=db_id_to_art_info,
             _pending_renames=pending_renames,
+            _post_commit_cleanup=_post_commit_cleanup,
         )
 
     # Immediate commit (legacy behaviour)
     try:
         for temp, final in pending_renames:
             os.replace(temp, final)
+        _post_commit_cleanup()
     except Exception:
         # If any replace fails, clean up remaining temps
         for temp, _final in pending_renames:

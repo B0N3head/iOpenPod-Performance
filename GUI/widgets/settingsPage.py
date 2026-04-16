@@ -1053,12 +1053,28 @@ class SettingsPage(QWidget):
             )
         )
 
+        self.kofi_row = ActionRow(
+            "Support iOpenPod",
+            "iOpenPod is and always will be completely free and open source. "
+            "If you like it and would like to support me, it is so very appreciated.",
+            button_text="Ko-fi",
+        )
+        from GUI.glyphs import glyph_icon
+        heart_icon = glyph_icon("heart", 14, "#ff5f75")
+        if heart_icon:
+            self.kofi_row.action_btn.setIcon(heart_icon)
+        self.kofi_row.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl("https://ko-fi.com/johngibbons")
+            )
+        )
+
         return self._make_page(
             "General",
             "Appearance",
             _SettingsCard(self.theme_combo, self.high_contrast, self.accent_color, self.font_scale, self.show_art),
             "About",
-            _SettingsCard(self.version_row, self.bug_report_row),
+            _SettingsCard(self.version_row, self.bug_report_row, self.kofi_row),
         )
 
     def _build_sync_page(self) -> QScrollArea:

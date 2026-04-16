@@ -151,10 +151,21 @@ COLOR_MAP: dict[tuple[str, str, str], str] = {
 MODEL_IMAGE: dict[str, str] = {
     # ── iPod Nano 7th Gen (2012 original → iPod18) ─────────────────────
     'MD475': 'iPod18-Pink.png',
+    'MD476': 'iPod18-Yellow.png',
     'MD477': 'iPod18-Blue.png',
+    'MD478': 'iPod18-Green.png',
+    'MD479': 'iPod18-Purple.png',
     'MD480': 'iPod18-Silver.png',
+    'MD481': 'iPod18-DarkGray.png',
     'MD744': 'iPod18-Red.png',
     'ME971': 'iPod18-SpaceGray.png',
+    # ── iPod Nano 7th Gen (2015 refresh → iPod18A) ─────────────────────
+    'MKMV2': 'iPod18A-Pink.png',
+    'MKMX2': 'iPod18A-Gold.png',
+    'MKN02': 'iPod18A-Blue.png',
+    'MKN22': 'iPod18A-Silver.png',
+    'MKN52': 'iPod18A-SpaceGray.png',
+    'MKN72': 'iPod18A-Red.png',
     # ── iPod Shuffle 2nd Gen — Sept 2007 Rev A (iPod130C) ─────────────
     'MB227': 'iPod130C-Blue.png',
     'MB228': 'iPod130C-Blue.png',
@@ -285,6 +296,7 @@ IMAGE_COLORS: dict[str, tuple[int, int, int]] = {
     "ipod18-purple": (222, 152, 208),
     "ipod18-red": (216, 68, 61),
     "ipod18-yellow": (217, 218, 91),
+    "ipod18-spacegray": _GRAY,
     # ── iPod Nano 7th Gen (2015 iPod18A) ──────────────────────────────
     "ipod18a-silver": _SILVER,
     "ipod18a-spacegray": _GRAY,
