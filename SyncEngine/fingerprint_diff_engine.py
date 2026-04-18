@@ -40,6 +40,14 @@ from .audio_fingerprint import get_or_compute_fingerprint, is_fpcalc_available
 from .mapping import MappingManager, MappingFile, TrackMapping
 from .integrity import IntegrityReport
 from .transcoder import resolve_transcode_plan
+from .photos import (
+    PCPhotoLibrary,
+    PhotoEditState,
+    PhotoSyncPlan,
+    build_photo_sync_plan,
+    read_photo_db,
+    scan_pc_photos,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +209,9 @@ class SyncPlan:
     # Storage
     storage: StorageSummary = field(default_factory=StorageSummary)
 
+    # Photo sync plan
+    photo_plan: PhotoSyncPlan | None = None
+
     # When True, removal cards in sync review start checked (used by "Remove from iPod" context menu)
     removals_pre_checked: bool = False
 
@@ -218,6 +229,7 @@ class SyncPlan:
             self.playlists_to_add,
             self.playlists_to_edit,
             self.playlists_to_remove,
+            self.photo_plan and self.photo_plan.has_changes,
         ])
 
     @property
@@ -230,13 +242,26 @@ class SyncPlan:
 
     @property
     def summary(self) -> str:
+        track_add_bytes = sum(
+            (item.estimated_size if item.estimated_size is not None else (item.pc_track.size if item.pc_track else 0))
+            for item in self.to_add
+        )
+        track_remove_bytes = sum(
+            (item.ipod_track.get("size", 0) if item.ipod_track else 0)
+            for item in self.to_remove
+        )
+        track_update_bytes = sum(
+            (item.estimated_size if item.estimated_size is not None else (item.pc_track.size if item.pc_track else 0))
+            for item in self.to_update_file
+        )
+
         lines = []
         if self.to_add:
-            lines.append(f"  📥 {len(self.to_add)} tracks to add ({_fmt_bytes(self.storage.bytes_to_add)})")
+            lines.append(f"  📥 {len(self.to_add)} tracks to add ({_fmt_bytes(track_add_bytes)})")
         if self.to_remove:
-            lines.append(f"  🗑️  {len(self.to_remove)} tracks to remove ({_fmt_bytes(self.storage.bytes_to_remove)})")
+            lines.append(f"  🗑️  {len(self.to_remove)} tracks to remove ({_fmt_bytes(track_remove_bytes)})")
         if self.to_update_file:
-            lines.append(f"  🔄 {len(self.to_update_file)} tracks to re-sync ({_fmt_bytes(self.storage.bytes_to_update)})")
+            lines.append(f"  🔄 {len(self.to_update_file)} tracks to re-sync ({_fmt_bytes(track_update_bytes)})")
         if self.to_update_metadata:
             lines.append(f"  📝 {len(self.to_update_metadata)} tracks with metadata updates")
         if self.to_update_artwork:
@@ -253,6 +278,15 @@ class SyncPlan:
             lines.append(f"  📝 {len(self.playlists_to_edit)} playlists to update")
         if self.playlists_to_remove:
             lines.append(f"  🗑️  {len(self.playlists_to_remove)} playlists to remove")
+        if self.photo_plan:
+            if self.photo_plan.photos_to_add:
+                lines.append(f"  🖼️  {len(self.photo_plan.photos_to_add)} photos to add")
+            if self.photo_plan.photos_to_remove:
+                lines.append(f"  🗑️  {len(self.photo_plan.photos_to_remove)} photos to remove")
+            if self.photo_plan.albums_to_add:
+                lines.append(f"  📚 {len(self.photo_plan.albums_to_add)} photo albums to add")
+            if self.photo_plan.albums_to_remove:
+                lines.append(f"  🗂️  {len(self.photo_plan.albums_to_remove)} photo albums to remove")
         if self.duplicates:
             lines.append(f"  ⚠️  {len(self.duplicates)} duplicate groups ({self.duplicate_count} extra files skipped)")
         if self.unresolved_collisions:
@@ -378,6 +412,7 @@ class FingerprintDiffEngine:
         is_cancelled: Optional[Callable[[], bool]] = None,
         *,
         track_edits: Optional[dict[int, dict[str, tuple]]] = None,
+        photo_edits: Optional[PhotoEditState] = None,
         sync_workers: int = 0,
         rating_strategy: str = "ipod_wins",
         allowed_paths: Optional[frozenset[str]] = None,
@@ -1004,6 +1039,34 @@ class FingerprintDiffEngine:
 
         # Attach the mapping so the executor can reuse it instead of
         # loading from disk a second time.
+        try:
+            device_photos = read_photo_db(self.ipod_path)
+            if allowed_paths is None:
+                if progress_callback:
+                    progress_callback("scan_photos", 0, 0, "Scanning photos...")
+                pc_photos = scan_pc_photos(self.pc_library.root_path)
+                plan.photo_plan = build_photo_sync_plan(
+                    pc_photos,
+                    device_photos,
+                    photo_edits,
+                    ipod_path=self.ipod_path,
+                )
+            elif photo_edits and photo_edits.has_changes:
+                plan.photo_plan = build_photo_sync_plan(
+                    PCPhotoLibrary(sync_root=str(self.pc_library.root_path)),
+                    device_photos,
+                    photo_edits,
+                    ipod_path=self.ipod_path,
+                )
+        except Exception as exc:
+            logger.warning("Photo sync planning failed: %s", exc)
+
+        if plan.photo_plan is not None:
+            # Include photo transfer deltas in the shared storage estimate so
+            # preflight checks and sync-review +/- totals reflect full sync cost.
+            plan.storage.bytes_to_add += plan.photo_plan.thumb_bytes_to_add
+            plan.storage.bytes_to_remove += plan.photo_plan.thumb_bytes_to_remove
+
         plan.mapping = mapping
 
         return plan

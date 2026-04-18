@@ -860,7 +860,6 @@ class SettingsPage(QWidget):
 
         # ── Content stack ───────────────────────────────────────────────────
         self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background: transparent;")
         self._stack.addWidget(self._build_general_page())      # 0
         self._stack.addWidget(self._build_sync_page())          # 1
         self._stack.addWidget(self._build_transcoding_page())   # 2
@@ -948,8 +947,7 @@ class SettingsPage(QWidget):
           - ``str``  → rendered as a small uppercase section header
           - ``QWidget`` → added directly (usually a _SettingsCard)
         """
-        scroll = make_scroll_area(extra_css="QScrollArea > QWidget > QWidget { background: transparent; }"
-                                  )
+        scroll = make_scroll_area()
 
         content = QWidget()
         content.setStyleSheet("background: transparent;")
@@ -1095,6 +1093,17 @@ class SettingsPage(QWidget):
             "and sync to iPod. Sound Check values are always synced to iPod "
             "regardless of this setting.",
         )
+        self.rotate_tall_photos = ToggleRow(
+            "Rotate Tall Photos on Device",
+            "For portrait-heavy photos, rotate the device viewing caches "
+            "clockwise when that uses more of the iPod's landscape photo "
+            "screen. The original PC files are not modified.",
+        )
+        self.fit_photo_thumbnails = ToggleRow(
+            "Fit Thumbnails",
+            "Use aspect-fit for device photo thumbnail formats. "
+            "When off (default), thumbnails use iTunes-style crop-to-fill.",
+        )
         self.rating_strategy = ComboRow(
             "Rating Conflict Strategy",
             "How to resolve rating conflicts when iPod and PC ratings differ. "
@@ -1111,6 +1120,8 @@ class SettingsPage(QWidget):
                 self.media_folder,
                 self.write_back,
                 self.compute_sound_check,
+                self.rotate_tall_photos,
+                self.fit_photo_thumbnails,
                 self.rating_strategy,
             ),
         )
@@ -1392,6 +1403,8 @@ class SettingsPage(QWidget):
         self.media_folder.value = s.media_folder
         self.write_back.value = s.write_back_to_pc
         self.compute_sound_check.value = s.compute_sound_check
+        self.rotate_tall_photos.value = s.rotate_tall_photos_for_device
+        self.fit_photo_thumbnails.value = s.fit_photo_thumbnails
 
         # Rating conflict strategy
         strategy_display = {
@@ -1555,6 +1568,8 @@ class SettingsPage(QWidget):
             self.media_folder.changed.connect(self._save)
             self.write_back.changed.connect(self._save)
             self.compute_sound_check.changed.connect(self._save)
+            self.rotate_tall_photos.changed.connect(self._save)
+            self.fit_photo_thumbnails.changed.connect(self._save)
             self.rating_strategy.changed.connect(self._save)
             self.aac_encoder.changed.connect(self._save)
             self.aac_quality_simple.changed.connect(self._save)
@@ -1717,6 +1732,8 @@ class SettingsPage(QWidget):
         s.media_folder = self.media_folder.value
         s.write_back_to_pc = self.write_back.value
         s.compute_sound_check = self.compute_sound_check.value
+        s.rotate_tall_photos_for_device = self.rotate_tall_photos.value
+        s.fit_photo_thumbnails = self.fit_photo_thumbnails.value
 
         # Rating conflict strategy
         strategy_keys = {
@@ -1859,11 +1876,11 @@ class SettingsPage(QWidget):
     def _current_ipod_image() -> str:
         """Return the image filename for the currently connected iPod, or ''."""
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
             if not dev:
                 return ""
-            from ipod_models import image_for_model, resolve_image_filename
+            from ipod_device import image_for_model, resolve_image_filename
             if dev.model_number:
                 img = image_for_model(dev.model_number)
                 if img:

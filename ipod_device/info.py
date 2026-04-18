@@ -15,7 +15,7 @@ Typical flow
 
 For headless (non-GUI) use::
 
-    from device_info import DeviceInfo, set_current_device, enrich
+    from ipod_device import DeviceInfo, set_current_device, enrich
     info = DeviceInfo(path="/media/ipod")
     enrich(info)            # reads SysInfo once, computes everything
     set_current_device(info)
@@ -341,7 +341,7 @@ def detect_checksum_type(ipod_path: str):
     """Detect which checksum type an iPod requires.
 
     Reads from the centralised store first; falls back to SysInfo probing.
-    Returns a :class:`ipod_models.ChecksumType` enum value.
+    Returns a :class:`ipod_device.ChecksumType` enum value.
     """
     from .checksum import ChecksumType
     from .capabilities import checksum_type_for_family_gen
@@ -1125,7 +1125,7 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
 def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
     """Query iPod firmware via USB SCSI VPD pages for device identification.
 
-    Delegates to :func:`ipod_usb_query.identify_via_vpd` which handles all
+    Delegates to :func:`ipod_device.vpd_libusb.identify_via_vpd` which handles all
     platforms (IOKit on macOS, pyusb on Linux/Windows), resolves the exact
     model via serial-last-3 lookup, and handles post-query remount on
     Linux/macOS.
@@ -1136,7 +1136,7 @@ def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
     try:
         from .vpd_libusb import identify_via_vpd
     except ImportError:
-        logger.debug("enrich: ipod_usb_query not available")
+        logger.debug("enrich: ipod_device.vpd_libusb not available")
         return
 
     result = identify_via_vpd(

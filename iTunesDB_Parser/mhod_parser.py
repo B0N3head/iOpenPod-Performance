@@ -556,7 +556,11 @@ def _parse_chapter_data(
         result["chapters"] = []
         return result
 
-    _sean_size = _UINT32_BE.unpack_from(data, seek)[0]  # noqa: F841
+    sean_size = _UINT32_BE.unpack_from(data, seek)[0]
+    if sean_size < 20 or seek + sean_size > end:
+        logger.warning("Chapter data: invalid 'sean' atom size: %d", sean_size)
+        result["chapters"] = []
+        return result
     sean_magic = data[seek + 4:seek + 8]
     if sean_magic != defs.SEAN_ATOM:
         logger.warning("Chapter data: expected 'sean' atom, got %r", sean_magic)

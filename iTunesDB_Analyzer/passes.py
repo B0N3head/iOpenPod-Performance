@@ -65,8 +65,6 @@ def pass_a_unknown_mapping(dbs: list[ParsedDatabase], hdb: HypothesisDB) -> None
                 db_version=db.db_version,
             ))
 
-    file_count = len(dbs)
-
     for (ct, off, length), obs_list in sorted(clusters.items()):
         # Frequency = fraction of chunks of this type that contain this unknown.
         total_chunks = sum(

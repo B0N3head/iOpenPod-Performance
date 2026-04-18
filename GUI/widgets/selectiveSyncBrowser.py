@@ -12,13 +12,16 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtGui import QFont, QCursor, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -38,12 +41,17 @@ from ..styles import (
 )
 from .MBGridView import MusicBrowserGrid
 from .MBGridViewItem import MusicBrowserGridItem
+from .browserChrome import style_browser_splitter
 from .formatters import format_duration_human, format_size
+from .gridHeaderBar import GridHeaderBar
+from .photoTile import PhotoGridTile
+from .photoViewer import PhotoViewerPane
 
 from ArtworkDB_Writer.art_extractor import (
     extract_art,
     find_folder_art,
 )
+from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +104,7 @@ def _extract_art_for_group(file_paths: list[str]) -> tuple | None:
 
 class _PCLibScanWorker(QThread):
     """Scan a folder with PCLibrary and emit the track list."""
-    finished = pyqtSignal(object)  # list[PCTrack]
+    finished = pyqtSignal(object)  # {"tracks": list[PCTrack], "photos": PCPhotoLibrary}
     error = pyqtSignal(str)
 
     def __init__(self, folder: str, include_video: bool = True):
@@ -109,7 +117,8 @@ class _PCLibScanWorker(QThread):
             from SyncEngine.pc_library import PCLibrary
             lib = PCLibrary(self._folder)
             tracks = list(lib.scan(include_video=self._include_video))
-            self.finished.emit(tracks)
+            photos = scan_pc_photos(self._folder)
+            self.finished.emit({"tracks": tracks, "photos": photos})
         except Exception as e:
             self.error.emit(str(e))
 
@@ -733,6 +742,246 @@ class PCTrackListView(QWidget):
         t.blockSignals(False)
 
 
+# ── Photo list with checkboxes ──────────────────────────────────────────────
+
+
+class PCPhotoListView(QWidget):
+    """Icon-grid photo picker for selective sync."""
+
+    toggled = pyqtSignal(str, bool)  # (path, checked)
+    select_all_requested = pyqtSignal()
+    deselect_all_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._photos: list[PCPhoto] = []
+        self._selection: dict[str, bool] = {}
+        self._photo_lookup: dict[str, PCPhoto] = {}
+        self._search_query = ""
+        self._sort_key = "title"
+        self._sort_reverse = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        style_browser_splitter(body_splitter)
+
+        list_panel = QWidget()
+        list_lay = QVBoxLayout(list_panel)
+        list_lay.setContentsMargins(0, 0, 0, 0)
+        list_lay.setSpacing(0)
+
+        self._grid_header = GridHeaderBar()
+        self._grid_header.setCategory("Photos")
+        self._grid_header.sort_changed.connect(self._on_sort_changed)
+        self._grid_header.search_changed.connect(self._on_search_changed)
+        list_lay.addWidget(self._grid_header)
+
+        self._list = QListWidget()
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.setViewMode(QListWidget.ViewMode.IconMode)
+        self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._list.setMovement(QListWidget.Movement.Static)
+        self._list.setSpacing(14)
+        self._list.setIconSize(QSize(132, 132))
+        self._list.setGridSize(QSize(196, 232))
+        self._list.setWordWrap(True)
+        self._list.setSelectionRectVisible(False)
+        self._list.setStyleSheet(f"""
+            QListWidget {{
+                background: transparent;
+                border: none;
+                color: {Colors.TEXT_PRIMARY};
+                padding: 0px;
+            }}
+            QListWidget::item {{
+                padding: 0px;
+                margin: 0px;
+                border: none;
+                background: transparent;
+            }}
+            QListWidget::item:selected {{
+                background: transparent;
+                border: none;
+            }}
+        """)
+        self._list.currentRowChanged.connect(self._on_current_photo_changed)
+        self._list.itemSelectionChanged.connect(self._sync_tile_states)
+        list_lay.addWidget(self._list, 1)
+        body_splitter.addWidget(list_panel)
+
+        self._viewer = PhotoViewerPane(
+            heading="",
+            empty_title="No photo selected",
+            empty_summary="Select a photo from the sync browser to preview it here.",
+        )
+        body_splitter.addWidget(self._viewer)
+        body_splitter.setSizes([680, 360])
+        layout.addWidget(body_splitter, 1)
+
+    def setPhotos(self, photos: list[PCPhoto], selection: dict[str, bool]):
+        self._photos = photos
+        self._selection = selection
+        self._photo_lookup = {photo.source_path: photo for photo in photos}
+        self._search_query = ""
+        self._sort_key = "title"
+        self._sort_reverse = False
+        self._grid_header.blockSignals(True)
+        self._grid_header.resetState()
+        self._grid_header.blockSignals(False)
+        self._refresh_list()
+
+    def _matches_search(self, photo: PCPhoto) -> bool:
+        if not self._search_query:
+            return True
+        haystack = " ".join(
+            part for part in (
+                photo.display_name,
+                photo.source_path,
+                " ".join(sorted(name for name in photo.album_names if name)),
+            ) if part
+        ).lower()
+        return self._search_query in haystack
+
+    def _sort_photos(self, photos: list[PCPhoto]) -> list[PCPhoto]:
+        if self._sort_key == "size":
+            key_fn = self._photo_size_sort_key
+        elif self._sort_key == "album_count":
+            key_fn = self._photo_album_count_sort_key
+        else:
+            key_fn = self._photo_title_sort_key
+        return sorted(photos, key=key_fn, reverse=self._sort_reverse)
+
+    def _photo_sort_label(self, photo: PCPhoto) -> str:
+        return (photo.display_name or photo.source_path).lower()
+
+    def _photo_size_sort_key(self, photo: PCPhoto) -> tuple[int, str]:
+        return photo.size, self._photo_sort_label(photo)
+
+    def _photo_album_count_sort_key(self, photo: PCPhoto) -> tuple[int, str]:
+        return len(photo.album_names), self._photo_sort_label(photo)
+
+    def _photo_title_sort_key(self, photo: PCPhoto) -> tuple[str, int]:
+        return self._photo_sort_label(photo), photo.size
+
+    def _refresh_list(self) -> None:
+        current_item = self._list.currentItem()
+        current_path = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+
+        self._list.blockSignals(True)
+        self._list.clear()
+        visible_photos = self._sort_photos([photo for photo in self._photos if self._matches_search(photo)])
+        target_row = -1
+        for row, photo in enumerate(visible_photos):
+            title = photo.display_name or photo.source_path
+            checked = self._selection.get(photo.source_path, True)
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(Metrics.GRID_ITEM_W, Metrics.GRID_ITEM_H))
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setData(Qt.ItemDataRole.UserRole, photo.source_path)
+            item.setData(Qt.ItemDataRole.UserRole + 1, checked)
+            pixmap = QPixmap(photo.source_path)
+            self._list.addItem(item)
+            tile = PhotoGridTile(title, checkable=True)
+            tile.setPixmap(pixmap)
+            tile.setChecked(checked)
+            tile.clicked.connect(lambda _=False, row_item=item: self._list.setCurrentItem(row_item))
+            tile.checked_changed.connect(lambda checked, row_item=item: self._set_photo_item_checked(row_item, checked))
+            self._list.setItemWidget(item, tile)
+            if current_path and photo.source_path == current_path:
+                target_row = row
+        self._list.blockSignals(False)
+        if self._list.count():
+            self._list.setCurrentRow(target_row if target_row >= 0 else 0)
+            self._sync_tile_states()
+        else:
+            self._viewer.clearPreview(
+                title="No photos found",
+                summary="Add photos to this folder to preview them here.",
+            )
+
+    def _on_sort_changed(self, key: str, reverse: bool):
+        self._sort_key = key
+        self._sort_reverse = reverse
+        self._refresh_list()
+
+    def _on_search_changed(self, query: str):
+        self._search_query = query.strip().lower()
+        self._refresh_list()
+
+    def setAllChecked(self, checked: bool):
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            if item is not None:
+                self._set_photo_item_checked(item, checked, emit_signal=False)
+        self._sync_tile_states()
+
+    def _on_current_photo_changed(self, row: int):
+        if row < 0:
+            self._viewer.clearPreview()
+            self._sync_tile_states()
+            return
+        item = self._list.item(row)
+        if item is None:
+            self._viewer.clearPreview()
+            self._sync_tile_states()
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        photo = self._photo_lookup.get(path or "")
+        if photo is None:
+            self._viewer.clearPreview()
+            self._sync_tile_states()
+            return
+
+        pixmap = QPixmap(photo.source_path)
+        album_names = sorted(name for name in photo.album_names if name)
+        summary_parts = [", ".join(album_names) if album_names else "All Photos"]
+        if photo.size:
+            summary_parts.append(format_size(photo.size))
+        meta_lines = [photo.source_path] if photo.source_path else []
+        self._viewer.setPhoto(
+            title=photo.display_name or photo.source_path,
+            pixmap=pixmap,
+            summary=" · ".join(part for part in summary_parts if part),
+            meta_lines=meta_lines,
+        )
+        self._sync_tile_states()
+
+    def _is_photo_item_checked(self, item: QListWidgetItem) -> bool:
+        return bool(item.data(Qt.ItemDataRole.UserRole + 1))
+
+    def _set_photo_item_checked(
+        self,
+        item: QListWidgetItem,
+        checked: bool,
+        emit_signal: bool = True,
+    ):
+        prior = self._is_photo_item_checked(item)
+        item.setData(Qt.ItemDataRole.UserRole + 1, checked)
+        tile = self._list.itemWidget(item)
+        if isinstance(tile, PhotoGridTile):
+            tile.setChecked(checked)
+        if emit_signal and prior != checked:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path:
+                self.toggled.emit(path, checked)
+
+    def _sync_tile_states(self):
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            if item is None:
+                continue
+            tile = self._list.itemWidget(item)
+            if isinstance(tile, PhotoGridTile):
+                tile.setSelected(item.isSelected())
+                tile.setChecked(self._is_photo_item_checked(item))
+
+
 # ── Main browser widget ─────────────────────────────────────────────────────
 
 _CATEGORY_GLYPHS = {
@@ -740,6 +989,7 @@ _CATEGORY_GLYPHS = {
     "Artists": "user",
     "Genres": "grid",
     "All Tracks": "music",
+    "Photos": "photo",
     "Podcasts": "broadcast",
     "Audiobooks": "book",
     "TV Shows": "monitor",
@@ -752,7 +1002,7 @@ _GRID_MODES = {"Albums", "Artists", "Genres", "Podcasts", "Audiobooks",
                "TV Shows", "Music Videos"}
 
 # Modes that go straight to the track list with no grouping.
-_LIST_MODES = {"All Tracks", "Movies"}
+_LIST_MODES = {"All Tracks", "Movies", "Photos"}
 
 
 class SelectiveSyncBrowser(QWidget):
@@ -764,9 +1014,12 @@ class SelectiveSyncBrowser(QWidget):
         super().__init__(parent)
         self._folder = ""
         self._all_tracks: list = []
+        self._photo_library = PCPhotoLibrary(sync_root="")
+        self._all_photos: list[PCPhoto] = []
         self._groups: dict[str, dict[str, dict]] = {}  # mode -> groups
         self._buckets: dict[str, list] = {}  # media_type -> tracks
-        self._selected: dict[str, bool] = {}
+        self._selected_tracks: dict[str, bool] = {}
+        self._selected_photos: dict[str, bool] = {}
         self._current_mode = "Albums"
         self._current_group: str | None = None
         self._current_group_tracks: list = []
@@ -849,6 +1102,7 @@ class SelectiveSyncBrowser(QWidget):
 
         _ordered_cats = [
             "Albums", "Artists", "Genres", "All Tracks",
+            "Photos",
             "__sep_media__",
             "Podcasts", "Audiobooks",
             "__sep_video__",
@@ -947,6 +1201,13 @@ class SelectiveSyncBrowser(QWidget):
         self._track_list.deselect_all_requested.connect(self._on_group_deselect_all)
         self._content.addWidget(self._track_list)  # index 2
 
+        # Page 3: photo picker
+        self._photo_list = PCPhotoListView()
+        self._photo_list.toggled.connect(self._on_photo_toggled)
+        self._photo_list.select_all_requested.connect(self._on_select_all_photos)
+        self._photo_list.deselect_all_requested.connect(self._on_deselect_all_photos)
+        self._content.addWidget(self._photo_list)  # index 3
+
         body_lay.addWidget(self._content, 1)
         root.addWidget(body, 1)
 
@@ -1016,9 +1277,12 @@ class SelectiveSyncBrowser(QWidget):
         """Start scanning *folder* and prepare the browser."""
         self._folder = folder
         self._all_tracks = []
+        self._photo_library = PCPhotoLibrary(sync_root=folder)
+        self._all_photos = []
         self._groups.clear()
         self._buckets.clear()
-        self._selected.clear()
+        self._selected_tracks.clear()
+        self._selected_photos.clear()
         self._current_mode = "Albums"
         self._grid_loaded.clear()
         self._current_group = None
@@ -1047,19 +1311,29 @@ class SelectiveSyncBrowser(QWidget):
     # ── Scan callbacks ───────────────────────────────────────────────────
 
     def _on_scan_complete(self, tracks: list):
-        self._all_tracks = tracks
-        self._selected = {t.path: True for t in tracks}
+        if isinstance(tracks, dict):
+            self._all_tracks = list(tracks.get("tracks", []))
+            self._photo_library = tracks.get("photos") or PCPhotoLibrary(sync_root=self._folder)
+        else:
+            self._all_tracks = list(tracks)
+            self._photo_library = PCPhotoLibrary(sync_root=self._folder)
+        self._all_photos = sorted(
+            self._photo_library.photos.values(),
+            key=lambda photo: (photo.display_name or photo.source_path).lower(),
+        )
+        self._selected_tracks = {t.path: True for t in self._all_tracks}
+        self._selected_photos = {photo.source_path: True for photo in self._all_photos}
         self._build_groups()
         self._apply_sidebar_visibility()
         # Pick the first mode that actually has content.
-        for mode in ("Albums", "Artists", "Genres", "All Tracks",
+        for mode in ("Albums", "Artists", "Genres", "All Tracks", "Photos",
                      "Podcasts", "Audiobooks",
                      "TV Shows", "Movies", "Music Videos"):
             if self._mode_has_content(mode):
                 self._show_mode(mode)
                 return
         # Nothing to show — leave loading label.
-        self._loading_label.setText("No media found in this folder.")
+        self._loading_label.setText("No music or photos found in this folder.")
 
     def _on_scan_error(self, msg: str):
         self._loading_label.setText(f"Scan failed: {msg}")
@@ -1328,6 +1602,8 @@ class SelectiveSyncBrowser(QWidget):
     def _mode_has_content(self, mode: str) -> bool:
         if mode == "All Tracks":
             return bool(self._buckets.get("music"))
+        if mode == "Photos":
+            return bool(self._all_photos)
         if mode == "Movies":
             return bool(self._buckets.get("movie"))
         return bool(self._groups.get(mode))
@@ -1346,7 +1622,7 @@ class SelectiveSyncBrowser(QWidget):
             btn.setVisible(has[cat])
 
         music_section = any(has[c] for c in
-                            ("Albums", "Artists", "Genres", "All Tracks"))
+                            ("Albums", "Artists", "Genres", "All Tracks", "Photos"))
         non_music = any(has[c] for c in (
             "Podcasts", "Audiobooks", "TV Shows", "Movies", "Music Videos"
         ))
@@ -1376,34 +1652,39 @@ class SelectiveSyncBrowser(QWidget):
 
         if mode in _LIST_MODES:
             # Direct track list — no grouping, no grid.
-            if mode == "All Tracks":
-                tracks = self._buckets.get("music", [])
-                title = "All Tracks"
-                noun = ("track", "tracks")
+            if mode == "Photos":
+                self._current_group = mode
+                self._current_group_tracks = []
+                self._photo_list.setPhotos(self._all_photos, self._selected_photos)
+                self._content.setCurrentIndex(3)
             else:  # Movies
-                tracks = self._buckets.get("movie", [])
-                title = "Movies"
-                noun = ("movie", "movies")
-
-            self._current_group = mode
-            self._current_group_tracks = tracks
-            self._track_list.setTitle(title)
-            n = len(tracks)
-            self._track_list.setSubtitle(
-                f"{n} {noun[0] if n == 1 else noun[1]}"
-            )
-            total_ms = sum(getattr(t, "duration_ms", 0) or 0 for t in tracks)
-            total_bytes = sum(getattr(t, "size", 0) or 0 for t in tracks)
-            meta_parts = []
-            if total_ms:
-                meta_parts.append(format_duration_human(total_ms))
-            if total_bytes:
-                meta_parts.append(format_size(total_bytes))
-            self._track_list.setMeta(" \u00b7 ".join(meta_parts))
-            self._track_list.setHeroVisible(False)
-            self._track_list.setBackVisible(False)
-            self._track_list.setTracks(tracks, self._selected)
-            self._content.setCurrentIndex(2)
+                if mode == "All Tracks":
+                    tracks = self._buckets.get("music", [])
+                    title = "All Tracks"
+                    noun = ("track", "tracks")
+                else:
+                    tracks = self._buckets.get("movie", [])
+                    title = "Movies"
+                    noun = ("movie", "movies")
+                self._current_group = mode
+                self._current_group_tracks = tracks
+                self._track_list.setTitle(title)
+                n = len(tracks)
+                self._track_list.setSubtitle(
+                    f"{n} {noun[0] if n == 1 else noun[1]}"
+                )
+                total_ms = sum(getattr(t, "duration_ms", 0) or 0 for t in tracks)
+                total_bytes = sum(getattr(t, "size", 0) or 0 for t in tracks)
+                meta_parts = []
+                if total_ms:
+                    meta_parts.append(format_duration_human(total_ms))
+                if total_bytes:
+                    meta_parts.append(format_size(total_bytes))
+                self._track_list.setMeta(" \u00b7 ".join(meta_parts))
+                self._track_list.setHeroVisible(False)
+                self._track_list.setBackVisible(False)
+                self._track_list.setTracks(tracks, self._selected_tracks)
+                self._content.setCurrentIndex(2)
         else:
             grid = self._grids.get(mode)
             if grid and mode not in self._grid_loaded:
@@ -1505,7 +1786,7 @@ class SelectiveSyncBrowser(QWidget):
 
         self._track_list.setHeroVisible(True)
         self._track_list.setBackVisible(True)
-        self._track_list.setTracks(tracks, self._selected)
+        self._track_list.setTracks(tracks, self._selected_tracks)
         self._content.setCurrentIndex(2)
 
     def _on_track_back(self):
@@ -1517,53 +1798,96 @@ class SelectiveSyncBrowser(QWidget):
     # ── Checkbox toggling ────────────────────────────────────────────────
 
     def _on_track_toggled(self, path: str, checked: bool):
-        self._selected[path] = checked
+        self._selected_tracks[path] = checked
         self._update_footer()
 
     def _on_select_all(self):
-        for path in self._selected:
-            self._selected[path] = True
+        for path in self._selected_tracks:
+            self._selected_tracks[path] = True
+        for path in self._selected_photos:
+            self._selected_photos[path] = True
         # Refresh track list if visible
         if self._content.currentIndex() == 2:
             self._track_list.setAllChecked(True)
+        if self._content.currentIndex() == 3:
+            self._photo_list.setAllChecked(True)
         self._update_footer()
 
     def _on_deselect_all(self):
-        for path in self._selected:
-            self._selected[path] = False
+        for path in self._selected_tracks:
+            self._selected_tracks[path] = False
+        for path in self._selected_photos:
+            self._selected_photos[path] = False
         if self._content.currentIndex() == 2:
             self._track_list.setAllChecked(False)
+        if self._content.currentIndex() == 3:
+            self._photo_list.setAllChecked(False)
         self._update_footer()
 
     def _on_group_select_all(self):
         """Select all tracks in the current drilled-in group."""
         for t in self._current_group_tracks:
-            self._selected[t.path] = True
+            self._selected_tracks[t.path] = True
         self._track_list.setAllChecked(True)
         self._update_footer()
 
     def _on_group_deselect_all(self):
         """Deselect all tracks in the current drilled-in group."""
         for t in self._current_group_tracks:
-            self._selected[t.path] = False
+            self._selected_tracks[t.path] = False
         self._track_list.setAllChecked(False)
+        self._update_footer()
+
+    def _on_photo_toggled(self, path: str, checked: bool):
+        self._selected_photos[path] = checked
+        self._update_footer()
+
+    def _on_select_all_photos(self):
+        for path in self._selected_photos:
+            self._selected_photos[path] = True
+        self._photo_list.setAllChecked(True)
+        self._update_footer()
+
+    def _on_deselect_all_photos(self):
+        for path in self._selected_photos:
+            self._selected_photos[path] = False
+        self._photo_list.setAllChecked(False)
         self._update_footer()
 
     # ── Footer ───────────────────────────────────────────────────────────
 
     def _update_footer(self):
-        total = len(self._selected)
-        checked = sum(1 for v in self._selected.values() if v)
-        self._count_label.setText(
-            f"{checked} of {total} tracks selected" if total else "No tracks found"
-        )
-        self._done_btn.setEnabled(checked > 0)
+        total_tracks = len(self._selected_tracks)
+        checked_tracks = sum(1 for v in self._selected_tracks.values() if v)
+        total_photos = len(self._selected_photos)
+        checked_photos = sum(1 for v in self._selected_photos.values() if v)
+        parts: list[str] = []
+        if total_tracks:
+            parts.append(f"{checked_tracks} of {total_tracks} tracks selected")
+        if total_photos:
+            parts.append(f"{checked_photos} of {total_photos} photos selected")
+        self._count_label.setText(" · ".join(parts) if parts else "No music or photos found")
+        self._done_btn.setEnabled((checked_tracks + checked_photos) > 0)
 
     # ── Done / Cancel ────────────────────────────────────────────────────
 
     def _on_done(self):
-        paths = frozenset(p for p, v in self._selected.items() if v)
-        self.selection_done.emit(self._folder, paths)
+        selected_track_paths = frozenset(
+            path for path, checked in self._selected_tracks.items() if checked
+        )
+        selected_photo_imports: list[tuple[str, str]] = []
+        for photo in self._all_photos:
+            if not self._selected_photos.get(photo.source_path, False):
+                continue
+            album_names = sorted(name for name in photo.album_names if name)
+            if album_names:
+                selected_photo_imports.extend((photo.source_path, album_name) for album_name in album_names)
+            else:
+                selected_photo_imports.append((photo.source_path, ""))
+        self.selection_done.emit(self._folder, {
+            "tracks": selected_track_paths,
+            "photos": tuple(selected_photo_imports),
+        })
 
     def _on_cancel(self):
         self._cleanup_scan_worker()

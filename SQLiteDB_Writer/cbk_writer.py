@@ -20,7 +20,7 @@ import hashlib
 import logging
 import os
 
-from ipod_models import ChecksumType
+from ipod_device import ChecksumType
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ def write_locations_cbk(
         # Try centralized store first
         hash_info = None
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
             if dev and dev.hash_info_iv and dev.hash_info_rndpart:
                 hash_info = HashInfo(
@@ -129,7 +129,7 @@ def write_locations_cbk(
         # Fallback: extract from existing iTunesCDB on device
         if hash_info is None and ipod_path:
             try:
-                from device_info import resolve_itdb_path
+                from ipod_device import resolve_itdb_path
                 itdb_path = resolve_itdb_path(ipod_path)
                 if itdb_path:
                     with open(itdb_path, "rb") as f:

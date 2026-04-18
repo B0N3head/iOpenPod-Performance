@@ -13,7 +13,7 @@ import logging
 from typing import Callable
 
 from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent
+from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from .formatters import format_size, format_duration_mmss
+from ..glyphs import glyph_icon
 from ..hidpi import scale_pixmap_for_display
 from ..styles import Colors, FONT_FAMILY, Metrics, table_css
 
@@ -40,8 +42,6 @@ del _sys
 # =============================================================================
 # Formatters - Shared formatters + local display-specific ones
 # =============================================================================
-
-from .formatters import format_size, format_duration_mmss  # noqa: E402
 
 
 def format_duration(ms: int) -> str:
@@ -634,6 +634,7 @@ class MusicBrowserList(QFrame):
 
         # Shared resources (created once, reused)
         self._font = QFont(FONT_FAMILY, Metrics.FONT_MD)
+        self._advisory_icon_cache: dict[tuple[int, int], QIcon] = {}
 
         # Column visibility state: keys the user has explicitly hidden
         self._hidden_columns: set[str] = set()
@@ -1235,6 +1236,8 @@ class MusicBrowserList(QFrame):
 
             if key == "rating" and display:
                 item.setForeground(QColor(Colors.STAR))
+            if key == "explicit_flag":
+                self._apply_explicit_cell_visuals(item, raw_value)
             if key in NUMERIC_COLUMNS:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
@@ -1453,6 +1456,91 @@ class MusicBrowserList(QFrame):
     # -------------------------------------------------------------------------
     # Internal - Helpers
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_explicit_flag(value) -> int:
+        """Normalize advisory values to iPod semantics (0/1/2)."""
+        try:
+            iv = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return iv if iv in (1, 2) else 0
+
+    def _advisory_badge_icon(self, flag: int, size: int = 14) -> QIcon | None:
+        """Create a compact badge icon for explicit/clean advisory values."""
+        if flag not in (1, 2):
+            return None
+
+        cache_key = (flag, size)
+        cached = self._advisory_icon_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if flag == 1:
+            svg_name = "advisory-explicit"
+            svg_color = Colors.DANGER
+        else:
+            svg_name = "advisory-clean"
+            svg_color = Colors.SUCCESS
+
+        svg_icon = glyph_icon(svg_name, size, color=svg_color)
+        if svg_icon is not None:
+            self._advisory_icon_cache[cache_key] = svg_icon
+            return svg_icon
+
+        if flag == 1:
+            bg = QColor(Colors.DANGER)
+            border = QColor(Colors.DANGER_BORDER)
+            glyph = "E"
+        else:
+            bg = QColor(Colors.SUCCESS)
+            border = QColor(Colors.SUCCESS_BORDER)
+            glyph = "C"
+
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = px.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(border)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 4, 4)
+
+        font = QFont(FONT_FAMILY, max(7, size - 6), QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(Colors.TEXT_ON_ACCENT))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.end()
+
+        icon = QIcon(px)
+        self._advisory_icon_cache[cache_key] = icon
+        return icon
+
+    def _apply_explicit_cell_visuals(self, cell: QTableWidgetItem, raw_value) -> None:
+        """Apply badge icon + semantic color for the explicit column."""
+        flag = self._coerce_explicit_flag(raw_value)
+        cell.setIcon(QIcon())
+        cell.setToolTip("")
+
+        if flag == 1:
+            icon = self._advisory_badge_icon(1)
+            if icon is not None:
+                cell.setIcon(icon)
+            cell.setForeground(QColor(Colors.DANGER))
+            cell.setToolTip("Content Advisory: Explicit")
+            return
+
+        if flag == 2:
+            icon = self._advisory_badge_icon(2)
+            if icon is not None:
+                cell.setIcon(icon)
+            cell.setForeground(QColor(Colors.SUCCESS))
+            cell.setToolTip("Content Advisory: Clean")
+            return
+
+        cell.setForeground(QColor(Colors.TEXT_TERTIARY))
 
     def _update_status(self) -> None:
         """Update the status label with track count info."""
@@ -2099,6 +2187,9 @@ class MusicBrowserList(QFrame):
         menu.addSeparator()
         self._build_flag_menu(menu, menu_style, selected, cache)
 
+        # ── Content Advisory (rtng / explicit flag) ──
+        self._build_content_advisory_menu(menu, menu_style, selected)
+
         # ── Rating ──
         self._build_rating_menu(menu, menu_style, selected, cache)
 
@@ -2220,6 +2311,45 @@ class MusicBrowserList(QFrame):
             if act:
                 act.triggered.connect(
                     lambda _=False, v=value: self._set_track_flag("rating", v)
+                )
+
+    def _build_content_advisory_menu(self, menu: QMenu, style: str, selected: list[dict]) -> None:
+        """Add Content Advisory submenu for iPod 'rtng' semantics.
+
+        iPod/iTunesDB values:
+          - 0: no advisory tag (unset / not present)
+          - 1: explicit
+          - 2: clean
+        """
+        advisory_menu = menu.addMenu("Content Advisory")
+        if not advisory_menu:
+            return
+        advisory_menu.setStyleSheet(style)
+
+        current_flags = {int(t.get("explicit_flag", 0) or 0) for t in selected}
+        unanimous = current_flags.pop() if len(current_flags) == 1 else None
+
+        if unanimous is None and len(selected) > 1:
+            mixed = advisory_menu.addAction("(mixed selection)")
+            if mixed:
+                mixed.setEnabled(False)
+            advisory_menu.addSeparator()
+
+        options: list[tuple[int, str]] = [
+            (0, "None (Unset)"),
+            (1, "Explicit"),
+            (2, "Clean"),
+        ]
+        for value, label in options:
+            act = advisory_menu.addAction(label)
+            if act:
+                act.setCheckable(True)
+                act.setChecked(unanimous == value)
+                icon = self._advisory_badge_icon(value)
+                if icon is not None:
+                    act.setIcon(icon)
+                act.triggered.connect(
+                    lambda _=False, v=value: self._set_track_flag("explicit_flag", v)
                 )
 
     def _build_volume_menu(self, menu: QMenu, style: str, selected: list[dict]) -> None:
@@ -2421,6 +2551,8 @@ class MusicBrowserList(QFrame):
                     cell.setText(display_text)
                     if key in SORTABLE_NUMERIC_KEYS:
                         cell.setData(Qt.ItemDataRole.UserRole, raw if raw else 0)
+                    if key == "explicit_flag":
+                        self._apply_explicit_cell_visuals(cell, raw)
 
     def _add_selected_to_playlist(self, playlist: dict) -> None:
         """Add all selected tracks to the given playlist and save it."""

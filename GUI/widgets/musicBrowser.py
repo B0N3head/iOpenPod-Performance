@@ -1,10 +1,11 @@
 import logging
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtWidgets import QFrame, QSplitter, QVBoxLayout, QSizePolicy, QStackedWidget
 from .MBGridView import MusicBrowserGrid
 from .MBListView import MusicBrowserList
 from .playlistBrowser import PlaylistBrowser
 from .podcastBrowser import PodcastBrowser
+from .photoBrowser import PhotoBrowserWidget
 from .trackListTitleBar import TrackListTitleBar
 from .gridHeaderBar import GridHeaderBar
 from ..styles import Colors, make_scroll_area
@@ -18,6 +19,16 @@ class MusicBrowser(QFrame):
     def __init__(self):
         super().__init__()
         self._current_category = "Albums"
+        self._tab_dirty: dict[str, bool] = {
+            "Playlists": True,
+            "Podcasts": True,
+            "Photos": True,
+        }
+        self._tab_loaded: dict[str, bool] = {
+            "Playlists": False,
+            "Podcasts": False,
+            "Photos": False,
+        }
 
         self.mainLayout = QVBoxLayout(self)
         self.mainLayout.setContentsMargins(0, 0, 0, 0)
@@ -113,14 +124,46 @@ class MusicBrowser(QFrame):
 
         # Podcast browser (shown when Podcasts category is active)
         self.podcastBrowser = PodcastBrowser()
+        self.photoBrowser = PhotoBrowserWidget()
 
         # Use a stacked widget to toggle between grid/track and playlist views
         self.stack = QStackedWidget()
         self.stack.addWidget(self.gridTrackSplitter)   # index 0
         self.stack.addWidget(self.playlistBrowser)      # index 1
         self.stack.addWidget(self.podcastBrowser)       # index 2
+        self.stack.addWidget(self.photoBrowser)         # index 3
 
         self.mainLayout.addWidget(self.stack)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refreshCurrentCategory)
+
+        self._bind_cache_signals()
+
+    def _bind_cache_signals(self) -> None:
+        """Mark heavy tabs dirty when cache-backed data changes."""
+        try:
+            from ..app import iTunesDBCache
+
+            cache = iTunesDBCache.get_instance()
+            cache.playlists_changed.connect(lambda: self._mark_tab_dirty("Playlists"))
+            cache.photos_changed.connect(lambda: self._mark_tab_dirty("Photos"))
+        except Exception:
+            pass
+
+    def _mark_tab_dirty(self, tab_name: str) -> None:
+        if tab_name in self._tab_dirty:
+            self._tab_dirty[tab_name] = True
+
+    def _mark_all_tabs_dirty(self) -> None:
+        for tab_name in self._tab_dirty:
+            self._tab_dirty[tab_name] = True
+
+    def _schedule_refresh_current_category(self) -> None:
+        """Coalesce rapid category/data changes into one UI refresh tick."""
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start(0)
 
     def reloadData(self):
         """Reload data from the current device."""
@@ -128,6 +171,10 @@ class MusicBrowser(QFrame):
         self.browserTrack.clearTable(clear_cache=True)
         self.playlistBrowser.clear()
         self.podcastBrowser.clear()
+        self.photoBrowser.clear()
+        for tab_name in self._tab_loaded:
+            self._tab_loaded[tab_name] = False
+        self._mark_all_tabs_dirty()
         # Data will be loaded when cache emits data_ready
 
     def _save_splitter_sizes(self):
@@ -171,12 +218,13 @@ class MusicBrowser(QFrame):
 
     def onDataReady(self):
         """Called when iTunesDB cache is loaded. Refresh current view."""
-        self._refreshCurrentCategory()
+        self._mark_all_tabs_dirty()
+        self._schedule_refresh_current_category()
 
     def updateCategory(self, category: str):
         """Update the display for the selected category."""
         self._current_category = category
-        self._refreshCurrentCategory()
+        self._schedule_refresh_current_category()
 
     def _refreshCurrentCategory(self):
         """Refresh display based on current category and cache state."""
@@ -203,12 +251,25 @@ class MusicBrowser(QFrame):
         elif category == "Playlists":
             self.stack.setCurrentIndex(1)
             self.trackListTitleBar.setFullscreenMode(False)
-            self.playlistBrowser.loadPlaylists()
+            if self._tab_dirty["Playlists"] or not self._tab_loaded["Playlists"]:
+                self.playlistBrowser.loadPlaylists()
+                self._tab_dirty["Playlists"] = False
+                self._tab_loaded["Playlists"] = True
         elif category == "Podcasts":
             # Podcast manager — full subscription browser
             self.stack.setCurrentIndex(2)
             self.trackListTitleBar.setFullscreenMode(False)
-            self._ensure_podcast_device()
+            if self._tab_dirty["Podcasts"] or not self._tab_loaded["Podcasts"]:
+                self._ensure_podcast_device()
+                self._tab_dirty["Podcasts"] = False
+                self._tab_loaded["Podcasts"] = True
+        elif category == "Photos":
+            self.stack.setCurrentIndex(3)
+            self.trackListTitleBar.setFullscreenMode(False)
+            if self._tab_dirty["Photos"] or not self._tab_loaded["Photos"]:
+                self.photoBrowser.reload()
+                self._tab_dirty["Photos"] = False
+                self._tab_loaded["Photos"] = True
         elif category == "Audiobooks":
             # Non-music audio categories — hide entire grid container for fullscreen tracklist
             log.debug(f"  Showing {category} view")
@@ -292,7 +353,7 @@ class MusicBrowser(QFrame):
     def _ensure_podcast_device(self):
         """Bind the podcast browser to the current iPod device if not done."""
         from ..app import DeviceManager
-        from device_info import get_current_device
+        from ipod_device import get_current_device
 
         dm = DeviceManager.get_instance()
         if not dm.device_path:

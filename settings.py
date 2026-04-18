@@ -39,7 +39,7 @@ def get_version() -> str:
     try:
         return _pkg_version("iopenpod")
     except Exception:
-        return "1.0.44"
+        return "1.0.46"
 
 
 def default_data_dir() -> str:
@@ -175,6 +175,16 @@ class AppSettings:
     # measurement and writes the result back into the PC file's tags.
     # Sound Check values are always synced to iPod regardless of this setting.
     compute_sound_check: bool = False
+
+    # When enabled, portrait-heavy photos can be rotated clockwise on the
+    # device's viewing caches when that makes better use of the iPod's
+    # landscape photo screen.
+    rotate_tall_photos_for_device: bool = False
+
+    # Controls thumbnail rendering in the iPod Photos database pipeline.
+    # False (default): iTunes-style crop-to-fill thumbnails.
+    # True: aspect-fit thumbnails with letterboxing/padding.
+    fit_photo_thumbnails: bool = False
 
     # Rating conflict strategy when iPod and PC ratings differ.
     # Options: ipod_wins, pc_wins, highest, lowest, average.

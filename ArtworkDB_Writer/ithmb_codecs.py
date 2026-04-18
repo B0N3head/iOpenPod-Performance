@@ -12,7 +12,7 @@ import io
 import numpy as np
 from PIL import Image
 
-from ipod_models import ITHMB_FORMAT_MAP
+from ipod_device import ITHMB_FORMAT_MAP
 
 
 def _fmt(format_id: int):
@@ -101,6 +101,237 @@ def _rgb555_to_rgb(arr16: np.ndarray) -> np.ndarray:
     g = ((arr16 >> 5) & 0x1F).astype(np.uint8)
     b = (arr16 & 0x1F).astype(np.uint8)
     return np.stack(((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)), axis=2)
+
+
+def _resolve_packed_geometry(
+    pixel_bytes: bytes,
+    width: int,
+    height: int,
+    hpad: int,
+    vpad: int,
+    format_id: int | None = None,
+    *,
+    require_even_width: bool = False,
+) -> tuple[int, int]:
+    """Infer packed raster geometry from visible size + MHNI padding.
+
+    MHNI stores visible image dimensions and separate right/bottom padding.
+    The payload size usually corresponds to (width + hpad) x (height + vpad).
+    """
+    px_count = len(pixel_bytes) // 2
+    if px_count <= 0:
+        return 0, 0
+
+    vis_w = max(1, int(width))
+    vis_h = max(1, int(height))
+    pad_w = max(0, int(hpad))
+    pad_h = max(0, int(vpad))
+
+    candidates: list[tuple[int, int, int, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add(sw: int, sh: int, priority: int) -> None:
+        sw = int(sw)
+        sh = int(sh)
+        if sw <= 0 or sh <= 0:
+            return
+        if require_even_width and (sw % 2) != 0:
+            return
+        if sw * sh != px_count:
+            return
+        key = (sw, sh)
+        if key in seen:
+            return
+        seen.add(key)
+
+        # Prefer candidates that contain the visible area and whose
+        # overhang matches the MHNI hpad/vpad hints.
+        overflow = max(0, vis_w - sw) + max(0, vis_h - sh)
+        pad_delta = abs((sw - vis_w) - pad_w) + abs((sh - vis_h) - pad_h)
+        candidates.append((priority, overflow, pad_delta, sw, sh))
+
+    def add_neighborhood(base_w: int, base_h: int, priority: int) -> None:
+        for dw in (-2, -1, 0, 1, 2):
+            for dh in (-2, -1, 0, 1, 2):
+                add(base_w + dw, base_h + dh, priority + abs(dw) + abs(dh))
+
+    add(vis_w + pad_w, vis_h + pad_h, 0)
+    add(vis_w, vis_h, 1)
+    add_neighborhood(vis_w + pad_w, vis_h + pad_h, 2)
+    add_neighborhood(vis_w, vis_h, 4)
+
+    padded_h = vis_h + pad_h
+    if padded_h > 0 and (px_count % padded_h) == 0:
+        add(px_count // padded_h, padded_h, 2)
+
+    if vis_h > 0 and (px_count % vis_h) == 0:
+        add(px_count // vis_h, vis_h, 3)
+
+    padded_w = vis_w + pad_w
+    if padded_w > 0 and (px_count % padded_w) == 0:
+        add(padded_w, px_count // padded_w, 4)
+
+    if vis_w > 0 and (px_count % vis_w) == 0:
+        add(vis_w, px_count // vis_w, 5)
+
+    fmt = _fmt(int(format_id)) if format_id is not None else None
+    if fmt is not None:
+        fmt_w = max(1, int(fmt.width))
+        fmt_h = max(1, int(fmt.height))
+        stride = max(1, int(fmt.row_bytes // 2) if int(fmt.row_bytes) > 0 else fmt_w)
+
+        add(stride, fmt_h, 6)
+        add(fmt_w, fmt_h, 6)
+
+        if px_count % stride == 0:
+            add(stride, px_count // stride, 7)
+        if px_count % fmt_w == 0:
+            add(fmt_w, px_count // fmt_w, 8)
+        if px_count % fmt_h == 0:
+            add(px_count // fmt_h, fmt_h, 9)
+
+    if not candidates:
+        return 0, 0
+
+    _priority, _overflow, _pad_delta, stored_w, stored_h = min(candidates)
+    return stored_w, stored_h
+
+
+def _line_discontinuity_ratio(rgb: np.ndarray) -> float:
+    if rgb.shape[0] < 3:
+        return 1.0
+    arr = rgb.astype(np.int16, copy=False)
+    adjacent = np.abs(np.diff(arr, axis=0))
+    avg_adj = float(np.mean(adjacent))
+    if avg_adj <= 0.0:
+        return 1.0
+    seam = rgb.shape[0] // 2
+    seam_jump = float(np.mean(np.abs(arr[seam - 1] - arr[seam])))
+    return seam_jump / avg_adj
+
+
+def _detail_score(rgb: np.ndarray) -> float:
+    arr = rgb.astype(np.int16, copy=False)
+    if arr.shape[0] < 2 or arr.shape[1] < 2:
+        return 0.0
+    dx = np.diff(arr, axis=1)
+    dy = np.diff(arr, axis=0)
+    return float(np.var(dx) + np.var(dy))
+
+
+def _weave_fields(top: np.ndarray, bottom: np.ndarray, *, swap: bool = False) -> np.ndarray:
+    h2, w, _ = top.shape
+    out = np.empty((h2 * 2, w, 3), dtype=np.uint8)
+    if swap:
+        out[0::2] = bottom
+        out[1::2] = top
+    else:
+        out[0::2] = top
+        out[1::2] = bottom
+    return out
+
+
+def _half_similarity(rgb: np.ndarray) -> tuple[float, float]:
+    h = rgb.shape[0]
+    if h < 4 or (h % 2) != 0:
+        return 999.0, 999.0
+    top = rgb[: h // 2].astype(np.int16, copy=False)
+    bottom = rgb[h // 2:].astype(np.int16, copy=False)
+    diff = np.abs(top - bottom)
+    return float(np.mean(diff)), float(np.percentile(diff, 95))
+
+
+def _fix_1019_layout(rgb: np.ndarray, format_id: int) -> np.ndarray:
+    """Resolve known 1019 UYVY layout artifacts deterministically.
+
+    Candidate layouts are scored by seam continuity first, then detail level.
+    """
+    if int(format_id) != 1019:
+        return rgb
+
+    h, w = rgb.shape[:2]
+    if h < 120 or (h % 2) != 0:
+        return rgb
+
+    half = h // 2
+    top = rgb[:half]
+    bottom = rgb[half:]
+
+    # Fast path: obvious stacked duplicate.
+    mad, p95 = _half_similarity(rgb)
+    if mad < 8.0 and p95 < 30.0:
+        chosen = top if _detail_score(top) >= _detail_score(bottom) else bottom
+        restored = Image.fromarray(chosen, mode="RGB").resize((w, h), Image.Resampling.BILINEAR)
+        return np.array(restored, dtype=np.uint8)
+
+    top_scaled = np.array(
+        Image.fromarray(top, mode="RGB").resize((w, h), Image.Resampling.BILINEAR),
+        dtype=np.uint8,
+    )
+    bottom_scaled = np.array(
+        Image.fromarray(bottom, mode="RGB").resize((w, h), Image.Resampling.BILINEAR),
+        dtype=np.uint8,
+    )
+    candidates = [
+        rgb,
+        _weave_fields(top, bottom, swap=False),
+        _weave_fields(top, bottom, swap=True),
+        top_scaled,
+        bottom_scaled,
+    ]
+
+    def score(img: np.ndarray) -> tuple[float, float, float]:
+        m, p = _half_similarity(img)
+        stacked_penalty = 1.0 if (m < 8.0 and p < 30.0) else 0.0
+        return (stacked_penalty, _line_discontinuity_ratio(img), -_detail_score(img))
+
+    return min(candidates, key=score)
+
+
+def _crop_visible_region(
+    rgb: np.ndarray,
+    width: int,
+    height: int,
+    hpad: int,
+    vpad: int,
+    format_id: int,
+) -> np.ndarray:
+    """Crop decoded pixels to the intended visible image rectangle.
+
+    Most formats use top-left anchored crops (width x height). Some photo
+    formats in Apple Photo Database store centered pad margins where hpad/vpad
+    represent per-side margins while width/height still include one margin.
+    """
+    stored_h, stored_w = rgb.shape[:2]
+    visible_w = max(1, min(stored_w, int(width)))
+    visible_h = max(1, min(stored_h, int(height)))
+    crop_x = 0
+    crop_y = 0
+
+    fmt = _fmt(int(format_id))
+    role = (fmt.role if fmt is not None else "")
+    if (hpad > 0 or vpad > 0) and role.startswith("photo"):
+        # Empirical iPod photo DB behavior (e.g. 1007/1015/1024/1093):
+        # stored ~= (width + hpad, height + vpad), with pad on both sides.
+        match_w = abs(stored_w - (int(width) + int(hpad))) <= 2
+        match_h = abs(stored_h - (int(height) + int(vpad))) <= 2
+        if match_w or match_h:
+            crop_x = min(max(0, int(hpad)), max(0, stored_w - 1))
+            crop_y = min(max(0, int(vpad)), max(0, stored_h - 1))
+            padded_w = int(width) - int(hpad)
+            padded_h = int(height) - int(vpad)
+            if padded_w > 0:
+                visible_w = min(stored_w - crop_x, padded_w)
+            else:
+                visible_w = min(stored_w - crop_x, visible_w)
+            if padded_h > 0:
+                visible_h = min(stored_h - crop_y, padded_h)
+            else:
+                visible_h = min(stored_h - crop_y, visible_h)
+
+    end_x = max(crop_x + 1, crop_x + visible_w)
+    end_y = max(crop_y + 1, crop_y + visible_h)
+    return rgb[crop_y:end_y, crop_x:end_x, :]
 
 
 def encode_image_for_format(
@@ -267,16 +498,22 @@ def decode_pixels_for_format(
     vpad = max(0, int(vpad))
 
     if pf in ("RGB565_LE", "RGB565_BE", "RGB565_BE_90"):
-        stored_w = width
-        stored_h = height
-        px_count = len(pixel_bytes) // 2
-        if stored_w * stored_h != px_count:
-            if stored_h <= 0 or px_count % stored_h != 0:
-                return None
-            stored_w = px_count // stored_h
+        stored_w, stored_h = _resolve_packed_geometry(
+            pixel_bytes,
+            width,
+            height,
+            hpad,
+            vpad,
+            format_id,
+        )
+        if stored_w <= 0 or stored_h <= 0:
+            return None
 
         dtype = "<u2" if pf == "RGB565_LE" else ">u2"
-        arr = np.frombuffer(pixel_bytes, dtype=dtype)
+        needed = stored_w * stored_h * 2
+        if len(pixel_bytes) < needed:
+            return None
+        arr = np.frombuffer(pixel_bytes[:needed], dtype=dtype)
         if arr.size != stored_w * stored_h:
             return None
         arr = arr.reshape((stored_h, stored_w))
@@ -285,43 +522,56 @@ def decode_pixels_for_format(
         if pf == "RGB565_BE_90":
             rgb = np.rot90(rgb, k=1)
 
-        visible_w = max(1, min(rgb.shape[1], width - hpad if hpad < width else width))
-        visible_h = max(1, min(rgb.shape[0], height - vpad if vpad < height else height))
-        rgb = rgb[:visible_h, :visible_w, :]
+        rgb = _crop_visible_region(rgb, width, height, hpad, vpad, format_id)
         return Image.fromarray(rgb, mode="RGB")
 
     if pf in ("RGB555_LE", "RGB555_BE", "REC_RGB555_LE"):
-        stored_w = width
-        stored_h = height
-        px_count = len(pixel_bytes) // 2
-        if stored_w * stored_h != px_count:
-            if stored_h <= 0 or px_count % stored_h != 0:
-                return None
-            stored_w = px_count // stored_h
+        stored_w, stored_h = _resolve_packed_geometry(
+            pixel_bytes,
+            width,
+            height,
+            hpad,
+            vpad,
+            format_id,
+        )
+        if stored_w <= 0 or stored_h <= 0:
+            return None
 
         dtype = "<u2" if pf != "RGB555_BE" else ">u2"
-        arr = np.frombuffer(pixel_bytes, dtype=dtype)
+        needed = stored_w * stored_h * 2
+        if len(pixel_bytes) < needed:
+            return None
+        arr = np.frombuffer(pixel_bytes[:needed], dtype=dtype)
         if arr.size != stored_w * stored_h:
             return None
         arr = arr.reshape((stored_h, stored_w))
 
         rgb = _rgb555_to_rgb(arr)
-        visible_w = max(1, min(rgb.shape[1], width - hpad if hpad < width else width))
-        visible_h = max(1, min(rgb.shape[0], height - vpad if vpad < height else height))
-        rgb = rgb[:visible_h, :visible_w, :]
+        rgb = _crop_visible_region(rgb, width, height, hpad, vpad, format_id)
         return Image.fromarray(rgb, mode="RGB")
 
     if pf == "UYVY":
-        width &= ~1
-        if len(pixel_bytes) < width * height * 2:
+        stored_w, stored_h = _resolve_packed_geometry(
+            pixel_bytes,
+            width,
+            height,
+            hpad,
+            vpad,
+            format_id,
+            require_even_width=True,
+        )
+        if stored_w <= 0 or stored_h <= 0:
             return None
-        p = np.frombuffer(pixel_bytes[: width * height * 2], dtype=np.uint8).reshape((height, width * 2))
+        needed = stored_w * stored_h * 2
+        if len(pixel_bytes) < needed:
+            return None
+        p = np.frombuffer(pixel_bytes[:needed], dtype=np.uint8).reshape((stored_h, stored_w * 2))
         u = p[:, 0::4].astype(np.float32)
         y0 = p[:, 1::4].astype(np.float32)
         v = p[:, 2::4].astype(np.float32)
         y1 = p[:, 3::4].astype(np.float32)
 
-        y = np.empty((height, width), dtype=np.float32)
+        y = np.empty((stored_h, stored_w), dtype=np.float32)
         y[:, 0::2] = y0
         y[:, 1::2] = y1
         uu = np.repeat(u, 2, axis=1)
@@ -334,6 +584,8 @@ def decode_pixels_for_format(
         g = np.clip((298.082 * c - 100.291 * d - 208.120 * e) / 256.0, 0, 255).astype(np.uint8)
         b = np.clip((298.082 * c + 516.412 * d) / 256.0, 0, 255).astype(np.uint8)
         rgb = np.stack((r, g, b), axis=2)
+        rgb = _crop_visible_region(rgb, width, height, hpad, vpad, format_id)
+        rgb = _fix_1019_layout(rgb, format_id)
         return Image.fromarray(rgb, mode="RGB")
 
     if pf == "I420_LE":

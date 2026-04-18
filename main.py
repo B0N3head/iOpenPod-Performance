@@ -200,7 +200,7 @@ def run_pyqt_app():
     from GUI.styles import app_stylesheet
     app.setStyleSheet(app_stylesheet())
 
-    window = MainWindow()  # noqa: F821 — imported at top of function
+    window = MainWindow()
 
     window.show()
 

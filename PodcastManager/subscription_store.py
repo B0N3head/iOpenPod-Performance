@@ -89,7 +89,6 @@ class SubscriptionStore:
             # On Windows, antivirus / Explorer / indexer can briefly lock
             # the target file, causing os.replace() to fail with
             # PermissionError.  Retry a few times before giving up.
-            last_err: Exception | None = None
             for attempt in range(5):
                 try:
                     os.replace(tmp, self._json_path)

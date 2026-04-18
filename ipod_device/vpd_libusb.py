@@ -25,17 +25,17 @@ Usage
 Standalone (writes SysInfo to iPod)::
 
     # macOS / Linux
-    sudo uv run python ipod_usb_query.py [--write-sysinfo]
+    sudo uv run python -m ipod_device.vpd_libusb [--write-sysinfo]
 
     # Windows (no elevation needed for query, may need admin for write)
-    uv run python ipod_usb_query.py [--write-sysinfo]
+    uv run python -m ipod_device.vpd_libusb [--write-sysinfo]
 
     # Any platform — manually specify iPod mount path
-    sudo uv run python ipod_usb_query.py --write-sysinfo --path /Volumes/IPOD
+    sudo uv run python -m ipod_device.vpd_libusb --write-sysinfo --path /Volumes/IPOD
 
 From code::
 
-    from ipod_usb_query import query_ipod_vpd, query_all_ipods
+    from ipod_device.vpd_libusb import query_ipod_vpd, query_all_ipods
     info = query_ipod_vpd(usb_pid=0x1261)          # one device
     all_info = query_all_ipods()                     # all connected iPods
 """
@@ -43,6 +43,7 @@ From code::
 from __future__ import annotations
 
 import logging
+import importlib.util
 import os
 import plistlib
 import re
@@ -335,7 +336,7 @@ def query_ipod_vpd(
             if "Access denied" in str(exc) or "Operation not permitted" in str(exc):
                 raise PermissionError(
                     "Root/sudo required to detach kernel driver for USB VPD query. "
-                    "Run with: sudo uv run python ipod_usb_query.py"
+                    "Run with: sudo uv run python -m ipod_device.vpd_libusb"
                 ) from exc
             raise
 
@@ -413,9 +414,7 @@ def query_all_ipods() -> list[dict]:
     """
     import time
 
-    try:
-        import usb.core  # noqa: F401 – needed so query_ipod_vpd can find it
-    except ImportError:
+    if importlib.util.find_spec("usb.core") is None:
         return []
 
     devices = _find_ipod_devices()
@@ -658,7 +657,7 @@ def _vpd_query_any_platform(usb_pid: int, firewire_guid: str) -> Optional[dict]:
                 logger.debug("_vpd_query_any_platform: IOKit success")
                 return vpd
         except ImportError:
-            logger.debug("_vpd_query_any_platform: ipod_iokit_query not available")
+            logger.debug("_vpd_query_any_platform: ipod_device.vpd_iokit not available")
         except Exception as exc:
             logger.debug("_vpd_query_any_platform: IOKit failed: %s", exc)
 
@@ -1058,7 +1057,7 @@ def main() -> int:
     if sys.platform != "win32":
         if os.geteuid() != 0:
             print("ERROR: Root privileges required. "
-                  "Run with: sudo uv run python ipod_usb_query.py")
+                  "Run with: sudo uv run python -m ipod_device.vpd_libusb")
             return 1
 
     print("Scanning for iPod USB devices...\n")

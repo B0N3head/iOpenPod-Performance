@@ -863,8 +863,8 @@ class PCLibrary:
 
         tags = audio.tags
 
-        def _t(fid):
-            return self._id3_text(tags, fid)  # noqa: E731
+        def _t(fid: str) -> Optional[str]:
+            return self._id3_text(tags, fid)
 
         # Core metadata from standard ID3 frames
         metadata['title'] = _t('TIT2')

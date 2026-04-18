@@ -591,8 +591,8 @@ def _get_video_caps() -> tuple[int, int, int, int, str]:
     device is connected or the model is unrecognised.
     """
     try:
-        from device_info import get_current_device
-        from ipod_models import capabilities_for_family_gen
+        from ipod_device import get_current_device
+        from ipod_device import capabilities_for_family_gen
         dev = get_current_device()
         if dev and dev.model_family:
             caps = capabilities_for_family_gen(
@@ -625,8 +625,8 @@ def _device_supports_alac() -> bool:
     the model is unrecognised — avoids unnecessary re-encodes.
     """
     try:
-        from device_info import get_current_device
-        from ipod_models import capabilities_for_family_gen
+        from ipod_device import get_current_device
+        from ipod_device import capabilities_for_family_gen
         dev = get_current_device()
         if dev and dev.model_family:
             caps = capabilities_for_family_gen(

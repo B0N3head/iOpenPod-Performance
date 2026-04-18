@@ -12,14 +12,14 @@ import numpy as np
 from PIL import Image
 from typing import Optional
 
-from ipod_models import (
+from ipod_device import (
     ITHMB_FORMAT_MAP,
     ithmb_formats_for_device,
 )
 
 
 # ── Artwork format tables ─────────────────────────────────────────────────
-# All canonical format definitions now live in ipod_models.py.
+# All canonical format definitions now live in ipod_device.
 #
 # The dicts below are DERIVED from the canonical source so that existing
 # callers (artwork_writer.py, __init__.py, etc.) still see the same
@@ -30,7 +30,7 @@ ALL_KNOWN_FORMATS: dict[int, tuple[int, int]] = {
     fid: (af.width, af.height) for fid, af in ITHMB_FORMAT_MAP.items()
 }
 
-# Per-family convenience dicts — thin wrappers around ipod_models data.
+# Per-family convenience dicts — thin wrappers around ipod_device data.
 # May be removed in a future cleanup once all callers migrate to
 # ``ithmb_formats_for_device()`` or ``capabilities_for_family_gen()``.
 IPOD_CLASSIC_FORMATS = ithmb_formats_for_device("iPod Classic", "1st Gen")
@@ -54,7 +54,7 @@ def get_artwork_formats(ipod_path: str) -> dict[int, tuple[int, int]]:
     import logging
     _log = logging.getLogger(__name__)
 
-    from device_info import get_current_device
+    from ipod_device import get_current_device
     device = get_current_device()
     if device is not None and device.artwork_formats:
         _log.info(

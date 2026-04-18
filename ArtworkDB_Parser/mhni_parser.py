@@ -1,6 +1,6 @@
 import struct
 
-from ipod_models import ITHMB_FORMAT_MAP
+from ipod_device import ITHMB_FORMAT_MAP
 
 
 def _expected_img_size_bytes(candidate) -> int:

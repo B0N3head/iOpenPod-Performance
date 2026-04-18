@@ -57,6 +57,7 @@ from ..styles import (
     LABEL_SECONDARY,
 )
 from ..glyphs import glyph_icon, glyph_pixmap
+from .browserChrome import BrowserHeroHeader, BrowserPane, style_browser_splitter
 from .formatters import format_size
 
 log = logging.getLogger(__name__)
@@ -199,8 +200,25 @@ class PodcastBrowser(QFrame):
 
     def set_device(self, serial: str, ipod_path: str) -> None:
         """Bind to a specific iPod device.  Loads subscriptions."""
-        self._device_serial = serial or "_default"
-        self._ipod_path = ipod_path
+        normalized_serial = serial or "_default"
+        normalized_path = ipod_path or ""
+        same_device = (
+            self._store is not None
+            and self._device_serial == normalized_serial
+            and self._ipod_path == normalized_path
+        )
+
+        # Fast path for tab switches: avoid rebuilding store + list when the
+        # selected iPod has not changed.
+        if same_device:
+            if self._deferred_reconcile_tracks is not None:
+                deferred = self._deferred_reconcile_tracks
+                self._deferred_reconcile_tracks = None
+                self.reconcile_ipod_statuses(deferred)
+            return
+
+        self._device_serial = normalized_serial
+        self._ipod_path = normalized_path
 
         from PodcastManager.subscription_store import SubscriptionStore
         self._store = SubscriptionStore(ipod_path)
@@ -290,7 +308,6 @@ class PodcastBrowser(QFrame):
         # ── Toolbar ──────────────────────────────────────────────────────
         toolbar = self._build_toolbar()
         root.addWidget(toolbar)
-        root.addWidget(make_separator())
 
         # ── Stacked widget: empty state vs. main content ─────────────────
         self._stack = QStackedWidget()
@@ -307,18 +324,12 @@ class PodcastBrowser(QFrame):
         root.addWidget(self._stack, stretch=1)
 
     def _build_toolbar(self) -> QWidget:
-        bar = QFrame()
-        bar.setFixedHeight((44))
-        bar.setStyleSheet(f"background: {Colors.SURFACE}; border: none;")
-
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins((12), (6), (12), (6))
-        layout.setSpacing((8))
+        bar = BrowserHeroHeader("Podcasts", self)
+        layout = bar.actions_layout
 
         self._add_btn = QPushButton("Add Podcast")
         self._add_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
         self._add_btn.setStyleSheet(accent_btn_css())
-        self._add_btn.setFixedHeight((30))
         _add_ic = glyph_icon("plus", (14), Colors.TEXT_ON_ACCENT)
         if _add_ic:
             self._add_btn.setIcon(_add_ic)
@@ -329,7 +340,6 @@ class PodcastBrowser(QFrame):
         self._refresh_btn = QPushButton("Refresh All")
         self._refresh_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
         self._refresh_btn.setStyleSheet(btn_css())
-        self._refresh_btn.setFixedHeight((30))
         _refresh_ic = glyph_icon("refresh", (14), Colors.TEXT_PRIMARY)
         if _refresh_ic:
             self._refresh_btn.setIcon(_refresh_ic)
@@ -340,7 +350,6 @@ class PodcastBrowser(QFrame):
         self._sync_btn = QPushButton("Sync Podcasts")
         self._sync_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
         self._sync_btn.setStyleSheet(btn_css())
-        self._sync_btn.setFixedHeight((30))
         _sync_ic = glyph_icon("refresh", (14), Colors.TEXT_PRIMARY)
         if _sync_ic:
             self._sync_btn.setIcon(_sync_ic)
@@ -425,12 +434,7 @@ class PodcastBrowser(QFrame):
     def _build_main_page(self) -> QWidget:
         """The main splitter containing feed list and episode panel."""
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth((3))
-        splitter.setStyleSheet(f"""
-            QSplitter::handle {{
-                background: {Colors.BORDER_SUBTLE};
-            }}
-        """)
+        style_browser_splitter(splitter)
 
         # Left: feed list
         left = self._build_feed_panel()
@@ -447,22 +451,11 @@ class PodcastBrowser(QFrame):
         return splitter
 
     def _build_feed_panel(self) -> QWidget:
-        panel = QFrame()
-        panel.setMinimumWidth((200))
-        panel.setStyleSheet("background: transparent; border: none;")
-
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        header = make_label(
+        panel = BrowserPane(
             "Subscriptions",
-            size=(Metrics.FONT_SM),
-            weight=QFont.Weight.DemiBold,
-            style=f"color: {Colors.TEXT_SECONDARY}; padding: {(8)}px {(12)}px;"
-            f" background: transparent; border: none;",
+            min_width=220,
+            body_margins=(8, 2, 8, 8),
         )
-        layout.addWidget(header)
 
         self._feed_list = QListWidget()
         self._feed_list.setIconSize(QSize((36), (36)))
@@ -490,7 +483,7 @@ class PodcastBrowser(QFrame):
             }}
         """)
 
-        layout.addWidget(self._feed_list, stretch=1)
+        panel.addWidget(self._feed_list, 1)
         return panel
 
     def _build_episode_panel(self) -> QWidget:

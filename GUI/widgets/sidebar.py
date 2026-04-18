@@ -122,12 +122,7 @@ class DeviceInfoCard(QFrame):
         header_layout.setSpacing((10))
 
         self.icon_label = QLabel()
-        px = glyph_pixmap("music", (30), Colors.TEXT_SECONDARY)
-        if px:
-            self.icon_label.setPixmap(px)
-        else:
-            self.icon_label.setText("♪")
-            self.icon_label.setFont(QFont(FONT_FAMILY, (22)))
+        self._set_default_icon()
         self.icon_label.setFixedSize((48), (48))
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet("background: transparent; border: none;")
@@ -321,6 +316,16 @@ class DeviceInfoCard(QFrame):
 
         self._tech_expanded = False
 
+    def _set_default_icon(self) -> None:
+        """Reset the header icon to the generic music fallback."""
+        self.icon_label.clear()
+        px = glyph_pixmap("music", (32), Colors.TEXT_SECONDARY)
+        if px:
+            self.icon_label.setPixmap(px)
+        else:
+            self.icon_label.setText("♪")
+            self.icon_label.setFont(QFont(FONT_FAMILY, 24))
+
     def _start_rename(self, event=None):
         """Show an inline QLineEdit to rename the iPod."""
         current = self.name_label.text()
@@ -411,7 +416,7 @@ class DeviceInfoCard(QFrame):
         generation = ""
         color = ""
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
             if dev:
                 family = dev.model_family or ""
@@ -427,17 +432,12 @@ class DeviceInfoCard(QFrame):
             self.icon_label.setPixmap(photo)
             self.icon_label.setFont(QFont())  # Clear emoji font
         else:
-            # Fallback to SVG music icon
-            px = glyph_pixmap("music", (32), Colors.TEXT_SECONDARY)
-            if px:
-                self.icon_label.setPixmap(px)
-            else:
-                self.icon_label.setText("♪")
-                self.icon_label.setFont(QFont(FONT_FAMILY, 24))
+            # Fallback to generic icon when no matching product photo exists.
+            self._set_default_icon()
 
         # Update technical details from centralized store
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
         except Exception:
             dev = None
@@ -452,7 +452,7 @@ class DeviceInfoCard(QFrame):
             self.id_method_row.setValue(dev.identification_method or '—')
 
             # Checksum / hashing — derive display name from the canonical enum
-            from ipod_models import ChecksumType
+            from ipod_device import ChecksumType
             try:
                 cs_name = ChecksumType(dev.checksum_type).name
             except ValueError:
@@ -550,6 +550,7 @@ class DeviceInfoCard(QFrame):
         self.name_label.setText("No Device")
         self._fit_name_font("No Device")
         self.model_label.setText("Press Select to choose your iPod")
+        self._set_default_icon()
         self._capacity_label.setText("—")
         self._capacity_widget.hide()
         for cell in (self._inv_songs, self._inv_hours):
@@ -579,6 +580,7 @@ class Sidebar(QFrame):
 
     # Categories that only make sense when podcast support is present
     _PODCAST_CATEGORIES = frozenset({"Podcasts"})
+    _PHOTO_CATEGORIES = frozenset({"Photos"})
 
     category_glyphs = {
         "Albums": "music",
@@ -586,6 +588,7 @@ class Sidebar(QFrame):
         "Genres": "grid",
         "Tracks": "music",
         "Playlists": "annotation-dots",
+        "Photos": "photo",
         "Podcasts": "broadcast",
         "Audiobooks": "book",
         "Movies": "film",
@@ -598,6 +601,7 @@ class Sidebar(QFrame):
         super().__init__()
         self._video_capabilities_visible = True
         self._podcast_capabilities_visible = True
+        self._photo_capabilities_visible = True
 
         self.setStyleSheet(f"""
             QFrame#sidebar {{
@@ -751,6 +755,27 @@ class Sidebar(QFrame):
         # Show all categories again when no device is selected
         self.setVideoVisible(True)
         self.setPodcastVisible(True)
+        self.setPhotoVisible(True)
+
+    def _first_visible_category(self) -> str | None:
+        preferred = self.buttons.get("Albums")
+        if preferred is not None and preferred.isVisible():
+            return "Albums"
+        for category, btn in self.buttons.items():
+            if btn.isVisible():
+                return category
+        return None
+
+    def _ensure_selected_category_visible(self) -> None:
+        selected_btn = self.buttons.get(self.selectedCategory)
+        if selected_btn is not None and selected_btn.isVisible():
+            self._style_nav_btn(self.selectedCategory, selected=True)
+            return
+
+        fallback = self._first_visible_category()
+        if fallback is None:
+            return
+        self.selectCategory(fallback)
 
     def setLibraryTabsVisible(self, visible: bool):
         """Show or hide all library category tabs."""
@@ -760,13 +785,15 @@ class Sidebar(QFrame):
                     btn.setVisible(False)
                 elif label in self._PODCAST_CATEGORIES and not self._podcast_capabilities_visible:
                     btn.setVisible(False)
+                elif label in self._PHOTO_CATEGORIES and not self._photo_capabilities_visible:
+                    btn.setVisible(False)
                 else:
                     btn.setVisible(True)
             else:
                 btn.setVisible(False)
 
-        if visible and self.selectedCategory not in self.buttons:
-            self.selectCategory("Albums")
+        if visible:
+            self._ensure_selected_category_visible()
 
     def setVideoVisible(self, visible: bool):
         """Show or hide video-related sidebar categories.
@@ -780,9 +807,7 @@ class Sidebar(QFrame):
             btn = self.buttons.get(cat)
             if btn:
                 btn.setVisible(visible)
-        # If the selected category is being hidden, switch to a safe default
-        if not visible and self.selectedCategory in self._VIDEO_CATEGORIES:
-            self.selectCategory("Albums")
+        self._ensure_selected_category_visible()
 
     def setPodcastVisible(self, visible: bool):
         """Show or hide podcast sidebar categories.
@@ -795,10 +820,28 @@ class Sidebar(QFrame):
             btn = self.buttons.get(cat)
             if btn:
                 btn.setVisible(visible)
-        if not visible and self.selectedCategory in self._PODCAST_CATEGORIES:
-            self.selectCategory("Albums")
+        self._ensure_selected_category_visible()
+
+    def setPhotoVisible(self, visible: bool):
+        self._photo_capabilities_visible = visible
+        for cat in self._PHOTO_CATEGORIES:
+            btn = self.buttons.get(cat)
+            if btn:
+                btn.setVisible(visible)
+        self._ensure_selected_category_visible()
 
     def selectCategory(self, category):
+        btn = self.buttons.get(category)
+        if btn is None or not btn.isVisible():
+            fallback = self._first_visible_category()
+            if fallback is None:
+                return
+            category = fallback
+
+        if category == self.selectedCategory:
+            self._style_nav_btn(category, selected=True)
+            return
+
         self._style_nav_btn(self.selectedCategory, selected=False)
         self.selectedCategory = category
         self._style_nav_btn(category, selected=True)

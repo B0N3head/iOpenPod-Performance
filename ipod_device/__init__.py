@@ -1,10 +1,11 @@
 """
 ipod_device — unified iPod device identification & management package.
 
-Re-exports everything that was previously spread across ipod_models.py,
-device_info.py, sysinfo_authority.py, ipod_usb_query.py,
-ipod_iokit_query.py, and GUI/device_scanner.py.
+Re-exports device-identification and model-capability APIs that were
+historically spread across multiple legacy modules.
 """
+
+# flake8: noqa: F401
 
 # ── checksum ─────────────────────────────────────────────────────────
 from .checksum import (
@@ -26,6 +27,7 @@ from .artwork import (
     ITHMB_FORMAT_MAP,
     ITHMB_SIZE_MAP,
     ithmb_formats_for_device,
+    photo_formats_for_device,
 )
 
 # ── models ───────────────────────────────────────────────────────────
@@ -72,7 +74,7 @@ from .info import (
     generate_library_id,
 )
 
-# ── authority (sysinfo_authority) ────────────────────────────────────
+# ── authority ────────────────────────────────────────────────────────
 from .authority import (
     SOURCE_RANK,
     SYSINFO_FIELDS,
@@ -82,7 +84,7 @@ from .authority import (
     read_authority,
 )
 
-# ── vpd_libusb (ipod_usb_query) ─────────────────────────────────────
+# ── vpd_libusb ───────────────────────────────────────────────────────
 from .vpd_libusb import (
     query_ipod_vpd as usb_query_ipod_vpd,
     query_all_ipods as usb_query_all_ipods,

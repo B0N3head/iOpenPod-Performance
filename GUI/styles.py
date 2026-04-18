@@ -564,7 +564,7 @@ def resolve_accent_color(
         return "blue"
     if setting == "match-ipod":
         if ipod_image:
-            from ipod_models import color_for_image
+            from ipod_device import color_for_image
             rgb = color_for_image(ipod_image)
             if rgb is not None:
                 # Reject white/silver and black/gray iPods — they don't work
@@ -760,24 +760,20 @@ class DarkScrollbarStyle(QProxyStyle):
     """
 
     @property
-    def _THICKNESS(self):  # noqa: N802
-        return max(4, (8))
-
-    @property
-    def _MIN_HANDLE(self):  # noqa: N802
+    def _min_handle(self):
         return (36)
     _TRACK = QColor(0, 0, 0, 0)           # invisible track
 
     @property
-    def _THUMB(self):  # noqa: N802
+    def _thumb(self):
         return QColor(255, 255, 255, 70) if Colors._active_mode == "dark" else QColor(0, 0, 0, 55)
 
     @property
-    def _THUMB_HOVER(self):  # noqa: N802
+    def _thumb_hover(self):
         return QColor(255, 255, 255, 110) if Colors._active_mode == "dark" else QColor(0, 0, 0, 90)
 
     @property
-    def _THUMB_PRESS(self):  # noqa: N802
+    def _thumb_press(self):
         return QColor(255, 255, 255, 140) if Colors._active_mode == "dark" else QColor(0, 0, 0, 120)
 
     _CLICKABLE_TYPES = (QAbstractButton, QComboBox, QGroupBox, QTabBar)
@@ -858,7 +854,7 @@ class DarkScrollbarStyle(QProxyStyle):
             page = max(opt.pageStep, 1)
             handle_len = max(
                 int(length * page / (rng + page)),
-                self._MIN_HANDLE,
+                self._min_handle,
             )
             available = length - handle_len
             if available <= 0:
@@ -930,15 +926,15 @@ class DarkScrollbarStyle(QProxyStyle):
             active_sc = option.activeSubControls if isinstance(option, QStyleOptionComplex) else QStyle.SubControl.SC_None
             hovered = bool(
                 (option.state & QStyle.StateFlag.State_MouseOver)
-                and (active_sc & QStyle.SubControl.SC_ScrollBarSlider)  # noqa: W503
+                and (active_sc & QStyle.SubControl.SC_ScrollBarSlider)
             )
 
             if pressed:
-                color = self._THUMB_PRESS
+                color = self._thumb_press
             elif hovered:
-                color = self._THUMB_HOVER
+                color = self._thumb_hover
             else:
-                color = self._THUMB
+                color = self._thumb
 
             horiz = option.orientation == Qt.Orientation.Horizontal
             # Inset to create a floating pill centered in the track
@@ -1466,6 +1462,7 @@ def make_scroll_area(
         Additional CSS to append.
     """
     from PyQt6.QtCore import Qt as _Qt
+    from PyQt6.QtGui import QPalette as _QPalette, QColor as _QColor
     from PyQt6.QtWidgets import QFrame as _QFrame, QScrollArea as _QScrollArea
 
     scroll = _QScrollArea()
@@ -1482,9 +1479,17 @@ def make_scroll_area(
     if vp is not None:
         scroll.setVerticalScrollBarPolicy(vp)
 
-    css = ""
     if transparent:
-        css = "QScrollArea { background: transparent; border: none; }"
+        pal = scroll.palette()
+        pal.setColor(_QPalette.ColorRole.Window, _QColor(0, 0, 0, 0))
+        pal.setColor(_QPalette.ColorRole.Base, _QColor(0, 0, 0, 0))
+        scroll.setPalette(pal)
+        vpw = scroll.viewport()
+        if vpw is not None:
+            vpw.setPalette(pal)
+            vpw.setAutoFillBackground(False)
+
+    css = ""
     if extra_css:
         css = f"{css}\n{extra_css}" if css else extra_css
     if css:

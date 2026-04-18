@@ -1,6 +1,6 @@
 """Integration test for the unified device scanner pipeline."""
-from GUI.device_scanner import scan_for_ipods
-from device_info import get_firewire_id
+from ipod_device import scan_for_ipods
+from ipod_device import get_firewire_id
 import logging
 logging.basicConfig(level=logging.DEBUG)
 

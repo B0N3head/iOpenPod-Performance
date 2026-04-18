@@ -23,6 +23,7 @@ from ..styles import (
     make_detail_row, make_separator, make_section_header,
 )
 from ..glyphs import glyph_icon, glyph_pixmap
+from .browserChrome import BrowserHeroHeader, BrowserPane, style_browser_splitter
 from .formatters import (
     format_duration_human,
     format_mhsd5_type,
@@ -452,57 +453,15 @@ class PlaylistInfoCard(QFrame):
 class PlaylistListPanel(QFrame):
     """Scrollable list of playlists grouped by type with section headers."""
     playlist_selected = pyqtSignal(dict)  # Emits the full playlist dict
-    new_playlist_requested = pyqtSignal(str)  # "smart" or "regular"
-    import_playlist_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setStyleSheet(f"""
-            QFrame#playlistListPanel {{
-                background: {Colors.SURFACE};
-                border: 1px solid {Colors.BORDER_SUBTLE};
-                border-radius: {Metrics.BORDER_RADIUS_LG}px;
-            }}
-        """)
         self.setObjectName("playlistListPanel")
-        self.setFixedWidth((210))
+        self.setStyleSheet("background: transparent; border: none;")
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins((10), (12), (10), (12))
-        outer.setSpacing((8))
-
-        # ── New Playlist button (fixed, above scroll) ──
-        self._new_btn = QPushButton("＋  New Playlist")
-        self._new_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD, QFont.Weight.Bold))
-        self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._new_btn.setMinimumHeight((34))
-        self._new_btn.setStyleSheet(btn_css(
-            bg=Colors.ACCENT_DIM,
-            bg_hover=Colors.ACCENT_HOVER,
-            bg_press=Colors.ACCENT_PRESS,
-            fg=Colors.ACCENT,
-            border=f"1px solid {Colors.ACCENT_BORDER}",
-            radius=Metrics.BORDER_RADIUS_SM,
-            padding="6px 8px",
-        ))
-        self._new_btn.clicked.connect(self._on_new_playlist)
-        outer.addWidget(self._new_btn)
-
-        self._import_btn = QPushButton("↓  Import Playlist")
-        self._import_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
-        self._import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._import_btn.setMinimumHeight((34))
-        self._import_btn.setStyleSheet(btn_css(
-            bg="transparent",
-            bg_hover=Colors.SURFACE_HOVER,
-            bg_press=Colors.SURFACE_ACTIVE,
-            fg=Colors.TEXT_SECONDARY,
-            border=f"1px solid {Colors.BORDER}",
-            radius=Metrics.BORDER_RADIUS_SM,
-            padding="6px 8px",
-        ))
-        self._import_btn.clicked.connect(self.import_playlist_requested.emit)
-        outer.addWidget(self._import_btn)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         # Scroll area wrapping playlist sections
         self._scroll = make_scroll_area()
@@ -512,7 +471,7 @@ class PlaylistListPanel(QFrame):
         self._inner.setStyleSheet("background: transparent;")
         self._inner_layout = QVBoxLayout(self._inner)
         self._inner_layout.setContentsMargins(0, 0, 0, 0)
-        self._inner_layout.setSpacing(2)
+        self._inner_layout.setSpacing(4)
         self._inner_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._scroll.setWidget(self._inner)
 
@@ -673,20 +632,6 @@ class PlaylistListPanel(QFrame):
         self._inner_layout.addWidget(btn)
         self._buttons.append(btn)
 
-    def _on_new_playlist(self) -> None:
-        """Show the type picker dialog."""
-        dlg = NewPlaylistDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            choice = dlg.get_choice()
-            if choice:
-                self.new_playlist_requested.emit(choice)
-
-    def set_import_busy(self, busy: bool) -> None:
-        """Lock/unlock the Import and New Playlist buttons during import."""
-        self._import_btn.setEnabled(not busy)
-        self._new_btn.setEnabled(not busy)
-        self._import_btn.setText("Importing\u2026" if busy else "\u2193  Import Playlist")
-
     def _on_click(self, index: int) -> None:
         # Reset previous selection
         if self._selected_btn is not None:
@@ -732,17 +677,58 @@ class PlaylistBrowser(QFrame):
         super().__init__()
         self._current_playlist: dict | None = None
         self._editing = False
+        self._playlist_signature: tuple | None = None
 
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing((8))
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._header = BrowserHeroHeader("Playlists", self)
+        root.addWidget(self._header)
+
+        self._new_playlist_btn = QPushButton("New Playlist")
+        self._new_playlist_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.Bold))
+        self._new_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._new_playlist_btn.setStyleSheet(btn_css(
+            bg=Colors.ACCENT_DIM,
+            bg_hover=Colors.ACCENT_HOVER,
+            bg_press=Colors.ACCENT_PRESS,
+            fg=Colors.ACCENT,
+            border=f"1px solid {Colors.ACCENT_BORDER}",
+            padding="6px 10px",
+        ))
+        self._new_playlist_btn.clicked.connect(self._onNewPlaylistButton)
+        self._header.actions_layout.addWidget(self._new_playlist_btn)
+
+        self._import_playlist_btn = QPushButton("Import Playlist")
+        self._import_playlist_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._import_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_playlist_btn.setStyleSheet(btn_css(
+            bg=Colors.SURFACE_RAISED,
+            bg_hover=Colors.SURFACE_HOVER,
+            bg_press=Colors.SURFACE_ACTIVE,
+            fg=Colors.TEXT_PRIMARY,
+            border=f"1px solid {Colors.BORDER_SUBTLE}",
+            padding="6px 10px",
+        ))
+        self._import_playlist_btn.clicked.connect(self._onImportPlaylist)
+        self._header.actions_layout.addWidget(self._import_playlist_btn)
+        self._header.actions_layout.addStretch()
+
+        self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        style_browser_splitter(self._content_splitter)
+        root.addWidget(self._content_splitter, 1)
 
         # ── Left: playlist list panel ──
         self.listPanel = PlaylistListPanel()
         self.listPanel.playlist_selected.connect(self._onPlaylistSelected)
-        self.listPanel.new_playlist_requested.connect(self._onNewPlaylist)
-        self.listPanel.import_playlist_requested.connect(self._onImportPlaylist)
-        main_layout.addWidget(self.listPanel)
+        self._sidebar_pane = BrowserPane(
+            "Playlists",
+            min_width=220,
+            body_margins=(8, 2, 8, 8),
+        )
+        self._sidebar_pane.addWidget(self.listPanel, 1)
+        self._content_splitter.addWidget(self._sidebar_pane)
 
         # ── Right: vertical splitter (info-or-editor / track list) ──
         self.rightSplitter = QSplitter(Qt.Orientation.Vertical)
@@ -855,19 +841,12 @@ class PlaylistBrowser(QFrame):
         self.rightSplitter.setStretchFactor(0, 1)
         self.rightSplitter.setStretchFactor(1, 3)
         self.rightSplitter.setSizes([250, 600])
-        self.rightSplitter.setStyleSheet(f"""
-            QSplitter::handle {{
-                background: {Colors.BORDER_SUBTLE};
-            }}
-            QSplitter::handle:hover {{
-                background: {Colors.ACCENT};
-            }}
-            QSplitter::handle:pressed {{
-                background: {Colors.ACCENT_LIGHT};
-            }}
-        """)
+        style_browser_splitter(self.rightSplitter)
 
-        main_layout.addWidget(self.rightSplitter, stretch=1)
+        self._content_splitter.addWidget(self.rightSplitter)
+        self._content_splitter.setStretchFactor(0, 0)
+        self._content_splitter.setStretchFactor(1, 1)
+        self._content_splitter.setSizes([240, 760])
 
     # ─────────────────────────────────────────────────────────────
     # Public API
@@ -881,7 +860,12 @@ class PlaylistBrowser(QFrame):
             return
 
         playlists = cache.get_playlists()
+        signature = self._compute_playlist_signature(playlists)
+        if signature == self._playlist_signature:
+            return
+
         self.listPanel.loadPlaylists(playlists)
+        self._playlist_signature = signature
         self._switchToBrowse()
         self.infoCard.showEmpty()
         self.trackList.clearTable()
@@ -898,6 +882,23 @@ class PlaylistBrowser(QFrame):
         self.trackTitleBar.setTitle("Select a playlist")
         self.trackTitleBar.resetColor()
         self._current_playlist = None
+        self._playlist_signature = None
+
+    @staticmethod
+    def _compute_playlist_signature(playlists: list[dict]) -> tuple:
+        """Compute a lightweight signature to detect list changes quickly."""
+        return tuple(
+            sorted(
+                (
+                    int(pl.get("playlist_id", 0) or 0),
+                    str(pl.get("Title", "")),
+                    int(pl.get("mhip_child_count", 0) or 0),
+                    int(pl.get("master_flag", 0) or 0),
+                    str(pl.get("_source", "")),
+                )
+                for pl in playlists
+            )
+        )
 
     # ─────────────────────────────────────────────────────────────
     # Mode switching
@@ -923,6 +924,18 @@ class PlaylistBrowser(QFrame):
     # ─────────────────────────────────────────────────────────────
     # Slots
     # ─────────────────────────────────────────────────────────────
+
+    def _set_import_busy(self, busy: bool) -> None:
+        self._import_playlist_btn.setEnabled(not busy)
+        self._new_playlist_btn.setEnabled(not busy)
+        self._import_playlist_btn.setText("Importing…" if busy else "Import Playlist")
+
+    def _onNewPlaylistButton(self) -> None:
+        dlg = NewPlaylistDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            choice = dlg.get_choice()
+            if choice:
+                self._onNewPlaylist(choice)
 
     def _onPlaylistSelected(self, playlist: dict) -> None:
         """Handle when a playlist is clicked in the list panel."""
@@ -1060,6 +1073,7 @@ class PlaylistBrowser(QFrame):
         if cache.is_ready():
             playlists = cache.get_playlists()
             self.listPanel.loadPlaylists(playlists)
+            self._playlist_signature = self._compute_playlist_signature(playlists)
 
     def _onEditorCancelled(self) -> None:
         """Handle when the editor's Cancel button is clicked."""
@@ -1289,7 +1303,7 @@ class PlaylistBrowser(QFrame):
         from settings import get_settings
         settings = get_settings()
 
-        self.listPanel.set_import_busy(True)
+        self._set_import_busy(True)
         self._topStack.setCurrentIndex(3)
         self._import_progress_bar.setRange(0, 0)  # indeterminate
         self._import_status_label.setText("Parsing playlist…")
@@ -1317,7 +1331,7 @@ class PlaylistBrowser(QFrame):
         self._import_status_label.setText(message)
 
     def _onImportDone(self, playlist_name: str, added: int, already_present: int, skipped: int) -> None:
-        self.listPanel.set_import_busy(False)
+        self._set_import_busy(False)
         self._switchToBrowse()
         parts = []
         if added:
@@ -1334,7 +1348,7 @@ class PlaylistBrowser(QFrame):
         QTimer.singleShot(500, self._rescanAfterWrite)
 
     def _onImportFailed(self, error_msg: str) -> None:
-        self.listPanel.set_import_busy(False)
+        self._set_import_busy(False)
         self._switchToBrowse()
         QMessageBox.critical(self, "Import Failed", f"Could not import playlist:\n{error_msg}")
 

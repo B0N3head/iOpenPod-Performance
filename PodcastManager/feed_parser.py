@@ -38,7 +38,7 @@ def fetch_feed(url: str, existing: PodcastFeed | None = None) -> PodcastFeed:
         ValueError: If the feed contains no entries or is unparseable.
     """
     resp = requests.get(url, timeout=_TIMEOUT, headers={
-        "User-Agent": "iOpenPod/1.0.44 (Podcast Manager)",
+        "User-Agent": "iOpenPod/1.0.46 (Podcast Manager)",
     })
     resp.raise_for_status()
 

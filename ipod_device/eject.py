@@ -12,6 +12,7 @@ Strategies per platform:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -22,6 +23,18 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECS = 30
+_ALREADY_UNMOUNTED_HINTS = (
+    "not mounted",
+    "not currently mounted",
+    "already unmounted",
+)
+_MISSING_TARGET_HINTS = (
+    "no such file or directory",
+    "not found",
+    "no object",
+    "error looking up object",
+    "does not exist",
+)
 
 
 def eject_ipod(mount_path: str) -> tuple[bool, str]:
@@ -115,44 +128,58 @@ def _eject_macos(path: Path) -> tuple[bool, str]:
 
 def _eject_linux(path: Path) -> tuple[bool, str]:
     """Try udisksctl, then ``eject``, then ``umount``, in that order."""
-    device = _find_block_device(str(path))
+    mount_path = str(path)
+    device = _find_block_device(mount_path)
+    detach_target = (_parent_block_device(device) or device) if device else None
+    path_exists = path.exists()
+    detach_error: str | None = None
+    last_error: str | None = None
 
     if device and shutil.which("udisksctl"):
         ok, msg = _udisks_eject(device)
         if ok:
             return True, msg
+        detach_error = msg
+        last_error = msg
         logger.debug("udisksctl eject failed, falling back: %s", msg)
 
-    if shutil.which("eject"):
-        try:
-            proc = subprocess.run(
-                ["eject", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT_SECS,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "eject timed out."
-        if proc.returncode == 0:
-            return True, f"Ejected {path}"
-        logger.debug("eject command failed: %s", (proc.stderr or proc.stdout).strip())
+    if detach_target and shutil.which("eject"):
+        ok, msg = _run_eject_command(detach_target)
+        if ok:
+            return True, msg
+        if _is_benign_absence(msg):
+            return True, f"Device already detached: {detach_target}"
+        last_error = msg
+        logger.debug("eject command failed for %s: %s", detach_target, msg)
 
     if shutil.which("umount"):
-        try:
-            proc = subprocess.run(
-                ["umount", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT_SECS,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "umount timed out."
-        if proc.returncode == 0:
-            return True, f"Unmounted {path}"
-        err = (proc.stderr or proc.stdout).strip()
-        return False, err or "umount failed."
+        umount_targets: list[str] = []
+        if device:
+            umount_targets.append(device)
+        if path_exists:
+            umount_targets.append(mount_path)
 
-    return False, "No suitable unmount utility found (tried udisksctl, eject, umount)."
+        if not umount_targets and not device and not path_exists:
+            return True, "Device already unmounted."
+
+        for target in umount_targets:
+            ok, msg, already_unmounted = _run_umount_command(target)
+            if ok:
+                if detach_error and detach_target:
+                    return False, detach_error
+                return True, msg
+            if already_unmounted:
+                if detach_error and detach_target:
+                    return False, detach_error
+                return True, "Device already unmounted."
+            last_error = msg
+
+    if not device and not path_exists:
+        return True, "Device already unmounted."
+
+    if detach_error and detach_target:
+        return False, detach_error
+    return False, last_error or "No suitable unmount utility found (tried udisksctl, eject, umount)."
 
 
 def _find_block_device(mount_path: str) -> str | None:
@@ -166,28 +193,51 @@ def _find_block_device(mount_path: str) -> str | None:
                 timeout=5,
             )
             if proc.returncode == 0:
-                source = proc.stdout.strip()
-                if source:
+                source = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
+                if source.startswith("/dev/"):
                     return source
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
     # Fallback: scan /proc/mounts for the longest matching mountpoint.
+    best: str | None = None
     try:
         with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
-            best: str | None = None
             best_len = -1
             for line in f:
                 parts = line.split()
                 if len(parts) < 2:
                     continue
-                dev, mp = parts[0], parts[1].replace(r"\040", " ")
+                dev, mp = parts[0], _decode_mount_field(parts[1])
                 if mount_path == mp or mount_path.startswith(mp.rstrip("/") + "/"):
-                    if len(mp) > best_len:
+                    if dev.startswith("/dev/") and len(mp) > best_len:
                         best, best_len = dev, len(mp)
-            return best
     except OSError:
-        return None
+        pass
+
+    if shutil.which("lsblk"):
+        try:
+            proc = subprocess.run(
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                for dev_entry in data.get("blockdevices", []):
+                    for child in dev_entry.get("children", []):
+                        mountpoint = child.get("mountpoint") or ""
+                        if mountpoint == mount_path:
+                            name = child.get("name", "")
+                            if name:
+                                return f"/dev/{name}"
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    return best
 
 
 def _udisks_eject(device: str) -> tuple[bool, str]:
@@ -208,26 +258,81 @@ def _udisks_eject(device: str) -> tuple[bool, str]:
 
     if u.returncode != 0:
         err = (u.stderr or u.stdout).strip()
-        if "not mounted" not in err.lower():
+        if not _is_benign_absence(err):
             return False, err or "udisksctl unmount failed."
 
     parent = _parent_block_device(device)
-    if parent:
-        try:
-            subprocess.run(
-                [
-                    "udisksctl", "power-off",
-                    "--block-device", parent,
-                    "--no-user-interaction",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT_SECS,
-            )
-        except subprocess.TimeoutExpired:
-            pass  # unmount succeeded; power-off is best-effort
+    if not parent:
+        return True, f"Unmounted {device}"
 
-    return True, f"Ejected {device}"
+    try:
+        power = subprocess.run(
+            [
+                "udisksctl", "power-off",
+                "--block-device", parent,
+                "--no-user-interaction",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "udisksctl power-off timed out."
+
+    if power.returncode != 0:
+        err = (power.stderr or power.stdout).strip()
+        if _is_benign_absence(err):
+            return True, f"Device already detached: {parent}"
+        return False, err or "udisksctl power-off failed."
+
+    return True, f"Ejected {parent}"
+
+
+def _run_eject_command(target: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["eject", target],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "eject timed out."
+
+    if proc.returncode == 0:
+        return True, f"Ejected {target}"
+    err = (proc.stderr or proc.stdout).strip()
+    return False, err or "eject failed."
+
+
+def _run_umount_command(target: str) -> tuple[bool, str, bool]:
+    try:
+        proc = subprocess.run(
+            ["umount", target],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "umount timed out.", False
+
+    if proc.returncode == 0:
+        return True, f"Unmounted {target}", False
+
+    err = (proc.stderr or proc.stdout).strip()
+    if _is_benign_absence(err):
+        return False, err or "Device already unmounted.", True
+    return False, err or "umount failed.", False
+
+
+def _decode_mount_field(field: str) -> str:
+    """Decode octal escapes from ``/proc/mounts`` mountpoint fields."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _is_benign_absence(message: str) -> bool:
+    lower = message.lower()
+    return any(hint in lower for hint in _ALREADY_UNMOUNTED_HINTS + _MISSING_TARGET_HINTS)
 
 
 def _parent_block_device(device: str) -> str | None:

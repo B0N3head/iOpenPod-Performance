@@ -4,9 +4,9 @@ from .capabilities import (
     ArtworkFormat,
     _ART_CLASSIC,
     _ART_NANO_1G2G,
+    _ART_NANO_6G,
     _ART_NANO_4G,
     _ART_NANO_5G,
-    _ART_NANO_6G,
     _ART_PHOTO,
     _ART_VIDEO,
     capabilities_for_family_gen,
@@ -23,6 +23,9 @@ _EXTRA_FORMATS = (
     # iPod Nano 1G/2G photos
     ArtworkFormat(1023, 176, 132, 352, "RGB565_BE", "photo_full", "Nano full screen"),
     ArtworkFormat(1032, 42, 37, 84, "RGB565_LE", "photo_list", "Nano list thumbnail"),
+    # iPod Nano 7G photos
+    ArtworkFormat(1005, 80, 80, 160, "RGB565_LE", "photo_thumb", "Nano 7G photo thumbnail"),
+    ArtworkFormat(1007, 480, 864, 960, "RGB565_LE", "photo_full", "Nano 7G photo full screen"),
     # iPod Video photos
     ArtworkFormat(1024, 320, 240, 640, "RGB565_LE", "photo_full", "Video full screen"),
     ArtworkFormat(1036, 50, 41, 100, "RGB565_LE", "photo_list", "Video list thumbnail"),
@@ -36,6 +39,8 @@ _EXTRA_FORMATS = (
     ArtworkFormat(1079, 80, 80, 160, "RGB565_LE", "photo_thumb", "Nano 4G/5G photo thumbnail"),
     ArtworkFormat(1083, 320, 240, 640, "RGB565_LE", "photo_full", "Nano 4G photo full screen"),
     ArtworkFormat(1087, 384, 384, 768, "RGB565_LE", "photo_large", "Nano 5G photo large"),
+    ArtworkFormat(1092, 80, 80, 160, "RGB565_LE", "photo_thumb", "Nano 6G photo thumbnail"),
+    ArtworkFormat(1093, 512, 512, 1024, "RGB565_LE", "photo_full", "Nano 6G photo full screen"),
     # Legacy/mobile/touch formats documented in libgpod reverse-engineering
     ArtworkFormat(1081, 640, 480, 0, "JPEG", "photo_full", "JPEG photo format (experimental/legacy)"),
     ArtworkFormat(2002, 50, 50, 100, "RGB565_BE", "cover_small", "iPod Mobile cover art small"),
@@ -71,3 +76,25 @@ def ithmb_formats_for_device(
     if caps is None or not caps.supports_artwork:
         return {}
     return {af.format_id: (af.width, af.height) for af in caps.cover_art_formats}
+
+
+def photo_formats_for_device(
+    family: str,
+    generation: str,
+) -> dict[int, ArtworkFormat]:
+    """Return device-specific photo ithmb formats.
+
+    This is separate from cover-art formats because iPods keep slide-show/photo
+    caches in the ``Photos`` hierarchy rather than ``ArtworkDB``. The per-device
+    format IDs are sourced from ``DeviceCapabilities.photo_format_ids``.
+    """
+    caps = capabilities_for_family_gen(family, generation or "")
+    format_ids = caps.photo_format_ids if caps is not None else ()
+    if not format_ids:
+        return {}
+    result: dict[int, ArtworkFormat] = {}
+    for format_id in format_ids:
+        af = ITHMB_FORMAT_MAP.get(format_id)
+        if af is not None:
+            result[format_id] = af
+    return result

@@ -24,6 +24,11 @@ _SORTS = {
         ("Most Artists", "artist_count", True),
         ("Most Tracks", "track_count", True),
     ],
+    "Photos": [
+        ("Name", "title", False),
+        ("Largest", "size", True),
+        ("Most Albums", "album_count", True),
+    ],
 }
 
 _DEFAULT_LABEL = "Name"

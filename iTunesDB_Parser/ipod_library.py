@@ -20,12 +20,12 @@ import os
 from typing import Optional
 
 from .parser import parse_itunesdb
-from iTunesDB_Shared.constants import (
+from iTunesDB_Shared.extraction import (
     extract_datasets,
     extract_mhod_strings,
     extract_playlist_extras,
-    filetype_to_string,
 )
+from iTunesDB_Shared.field_base import filetype_to_string
 
 logger = logging.getLogger(__name__)
 

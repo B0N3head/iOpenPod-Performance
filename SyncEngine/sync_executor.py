@@ -29,6 +29,7 @@ from .mapping import MappingManager, MappingFile
 from .transcoder import transcode, needs_transcoding, resolve_transcode_plan, clear_caches as _clear_transcoder_caches
 from .audio_fingerprint import get_or_compute_fingerprint
 from .itunes_prefs import protect_from_itunes
+from .photos import apply_photo_sync_plan, read_photo_db
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Shared.constants import (
@@ -113,6 +114,11 @@ class SyncResult:
     tracks_updated_file: int = 0
     playcounts_synced: int = 0
     ratings_synced: int = 0
+    photos_added: int = 0
+    photos_removed: int = 0
+    photos_updated: int = 0
+    photo_albums_added: int = 0
+    photo_albums_removed: int = 0
     sound_check_computed: int = 0
     scrobbles_submitted: int = 0
     errors: list[tuple[str, str]] = field(default_factory=list)
@@ -139,6 +145,16 @@ class SyncResult:
             lines.append(f"  Synced play counts for {self.playcounts_synced} tracks")
         if self.ratings_synced:
             lines.append(f"  Synced ratings for {self.ratings_synced} tracks")
+        if self.photos_added:
+            lines.append(f"  Added {self.photos_added} photos")
+        if self.photos_removed:
+            lines.append(f"  Removed {self.photos_removed} photos")
+        if self.photos_updated:
+            lines.append(f"  Updated {self.photos_updated} device photo views")
+        if self.photo_albums_added:
+            lines.append(f"  Added {self.photo_albums_added} photo albums")
+        if self.photo_albums_removed:
+            lines.append(f"  Removed {self.photo_albums_removed} photo albums")
         if self.sound_check_computed:
             lines.append(f"  Computed Sound Check for {self.sound_check_computed} tracks")
         if self.scrobbles_submitted:
@@ -181,6 +197,7 @@ class _SyncContext:
     compute_sound_check: bool = False
     scrobble_on_sync: bool = False
     listenbrainz_token: str = ""
+    _is_scrobble_cancelled: Optional[Callable[[], bool]] = None
 
     # ── Result accumulator ──────────────────────────────────────────
     result: SyncResult = field(default_factory=lambda: SyncResult(success=True))
@@ -199,6 +216,7 @@ class _SyncContext:
     new_track_fingerprints: dict[int, str] = field(default_factory=dict)
     new_track_info: dict[int, tuple] = field(default_factory=dict)
     pc_file_paths: dict[int, str] = field(default_factory=dict)
+    final_photo_db: object | None = None
 
     _cancel_recorded: bool = False
 
@@ -270,6 +288,7 @@ class SyncExecutor:
         compute_sound_check: bool = False,
         scrobble_on_sync: bool = False,
         listenbrainz_token: str = "",
+        is_scrobble_cancelled: Optional[Callable[[], bool]] = None,
         on_cancel_with_partial: Optional[Callable[[int, int], bool]] = None,
     ) -> SyncResult:
         """Execute the sync plan.
@@ -295,6 +314,7 @@ class SyncExecutor:
             compute_sound_check=compute_sound_check,
             scrobble_on_sync=scrobble_on_sync,
             listenbrainz_token=listenbrainz_token,
+            _is_scrobble_cancelled=is_scrobble_cancelled,
         )
 
         if not self._preflight_checks(ctx):
@@ -590,11 +610,31 @@ class SyncExecutor:
 
     def _preflight_checks(self, ctx: _SyncContext) -> bool:
         """Return False (and populate ctx.result) if sync cannot proceed."""
-        if not ctx.dry_run and ctx.plan.storage.bytes_to_add > 0:
+        if not ctx.dry_run and (ctx.plan.storage.bytes_to_add > 0 or ctx.plan.to_update_file):
             try:
                 disk = shutil.disk_usage(self.ipod_path)
+
+                # Updates can increase file size (e.g., re-encoding to a higher
+                # AAC bitrate). Account for positive growth so we fail early
+                # instead of deleting/replacing tracks until space runs out.
+                update_growth = 0
+                for item in ctx.plan.to_update_file:
+                    est = item.estimated_size or 0
+                    if est <= 0:
+                        continue
+                    old_size_raw = 0
+                    if item.ipod_track is not None:
+                        old_size_raw = item.ipod_track.get("size", 0) or 0
+                    try:
+                        old_size = int(old_size_raw)
+                    except (TypeError, ValueError):
+                        old_size = 0
+                    if est > old_size:
+                        update_growth += est - old_size
+
                 needed = (ctx.plan.storage.bytes_to_add
                           - ctx.plan.storage.bytes_to_remove
+                          + update_growth
                           + _DB_OVERHEAD_BYTES)
                 if needed > 0 and disk.free < needed:
                     free_mb = disk.free / (1024 * 1024)
@@ -760,6 +800,23 @@ class SyncExecutor:
             self._update_podcast_subscriptions(ctx)
 
             self._clear_gui_cache(ctx)
+
+            if ctx.plan.photo_plan:
+                ctx.final_photo_db = apply_photo_sync_plan(
+                    self.ipod_path,
+                    ctx.plan.photo_plan,
+                    progress_callback=lambda stage, cur, total, msg: ctx.progress(
+                        stage, cur, total, message=msg,
+                    ),
+                    is_cancelled=ctx._is_cancelled,
+                )
+                ctx.result.photos_added = len(ctx.plan.photo_plan.photos_to_add)
+                ctx.result.photos_removed = len(ctx.plan.photo_plan.photos_to_remove)
+                ctx.result.photos_updated = len(ctx.plan.photo_plan.photos_to_update)
+                ctx.result.photo_albums_added = len(ctx.plan.photo_plan.albums_to_add)
+                ctx.result.photo_albums_removed = len(ctx.plan.photo_plan.albums_to_remove)
+            else:
+                ctx.final_photo_db = read_photo_db(self.ipod_path)
 
             self._apply_itunes_protections(ctx, all_tracks)
             self._delete_playcounts_file()
@@ -1012,6 +1069,7 @@ class SyncExecutor:
                 return (item, False, None, False, "No source track")
             source_path = Path(item.pc_track.path)
             need_transcode = needs_transcoding(source_path)
+            expected_write_bytes = item.estimated_size if item.estimated_size and item.estimated_size > 0 else item.pc_track.size
 
             with completed_lock:
                 worker_sizes[worker_id] = item.pc_track.size
@@ -1054,6 +1112,7 @@ class SyncExecutor:
                 transcode_progress=transcode_cb,
                 copy_progress=copy_cb,
                 is_cancelled=ctx._is_cancelled,
+                expected_write_bytes=expected_write_bytes,
             )
             return (item, success, ipod_path, was_transcoded, err_msg)
 
@@ -1153,16 +1212,12 @@ class SyncExecutor:
                 ctx.result.tracks_updated_file += 1
             return
 
-        # Pre-process: delete old files and invalidate cache (sequential, fast)
+        # Pre-process: invalidate cache only.
+        # Old iPod files are deleted only after replacement copy succeeds,
+        # so failed updates cannot leave the DB pointing at missing files.
         for item in ctx.plan.to_update_file:
             if item.pc_track is None:
                 continue
-            if item.ipod_track:
-                file_path = item.ipod_track.get("Location") or item.ipod_track.get("location")
-                if file_path:
-                    relative_path = file_path.replace(":", "/").lstrip("/")
-                    full_path = self.ipod_path / relative_path
-                    self._delete_from_ipod(full_path)
             if item.fingerprint:
                 self.transcode_cache.invalidate(item.fingerprint)
 
@@ -1175,6 +1230,7 @@ class SyncExecutor:
             db_id = item.db_id
             if db_id and db_id in ctx.tracks_by_db_id:
                 existing_track = ctx.tracks_by_db_id[db_id]
+                old_location = existing_track.location
                 if existing_track.location in ctx.tracks_by_location:
                     del ctx.tracks_by_location[existing_track.location]
                 existing_track.location = ipod_location
@@ -1207,6 +1263,15 @@ class SyncExecutor:
                 # (media_type is already set from the original file, no change needed)
 
                 ctx.tracks_by_location[ipod_location] = existing_track
+
+                # Replacement succeeded: remove the old on-device file path.
+                if old_location and old_location != ipod_location:
+                    try:
+                        old_rel = old_location.replace(":", "/").lstrip("/")
+                        old_full = self.ipod_path / old_rel
+                        self._delete_from_ipod(old_full)
+                    except Exception as exc:
+                        logger.warning("Could not remove old iPod file %s: %s", old_location, exc)
 
             if db_id:
                 ctx.pc_file_paths[db_id] = str(source_path)
@@ -1622,19 +1687,66 @@ class SyncExecutor:
         try:
             from .scrobbler import scrobble_plays
 
+            def _format_elapsed(seconds: float) -> str:
+                total = max(int(seconds), 0)
+                mins, secs = divmod(total, 60)
+                hrs, mins = divmod(mins, 60)
+                if hrs:
+                    return f"{hrs}h {mins}m {secs}s"
+                if mins:
+                    return f"{mins}m {secs}s"
+                return f"{secs}s"
+
+            def _on_timeout(elapsed: float, attempt: int, timeout_s: int) -> None:
+                ctx.progress(
+                    "scrobble",
+                    0,
+                    1,
+                    message=(
+                        "Connecting to ListenBrainz is taking a while. "
+                        "Still trying to connect. "
+                        f"Elapsed {_format_elapsed(elapsed)} "
+                        f"(attempt {attempt}, request timeout {timeout_s}s)."
+                    ),
+                )
+
+            def _should_abort_scrobble() -> bool:
+                if ctx._is_scrobble_cancelled and ctx._is_scrobble_cancelled():
+                    return True
+                if ctx._is_cancelled and ctx._is_cancelled():
+                    return True
+                return False
+
             scrobble_results = scrobble_plays(
                 playcount_items=ctx.plan.to_sync_playcount,
                 listenbrainz_token=lb_token,
+                on_timeout=_on_timeout,
+                should_abort=_should_abort_scrobble,
             )
 
             total_accepted = 0
+            gave_up = False
             for sr in scrobble_results:
                 total_accepted += sr.accepted
                 for err in sr.errors:
+                    if "User gave up" in err:
+                        gave_up = True
                     logger.warning("Scrobble error (%s): %s", sr.service, err)
 
             ctx.result.scrobbles_submitted = total_accepted
             logger.info("Scrobbled %d plays total", total_accepted)
+
+            if gave_up:
+                ctx.progress(
+                    "scrobble",
+                    1,
+                    1,
+                    message=(
+                        "Stopped trying to connect to ListenBrainz. "
+                        "Sync is complete; you can retry scrobbling on the next sync."
+                    ),
+                )
+                return
 
         except Exception as exc:
             logger.warning("Scrobbling failed (non-fatal): %s", exc)
@@ -1680,8 +1792,8 @@ class SyncExecutor:
         # Determine music_dirs from device capabilities
         music_dirs = _DEFAULT_MUSIC_DIRS
         try:
-            from device_info import get_current_device
-            from ipod_models import capabilities_for_family_gen
+            from ipod_device import get_current_device
+            from ipod_device import capabilities_for_family_gen
             dev = get_current_device()
             if dev and dev.model_family:
                 caps = capabilities_for_family_gen(
@@ -1730,6 +1842,7 @@ class SyncExecutor:
         transcode_progress: Optional[Callable[[float], None]] = None,
         copy_progress: Optional[Callable[[float], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        expected_write_bytes: Optional[int] = None,
     ) -> tuple[bool, Optional[Path], bool, str]:
         """
         Copy or transcode a file to iPod, using cache when possible.
@@ -1744,11 +1857,12 @@ class SyncExecutor:
         """
         dest_folder = self._get_next_media_folder()
         source_size = source_path.stat().st_size
+        write_size = expected_write_bytes if expected_write_bytes and expected_write_bytes > 0 else source_size
 
         # Safety check: abort if writing this file would leave below the reserve
         try:
             free = shutil.disk_usage(self.ipod_path).free
-            if free - source_size < _DISK_RESERVE_BYTES:
+            if free - write_size < _DISK_RESERVE_BYTES:
                 free_mb = free / (1024 * 1024)
                 reserve_mb = _DISK_RESERVE_BYTES / (1024 * 1024)
                 raise _OutOfSpaceError(
@@ -1781,6 +1895,8 @@ class SyncExecutor:
                         )
                         logger.info("Used cached transcode: %s", source_path.name)
                         return True, final_path, True, ""
+                    except _OutOfSpaceError:
+                        raise
                     except Exception as e:
                         logger.warning("Cache copy failed, will transcode: %s", e)
 
@@ -1848,6 +1964,8 @@ class SyncExecutor:
             try:
                 self._copy_file_chunked(source_path, dest_path, copy_progress, is_cancelled=is_cancelled)
                 return True, dest_path, False, ""
+            except _OutOfSpaceError:
+                raise
             except Exception as e:
                 logger.error("Copy failed: %s", e)
                 return False, None, False, str(e)
@@ -1862,27 +1980,29 @@ class SyncExecutor:
         """Copy *src* to *dst* in chunks, calling *progress(0.0‒1.0)* periodically."""
         total = src.stat().st_size
         copied = 0
-        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-            while True:
-                if is_cancelled and is_cancelled():
-                    # Clean up partial file
-                    fdst.close()
-                    fsrc.close()
-                    try:
-                        dst.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    raise _CancelledError()
-                buf = fsrc.read(chunk_size)
-                if not buf:
-                    break
-                fdst.write(buf)
-                copied += len(buf)
-                if progress and total:
-                    progress(copied / total)
-        # Final callback in case total was 0 (empty file)
-        if progress:
-            progress(1.0)
+        try:
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                while True:
+                    if is_cancelled and is_cancelled():
+                        raise _CancelledError()
+                    buf = fsrc.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    copied += len(buf)
+                    if progress and total:
+                        progress(copied / total)
+            # Final callback in case total was 0 (empty file)
+            if progress:
+                progress(1.0)
+        except Exception as e:
+            try:
+                dst.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+                raise _OutOfSpaceError("No space left on iPod while writing file") from e
+            raise
 
     def _delete_from_ipod(self, ipod_path: str | Path) -> bool:
         """Delete a file from iPod."""
@@ -1974,6 +2094,20 @@ class SyncExecutor:
             totals[bucket][1] += t.length // 1000
             totals[bucket][2] += 1
 
+        photo_db = ctx.final_photo_db if ctx.final_photo_db is not None else read_photo_db(self.ipod_path)
+        total_photos = len(getattr(photo_db, "photos", {}))
+        total_photo_bytes = sum(getattr(photo_db, "file_sizes", {}).values())
+
+        try:
+            from ipod_device import get_current_device
+            dev = get_current_device()
+            caps = dev.capabilities if dev else None
+            supports_photos = bool(caps and caps.supports_photo)
+            supports_videos = bool(caps and caps.supports_video)
+        except Exception:
+            supports_photos = total_photos > 0
+            supports_videos = True
+
         try:
             protect_from_itunes(
                 self.ipod_path,
@@ -1995,6 +2129,10 @@ class SyncExecutor:
                 music_video_tracks=totals["mv"][2],
                 music_video_bytes=totals["mv"][0],
                 music_video_seconds=totals["mv"][1],
+                total_photos=total_photos,
+                total_photo_bytes=total_photo_bytes,
+                supports_photos=supports_photos,
+                supports_videos=supports_videos,
             )
         except Exception as e:
             logger.warning("iTunesPrefs protection failed (non-fatal): %s", e)

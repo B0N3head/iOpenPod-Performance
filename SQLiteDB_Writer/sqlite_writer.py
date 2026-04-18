@@ -29,8 +29,8 @@ from typing import Optional
 
 from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Writer.mhyp_writer import PlaylistInfo
-from ipod_models import ChecksumType, DeviceCapabilities
-from device_info import detect_checksum_type, get_firewire_id
+from ipod_device import ChecksumType, DeviceCapabilities
+from ipod_device import detect_checksum_type, get_firewire_id
 
 from .library_writer import write_library_itdb
 from .locations_writer import write_locations_itdb

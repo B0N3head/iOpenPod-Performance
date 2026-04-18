@@ -1697,6 +1697,7 @@ def _resolve_model(
         return resolved
 
     if _use_serial:
+        serial_info = serial_info or {}
         resolved["serial"] = serial
         resolved["model_number"] = serial_info.get("model_number", "")
         resolved["model_family"] = serial_info.get("model_family", "iPod")
@@ -2042,7 +2043,7 @@ def _identify_via_serial_lookup(serial: str) -> Optional[dict]:
 def _estimate_capacity_from_disk_size(disk_gb: float) -> str:
     """Estimate marketed capacity from actual disk size.
 
-    .. deprecated:: Use :func:`device_info._estimate_capacity_from_disk_size` directly.
+    .. deprecated:: Use :func:`ipod_device.info._estimate_capacity_from_disk_size` directly.
     """
     from .info import _estimate_capacity_from_disk_size as _impl
     return _impl(disk_gb)
@@ -2051,7 +2052,7 @@ def _estimate_capacity_from_disk_size(disk_gb: float) -> str:
 def _try_vpd_identification(ipod: DeviceInfo) -> None:
     """Attempt full VPD-based identification for an incompletely resolved iPod.
 
-    Delegates to :func:`ipod_usb_query.identify_via_vpd` which handles all
+    Delegates to :func:`ipod_device.vpd_libusb.identify_via_vpd` which handles all
     platforms (IOKit on macOS, pyusb on Linux/Windows).
 
     SysInfo writing is NOT done here — the authority module handles it

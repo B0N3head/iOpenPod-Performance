@@ -27,13 +27,15 @@ def read_existing_database(ipod_path: Path) -> dict:
     """
     from iTunesDB_Parser import parse_itunesdb
     from iTunesDB_Parser.playcounts import parse_playcounts, merge_playcounts
-    from iTunesDB_Shared.constants import (
-        extract_datasets, extract_mhod_strings, extract_playlist_extras,
-        filetype_to_string,
+    from iTunesDB_Shared.extraction import (
+        extract_datasets,
+        extract_mhod_strings,
+        extract_playlist_extras,
     )
+    from iTunesDB_Shared.field_base import filetype_to_string
 
     empty = {"tracks": [], "playlists": [], "smart_playlists": []}
-    from device_info import resolve_itdb_path
+    from ipod_device import resolve_itdb_path
     _resolved = resolve_itdb_path(str(ipod_path))
     itdb_path = Path(_resolved) if _resolved else ipod_path / "iPod_Control" / "iTunes" / "iTunesDB"
     if not itdb_path.exists():
@@ -158,8 +160,8 @@ def write_database(
     # Resolve capabilities once for the writer
     capabilities = None
     try:
-        from device_info import get_current_device
-        from ipod_models import capabilities_for_family_gen
+        from ipod_device import get_current_device
+        from ipod_device import capabilities_for_family_gen
         dev = get_current_device()
         if dev and dev.model_family:
             capabilities = capabilities_for_family_gen(
@@ -203,7 +205,7 @@ def write_database(
             # use the same persistent ID — firmware cross-references both.
             db_pid = 0
             try:
-                from device_info import resolve_itdb_path
+                from ipod_device import resolve_itdb_path
                 cdb_path = resolve_itdb_path(str(ipod_path))
                 if cdb_path:
                     with open(cdb_path, "rb") as _f:
@@ -217,7 +219,7 @@ def write_database(
             # Get FireWire ID for cbk signing
             firewire_id = None
             try:
-                from device_info import get_firewire_id
+                from ipod_device import get_firewire_id
                 firewire_id = get_firewire_id(str(ipod_path))
             except Exception as e:
                 logger.warning("Could not get FireWire ID for SQLite cbk: %s", e)

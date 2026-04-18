@@ -77,7 +77,7 @@ def download_episode(
         episode.audio_url,
         stream=True,
         timeout=_TIMEOUT,
-        headers={"User-Agent": "iOpenPod/1.0.44 (Podcast Manager)"},
+        headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
     )
     resp.raise_for_status()
 
@@ -150,7 +150,7 @@ def embed_feed_artwork(file_path: str, artwork_url: str) -> bool:
         # Download the artwork image
         resp = requests.get(
             artwork_url, timeout=15,
-            headers={"User-Agent": "iOpenPod/1.0.44 (Podcast Manager)"},
+            headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
         )
         resp.raise_for_status()
         art_data = resp.content

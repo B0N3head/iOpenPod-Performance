@@ -66,6 +66,15 @@ class MainWindow(QMainWindow):
         self._quick_pl_timer.setInterval(1500)  # 1.5 s debounce
         self._quick_pl_timer.timeout.connect(self._start_quick_playlist_sync)
 
+        # Defer expensive theme rebuilds (e.g., match-iPod accent) so device
+        # load/UI hydration is not blocked on the same event-loop turn.
+        self._pending_theme_rebuild = False
+        self._theme_rebuild_restore_page = 0
+        self._theme_rebuild_timer = QTimer(self)
+        self._theme_rebuild_timer.setSingleShot(True)
+        self._theme_rebuild_timer.setInterval(20)
+        self._theme_rebuild_timer.timeout.connect(self._run_deferred_theme_rebuild)
+
         # Central widget with stacked layout for main/sync views
         self.centralStack = QStackedWidget()
         self.setCentralWidget(self.centralStack)
@@ -81,6 +90,7 @@ class MainWindow(QMainWindow):
 
         # Connect cache ready signal to refresh UI
         iTunesDBCache.get_instance().data_ready.connect(self.onDataReady)
+        self.musicBrowser.photoBrowser.bind_cache(iTunesDBCache.get_instance())
 
         # Schedule an immediate write whenever track flags are edited in the UI
         iTunesDBCache.get_instance().tracks_changed.connect(self._schedule_quick_meta_write)
@@ -95,7 +105,7 @@ class MainWindow(QMainWindow):
                 # Run a quick scan so discovered_ipod is populated
                 # (needed for FireWire GUID, model info, etc.)
                 try:
-                    from GUI.device_scanner import scan_for_ipods
+                    from ipod_device import scan_for_ipods
                     found_ipod = False
                     for ipod in scan_for_ipods():
                         if os.path.normpath(ipod.path) == os.path.normpath(settings.last_device_path):
@@ -255,31 +265,38 @@ class MainWindow(QMainWindow):
         if restore_page is None:
             restore_page = self.centralStack.currentIndex()
 
-        app = QApplication.instance()
-        if isinstance(app, QApplication):
-            app.setPalette(build_palette())
-            app.setStyleSheet(app_stylesheet())
+        self.setUpdatesEnabled(False)
+        try:
+            app = QApplication.instance()
+            if isinstance(app, QApplication):
+                app.setPalette(build_palette())
+                app.setStyleSheet(app_stylesheet())
 
-        # Tear down existing widgets
-        while self.centralStack.count():
-            w = self.centralStack.widget(0)
-            if w is not None:
-                self.centralStack.removeWidget(w)
-                w.deleteLater()
+            # Tear down existing widgets
+            while self.centralStack.count():
+                w = self.centralStack.widget(0)
+                if w is not None:
+                    self.centralStack.removeWidget(w)
+                    w.deleteLater()
 
-        # Rebuild with newly set styles
-        self._build_ui()
+            # Rebuild with newly set styles
+            self._build_ui()
+            self.musicBrowser.photoBrowser.bind_cache(iTunesDBCache.get_instance())
 
-        # Restore page and settings state
-        self.settingsPage.load_from_settings()
-        self.centralStack.setCurrentIndex(
-            min(restore_page, self.centralStack.count() - 1)
-        )
+            # Restore page and settings state
+            self.settingsPage.load_from_settings()
+            self.centralStack.setCurrentIndex(
+                min(restore_page, self.centralStack.count() - 1)
+            )
 
-        # If cache is loaded, reload UI from cache
-        cache = iTunesDBCache.get_instance()
-        if cache.get_tracks():
-            self.onDataReady()
+            # If cache is loaded, reload UI from cache.
+            # Use get_data() rather than get_tracks() so device info still
+            # repopulates for empty libraries / partial parser data.
+            cache = iTunesDBCache.get_instance()
+            if cache.get_data() is not None:
+                self.onDataReady()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _on_theme_changed(self):
         """Rebuild the entire UI after a live theme switch (from settings)."""
@@ -312,6 +329,12 @@ class MainWindow(QMainWindow):
 
     def onDeviceChanged(self, path: str):
         """Handle device selection - start loading data."""
+        # Cancel any pending style rebuild from a prior device before starting
+        # a new load cycle.
+        if self._theme_rebuild_timer.isActive():
+            self._theme_rebuild_timer.stop()
+        self._pending_theme_rebuild = False
+
         # Clear the thread pool of pending tasks
         thread_pool = ThreadPoolSingleton.get_instance()
         thread_pool.clear()
@@ -320,6 +343,7 @@ class MainWindow(QMainWindow):
         clear_artworkdb_cache()
 
         self.musicBrowser.reloadData()
+        self.sidebar.clearDeviceInfo()
 
         if path:
             self._show_default_page()
@@ -346,15 +370,14 @@ class MainWindow(QMainWindow):
         db_data = cache.get_data()
         classified = self._classify_tracks(tracks)
 
-        from device_info import get_current_device
+        from ipod_device import get_current_device
         from iTunesDB_Shared.constants import get_version_name
         dev = get_current_device()
 
-        # If accent is "match-ipod", apply device color and rebuild UI so
-        # every widget picks up the new accent.
+        # If accent is "match-ipod", apply the device color and schedule a
+        # deferred full rebuild so we do not block this load callback.
         if self._apply_match_ipod_accent(dev):
-            self._rebuild_themed_ui(restore_page=0)
-            return  # _rebuild_themed_ui calls onDataReady again via cache check
+            self._schedule_themed_rebuild(restore_page=0)
 
         # Refresh disk usage so the storage bar reflects post-sync changes
         if dev and dev.path:
@@ -392,6 +415,19 @@ class MainWindow(QMainWindow):
         self._update_podcast_statuses()
         self.musicBrowser.onDataReady()
 
+    def _schedule_themed_rebuild(self, restore_page: int = 0) -> None:
+        """Queue a deferred themed UI rebuild if one is not already pending."""
+        self._theme_rebuild_restore_page = restore_page
+        if self._pending_theme_rebuild:
+            return
+        self._pending_theme_rebuild = True
+        self._theme_rebuild_timer.start()
+
+    def _run_deferred_theme_rebuild(self) -> None:
+        """Execute a previously scheduled themed rebuild."""
+        self._pending_theme_rebuild = False
+        self._rebuild_themed_ui(restore_page=self._theme_rebuild_restore_page)
+
     def _apply_match_ipod_accent(self, dev=None):
         """Re-apply accent color when 'match-ipod' is active and device is known.
 
@@ -402,25 +438,25 @@ class MainWindow(QMainWindow):
         if s.accent_color != "match-ipod":
             return False
         if dev is None:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
-        if not dev:
-            return False
+
         # Resolve the image filename for this device
-        from ipod_models import resolve_image_filename, image_for_model
+        from ipod_device import resolve_image_filename, image_for_model
         img = ""
-        if dev.model_number:
+        if dev and dev.model_number:
             img = image_for_model(dev.model_number)
-        if not img and dev.model_family and dev.generation:
+        if not img and dev and dev.model_family and dev.generation:
             img = resolve_image_filename(
                 dev.model_family, dev.generation, dev.color or "",
             )
-        if not img:
-            return False
+
         from GUI.styles import resolve_accent_color, Colors
         accent_hex = resolve_accent_color("match-ipod", img)
-        if accent_hex == "blue":
-            return False  # no color found, keep default
+
+        # Always apply the resolved accent, including "blue" fallback.
+        # This ensures switching from a colorful device to a gray/white/black
+        # device resets the UI back to the default accent.
         old_accent = Colors.ACCENT
         Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
         return Colors.ACCENT != old_accent
@@ -447,15 +483,18 @@ class MainWindow(QMainWindow):
 
     def _update_sidebar_visibility(self, classified: dict[str, list]) -> None:
         """Show/hide sidebar categories based on tracks and device capabilities."""
-        from device_info import get_current_device
+        from ipod_device import get_current_device
         dev = get_current_device()
         caps = dev.capabilities if dev else None
 
         has_video = len(classified["video"]) > 0
         has_podcast = len(classified["podcast"]) > 0
+        photodb = iTunesDBCache.get_instance().get_photo_db()
+        has_photos = bool(photodb and getattr(photodb, "photos", {}))
 
         self.sidebar.setVideoVisible(has_video or (caps.supports_video if caps else False))
         self.sidebar.setPodcastVisible(has_podcast or (caps.supports_podcast if caps else False))
+        self.sidebar.setPhotoVisible(has_photos or (caps.supports_photo if caps else False))
 
     def _onDeviceRenamed(self, new_name: str):
         """Handle device rename from sidebar — update master playlist and write to iPod."""
@@ -470,7 +509,7 @@ class MainWindow(QMainWindow):
 
         # Update DeviceInfo.ipod_name
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
             if dev:
                 dev.ipod_name = new_name
@@ -715,7 +754,7 @@ class MainWindow(QMainWindow):
         self.syncReview.show_loading()
 
         # Check device video capability
-        from device_info import get_current_device
+        from ipod_device import get_current_device
         dev = get_current_device()
         caps = dev.capabilities if dev else None
         supports_video = bool(caps and caps.supports_video)
@@ -726,6 +765,7 @@ class MainWindow(QMainWindow):
         ipod_tracks = cache.get_tracks()
 
         track_edits = cache.get_track_edits()
+        photo_edits = cache.get_photo_edits()
         try:
             sync_workers = settings.sync_workers
             rating_strategy = settings.rating_conflict_strategy
@@ -742,6 +782,7 @@ class MainWindow(QMainWindow):
             supports_video=supports_video,
             supports_podcast=supports_podcast,
             track_edits=track_edits,
+            photo_edits=photo_edits,
             sync_workers=sync_workers,
             rating_strategy=rating_strategy,
         )
@@ -956,7 +997,7 @@ class MainWindow(QMainWindow):
         self.centralStack.setCurrentIndex(1)
         self.syncReview.show_loading()
 
-        from device_info import get_current_device
+        from ipod_device import get_current_device
         dev = get_current_device()
         caps = dev.capabilities if dev else None
         supports_video = bool(caps and caps.supports_video)
@@ -965,6 +1006,16 @@ class MainWindow(QMainWindow):
         cache = iTunesDBCache.get_instance()
         ipod_tracks = cache.get_tracks()
         track_edits = cache.get_track_edits()
+        selected_track_paths = selected_paths
+        selected_photo_imports = ()
+        if isinstance(selected_paths, dict):
+            selected_track_paths = frozenset(selected_paths.get("tracks", ()))
+            selected_photo_imports = tuple(selected_paths.get("photos", ()))
+
+        photo_edits = None
+        if selected_photo_imports:
+            from SyncEngine.photos import PhotoEditState
+            photo_edits = PhotoEditState(imported_files=list(selected_photo_imports))
         settings = get_settings()
         try:
             sync_workers = settings.sync_workers
@@ -981,9 +1032,10 @@ class MainWindow(QMainWindow):
             supports_video=supports_video,
             supports_podcast=supports_podcast,
             track_edits=track_edits,
+            photo_edits=photo_edits,
             sync_workers=sync_workers,
             rating_strategy=rating_strategy,
-            allowed_paths=frozenset(selected_paths),
+            allowed_paths=frozenset(selected_track_paths),
         )
         self._sync_worker.progress.connect(self.syncReview.update_progress)
         self._sync_worker.finished.connect(self._onSyncDiffComplete)
@@ -1099,6 +1151,7 @@ class MainWindow(QMainWindow):
             playlists_to_add=original_plan.playlists_to_add if (original_plan and include_playlists) else [],
             playlists_to_edit=original_plan.playlists_to_edit if (original_plan and include_playlists) else [],
             playlists_to_remove=original_plan.playlists_to_remove if (original_plan and include_playlists) else [],
+            photo_plan=self.syncReview.get_selected_photo_plan() if original_plan else None,
         )
 
         if not filtered_plan.has_changes:
@@ -1121,6 +1174,7 @@ class MainWindow(QMainWindow):
                 c._user_playlists.clear()
             if c.has_pending_track_edits():
                 c.clear_track_edits()
+            c.clear_photo_edits()
 
         # Start sync execution worker
         self._sync_execute_worker = SyncExecuteWorker(
@@ -1136,6 +1190,7 @@ class MainWindow(QMainWindow):
         self._sync_execute_worker.confirm_partial_save.connect(self._onConfirmPartialSave)
         # Allow the user to skip the in-progress backup from the progress screen
         self.syncReview.skip_backup_signal.connect(self._sync_execute_worker.request_skip_backup)
+        self.syncReview.give_up_scrobble_signal.connect(self._sync_execute_worker.request_give_up_scrobble)
         self._sync_execute_worker.start()
 
     def _onSyncExecuteComplete(self, result):
@@ -1265,9 +1320,13 @@ class MainWindow(QMainWindow):
         self.sidebar.show_save_indicator("error")
 
     def _disconnect_skip_signal(self):
-        """Disconnect skip_backup_signal from the finished worker."""
+        """Disconnect worker control signals from the finished worker."""
         try:
             self.syncReview.skip_backup_signal.disconnect()
+        except TypeError:
+            pass  # Already disconnected
+        try:
+            self.syncReview.give_up_scrobble_signal.disconnect()
         except TypeError:
             pass  # Already disconnected
 
@@ -1813,7 +1872,7 @@ class DeviceManager(QObject):
         if path is None:
             self._discovered_ipod = None
             # Clear centralized device store
-            from device_info import clear_current_device
+            from ipod_device import clear_current_device
             clear_current_device()
         self.device_changed.emit(path or "")
 
@@ -1821,7 +1880,7 @@ class DeviceManager(QObject):
     def itunesdb_path(self) -> str | None:
         if not self._device_path:
             return None
-        from device_info import resolve_itdb_path
+        from ipod_device import resolve_itdb_path
         return resolve_itdb_path(self._device_path)
 
     @property
@@ -1849,7 +1908,7 @@ class DeviceManager(QObject):
         The scanner already calls ``enrich()`` so devices arrive
         fully populated — no conversion or re-probing needed.
         """
-        from device_info import set_current_device, clear_current_device
+        from ipod_device import set_current_device, clear_current_device
 
         if ipod is None:
             clear_current_device()
@@ -1866,6 +1925,7 @@ class iTunesDBCache(QObject):
     playlists_changed = pyqtSignal()   # Emitted when user playlists are added/edited/removed
     playlist_quick_sync = pyqtSignal()  # Emitted when playlists should be written to iPod immediately
     tracks_changed = pyqtSignal()       # Emitted when track flags are modified (pending sync)
+    photos_changed = pyqtSignal()       # Emitted when staged photo state changes
 
     def __init__(self):
         super().__init__()
@@ -1879,12 +1939,15 @@ class iTunesDBCache(QObject):
         self._artist_index: dict | None = None  # artist -> list of tracks
         self._genre_index: dict | None = None   # genre -> list of tracks
         self._track_id_index: dict | None = None  # trackID -> track dict
+        self._photo_db = None
         # User-created/edited playlists (persisted in memory until sync)
         self._user_playlists: list[dict] = []
         # Pending track flag edits: db_id -> { field: (original, new), ... }
         # Originals are captured on first edit so the diff engine can
         # revert in-memory track dicts before comparing.
         self._track_edits: dict[int, dict[str, tuple]] = {}
+        from SyncEngine.photos import PhotoEditState
+        self._photo_edits = PhotoEditState()
 
     @classmethod
     def get_instance(cls) -> "iTunesDBCache":
@@ -1903,8 +1966,11 @@ class iTunesDBCache(QObject):
             self._artist_index = None
             self._genre_index = None
             self._track_id_index = None
+            self._photo_db = None
             self._user_playlists.clear()
             self._track_edits.clear()
+            from SyncEngine.photos import PhotoEditState
+            self._photo_edits = PhotoEditState()
 
     def invalidate(self):
         """Mark cached data stale so the next start_loading() re-parses."""
@@ -1944,6 +2010,17 @@ class iTunesDBCache(QObject):
         """Get album list from cached data."""
         data = self.get_data()
         return list(data.get("mhla", [])) if data else []
+
+    def get_photo_db(self):
+        data = self.get_data()
+        return data.get("photodb") if data else None
+
+    def replace_photo_db(self, photodb) -> None:
+        with self._lock:
+            self._photo_db = photodb
+            if self._data is not None:
+                self._data["photodb"] = photodb
+        self.photos_changed.emit()
 
     def get_album_index(self) -> dict:
         """Get pre-computed album index: (album, artist) -> list of tracks."""
@@ -2159,6 +2236,50 @@ class iTunesDBCache(QObject):
         with self._lock:
             self._track_edits.clear()
 
+    def get_photo_edits(self):
+        with self._lock:
+            return self._photo_edits
+
+    def clear_photo_edits(self) -> None:
+        from SyncEngine.photos import PhotoEditState
+        with self._lock:
+            self._photo_edits = PhotoEditState()
+        self.photos_changed.emit()
+
+    def has_pending_photo_edits(self) -> bool:
+        with self._lock:
+            return bool(self._photo_edits.has_changes)
+
+    def stage_photo_import(self, source_path: str, album_name: str = "") -> None:
+        with self._lock:
+            self._photo_edits.imported_files.append((source_path, album_name))
+        self.photos_changed.emit()
+
+    def stage_photo_album_create(self, album_name: str) -> None:
+        with self._lock:
+            self._photo_edits.created_albums.add(album_name)
+        self.photos_changed.emit()
+
+    def stage_photo_album_rename(self, old_name: str, new_name: str) -> None:
+        with self._lock:
+            self._photo_edits.renamed_albums[old_name] = new_name
+        self.photos_changed.emit()
+
+    def stage_photo_album_delete(self, album_name: str) -> None:
+        with self._lock:
+            self._photo_edits.deleted_albums.add(album_name)
+        self.photos_changed.emit()
+
+    def stage_photo_membership_remove(self, visual_hash: str, album_name: str) -> None:
+        with self._lock:
+            self._photo_edits.membership_removals.add((visual_hash, album_name))
+        self.photos_changed.emit()
+
+    def stage_photo_delete(self, visual_hash: str) -> None:
+        with self._lock:
+            self._photo_edits.deleted_photos.add(visual_hash)
+        self.photos_changed.emit()
+
     def pop_track_edits(self) -> "dict[int, dict[str, tuple]]":
         """Atomically return and clear all pending track edits."""
         with self._lock:
@@ -2226,6 +2347,7 @@ class iTunesDBCache(QObject):
             self._artist_index = artist_index
             self._genre_index = genre_index
             self._track_id_index = track_id_index
+            self._photo_db = data.get("photodb")
         # Emit signal outside lock to avoid deadlock
         self.data_ready.emit()
 
@@ -2252,14 +2374,38 @@ class iTunesDBCache(QObject):
         # Start background load
         worker = Worker(self._load_data, device.device_path, device.itunesdb_path)
         worker.signals.result.connect(self._on_load_complete)
+        worker.signals.error.connect(self._on_load_error)
         ThreadPoolSingleton.get_instance().start(worker)
 
     def _load_data(self, device_path: str, itunesdb_path: str) -> tuple:
         """Background thread: parse the iTunesDB and merge Play Counts."""
-        from iTunesDB_Parser.ipod_library import load_ipod_library
+        data: dict = {}
 
-        data = load_ipod_library(itunesdb_path)
+        try:
+            from iTunesDB_Parser.ipod_library import load_ipod_library
+            parsed = load_ipod_library(itunesdb_path) or {}
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                logger.warning("iTunesDB parser returned unexpected type: %s", type(parsed).__name__)
+        except Exception:
+            logger.exception("Failed to load iTunesDB for device: %s", device_path)
+
+        try:
+            from SyncEngine.photos import read_photo_db
+            data["photodb"] = read_photo_db(device_path)
+        except Exception:
+            logger.exception("Failed to load photo database for device: %s", device_path)
+            from SyncEngine.photos import PhotoDB
+            data["photodb"] = PhotoDB()
+
         return (data, device_path)
+
+    def _on_load_error(self, error: tuple) -> None:
+        """Reset loading state when background load worker errors."""
+        exctype, value, _tb = error
+        logger.error("Device load worker failed: %s: %s", getattr(exctype, "__name__", str(exctype)), value)
+        self.set_loading(False)
 
     def _on_load_complete(self, result: tuple):
         """Called when background load finishes."""

@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QWidget, QGridLayout, QFileDialog, QMessageBox, QFrame,
 )
 
-from device_info import DeviceInfo
-from ..device_scanner import scan_for_ipods
+from ipod_device import DeviceInfo
+from ipod_device import scan_for_ipods
 from ..ipod_images import get_ipod_image
 from ..styles import Colors, FONT_FAMILY, Metrics, btn_css, accent_btn_css, make_scroll_area
 

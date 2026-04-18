@@ -10,7 +10,6 @@ from .field_schema import (
     SCHEMA,
     FieldStatus,
     covered_ranges,
-    fields_for_chunk,
 )
 from .hypothesis_db import HypothesisDB
 from .models import ParsedDatabase
@@ -89,7 +88,6 @@ def annotated_hex(
         target = matching[chunk_index]
 
     raw = target.raw_header
-    fields = fields_for_chunk(target.chunk_type)
     covered = covered_ranges(target.chunk_type, len(raw))
 
     # Build offset → annotation map.

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from device_info import generate_library_id  # noqa: F401  — canonical loc is device_info
+from ipod_device import generate_library_id
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,10 @@ def _build_device_totals(
     music_video_tracks: int = 0,
     music_video_bytes: int = 0,
     music_video_seconds: int = 0,
+    total_photos: int = 0,
+    total_photo_bytes: int = 0,
+    supports_photos: bool = True,
+    supports_videos: bool = True,
 ) -> dict:
     """Build an EstimatedDeviceTotals dict for writing to the plist."""
     try:
@@ -255,8 +259,8 @@ def _build_device_totals(
         "supportsAudio": True,
         "supportsBooks": False,
         "supportsGames": True,
-        "supportsPhotos": True,
-        "supportsVideos": True,
+        "supportsPhotos": supports_photos,
+        "supportsVideos": supports_videos,
         "totalAlertToneBytes": 0,
         "totalAlertToneSeconds": 0,
         "totalAlertToneTracks": 0,
@@ -290,8 +294,8 @@ def _build_device_totals(
         "totalMusicVideoBytes": music_video_bytes,
         "totalMusicVideoSeconds": music_video_seconds,
         "totalMusicVideoTracks": music_video_tracks,
-        "totalPhotoBytes": 0,
-        "totalPhotos": 0,
+        "totalPhotoBytes": total_photo_bytes,
+        "totalPhotos": total_photos,
         "totalPodcastBytes": podcast_bytes,
         "totalPodcastSeconds": podcast_seconds,
         "totalPodcastTracks": podcast_tracks,

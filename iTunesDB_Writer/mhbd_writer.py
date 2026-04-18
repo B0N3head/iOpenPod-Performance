@@ -80,8 +80,8 @@ from .mhli_writer import write_mhli
 from dataclasses import replace as _dc_replace
 from .mhit_writer import TrackInfo
 from .mhyp_writer import PlaylistInfo, generate_playlist_id
-from ipod_models import ChecksumType, DeviceCapabilities
-from device_info import detect_checksum_type
+from ipod_device import ChecksumType, DeviceCapabilities
+from ipod_device import detect_checksum_type
 from .hash58 import write_hash58
 from .hashab import write_hashab
 from iTunesDB_Shared.field_base import (
@@ -98,7 +98,7 @@ logger = logging.getLogger(__name__)
 
 # Default database version — 0x4F (79) works for iPod Classic / Nano 3G+.
 # For older devices, callers should pass `db_version` from
-# ``ipod_models.DeviceCapabilities.db_version``.
+# ``ipod_device.DeviceCapabilities.db_version``.
 DATABASE_VERSION_DEFAULT = 0x4F
 
 
@@ -233,7 +233,7 @@ def write_mhbd(
                               an existing database via extract_preserved_mhsd_blobs().
                               Appended verbatim after the 5 standard datasets to
                               preserve Genius and other iTunes-generated data.
-        capabilities: Device capabilities from ``ipod_models``.  When provided,
+        capabilities: Device capabilities from ``ipod_device``.  When provided,
                       ``db_version`` and ``supports_podcast`` are respected.
         master_playlist_name: Display name for the auto-generated master playlist.
 
@@ -535,7 +535,7 @@ def write_mhbd(
 
     # +0x48: Library Persistent ID — must match iTunesPrefs (macOS protection)
     try:
-        from device_info import generate_library_id
+        from ipod_device import generate_library_id
         lib_pid = struct.unpack('<Q', generate_library_id())[0]
     except Exception:
         lib_pid = reference_info.get('db_persistent_id', db_id) if reference_info else db_id
@@ -631,14 +631,14 @@ def write_itunesdb(
         playlists: List of PlaylistInfo for user playlists (dataset 2).
                    Master playlist is auto-generated; does NOT belong in this list.
         smart_playlists: List of PlaylistInfo for dataset 5 smart playlists.
-        capabilities: Device capabilities from ``ipod_models``.  Auto-detected
+        capabilities: Device capabilities from ``ipod_device``.  Auto-detected
                       from the current device if not provided.
         master_playlist_name: Display name for the auto-generated master playlist.
 
     Returns:
         True if successful
     """
-    from device_info import resolve_itdb_path, itdb_write_filename
+    from ipod_device import resolve_itdb_path, itdb_write_filename
 
     def _progress(msg: str) -> None:
         if progress_callback is not None:
@@ -653,8 +653,8 @@ def write_itunesdb(
     # Auto-detect capabilities from the centralized device store
     if capabilities is None:
         try:
-            from device_info import get_current_device
-            from ipod_models import capabilities_for_family_gen
+            from ipod_device import get_current_device
+            from ipod_device import capabilities_for_family_gen
             dev = get_current_device()
             if dev and dev.model_family:
                 capabilities = capabilities_for_family_gen(
@@ -971,7 +971,7 @@ def write_itunesdb(
         # Try to get FireWire ID from parameter, SysInfo, SysInfoExtended, or Windows registry
         if firewire_id is None:
             try:
-                from device_info import get_firewire_id
+                from ipod_device import get_firewire_id
                 firewire_id = get_firewire_id(ipod_path)
             except Exception as e:
                 logger.warning("Could not get FireWire ID: %s", e)
@@ -995,7 +995,7 @@ def write_itunesdb(
 
         hash_info = None
         try:
-            from device_info import get_current_device
+            from ipod_device import get_current_device
             dev = get_current_device()
             if dev and dev.hash_info_iv and dev.hash_info_rndpart:
                 hash_info = HashInfo(uuid=b'\x00' * 20, rndpart=dev.hash_info_rndpart, iv=dev.hash_info_iv)
@@ -1052,7 +1052,7 @@ def write_itunesdb(
         # Requires FireWire ID (same as HASH58)
         if firewire_id is None:
             try:
-                from device_info import get_firewire_id
+                from ipod_device import get_firewire_id
                 firewire_id = get_firewire_id(ipod_path)
             except Exception as e:
                 logger.warning("Could not get FireWire ID for HASHAB: %s", e)

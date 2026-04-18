@@ -31,6 +31,7 @@ import html
 import os
 import logging
 from typing import Callable, Optional
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class SyncWorker(QThread):
     def __init__(self, pc_folder: str, ipod_tracks: list, ipod_path: str = "",
                  supports_video: bool = True, supports_podcast: bool = True,
                  *, track_edits: dict | None = None,
+                 photo_edits=None,
                  sync_workers: int = 0, rating_strategy: str = "ipod_wins",
                  allowed_paths: frozenset[str] | None = None):
         super().__init__()
@@ -59,6 +61,7 @@ class SyncWorker(QThread):
         self.supports_video = supports_video
         self.supports_podcast = supports_podcast
         self.track_edits = track_edits
+        self.photo_edits = photo_edits
         self.sync_workers = sync_workers
         self.rating_strategy = rating_strategy
         self.allowed_paths = allowed_paths
@@ -81,6 +84,7 @@ class SyncWorker(QThread):
                 progress_callback=lambda stage, cur, tot, msg: self.progress.emit(stage, cur, tot, msg),
                 is_cancelled=self.isInterruptionRequested,
                 track_edits=self.track_edits,
+                photo_edits=self.photo_edits,
                 sync_workers=self.sync_workers,
                 rating_strategy=self.rating_strategy,
                 allowed_paths=self.allowed_paths,
@@ -116,6 +120,7 @@ class SyncExecuteWorker(QThread):
         self._skip_backup_requested = False
         self.user_playlists = user_playlists
         self.on_sync_complete = on_sync_complete
+        self._give_up_scrobble_requested = False
         self._partial_save_event: "threading.Event | None" = None
         self._partial_save_decision: list[bool] = [True]
 
@@ -128,6 +133,10 @@ class SyncExecuteWorker(QThread):
     def request_skip_backup(self):
         """Signal the worker to skip the in-progress backup and proceed to sync."""
         self._skip_backup_requested = True
+
+    def request_give_up_scrobble(self):
+        """Signal the worker to stop retrying ListenBrainz scrobbles."""
+        self._give_up_scrobble_requested = True
 
     def run(self):
         try:
@@ -246,6 +255,7 @@ class SyncExecuteWorker(QThread):
                 compute_sound_check=settings.compute_sound_check,
                 scrobble_on_sync=settings.scrobble_on_sync,
                 listenbrainz_token=settings.listenbrainz_token or "",
+                is_scrobble_cancelled=lambda: self._give_up_scrobble_requested,
                 on_cancel_with_partial=_on_cancel_with_partial,
             )
 
@@ -1047,6 +1057,7 @@ class SyncReviewWidget(QWidget):
 
     sync_requested = pyqtSignal(object)  # Emits list[SyncItem]
     skip_backup_signal = pyqtSignal()     # Skip the in-progress pre-sync backup
+    give_up_scrobble_signal = pyqtSignal()  # Stop retrying scrobble timeouts
     cancelled = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -1060,12 +1071,14 @@ class SyncReviewWidget(QWidget):
         self._is_auto_presync: bool = False
         self._completed_stages: list = []
         self._current_exec_stage = ""
+        self._scrobble_timeout_retrying = False
         # Debounce timer for selection count updates (avoids O(n²) on bulk toggles)
         self._count_timer = QTimer(self)
         self._count_timer.setSingleShot(True)
         self._count_timer.setInterval(0)  # fires on next event loop iteration
         self._count_timer.timeout.connect(self._do_update_selection_count)
         self._playlist_card: SyncCategoryCard | None = None
+        self._photo_card_meta: list[tuple[str, SyncCategoryCard]] = []
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1544,6 +1557,9 @@ class SyncReviewWidget(QWidget):
         "backup": "Creating pre-sync backup",
         "transcode": "Transcoding",
         "scrobble": "Scrobbling to ListenBrainz",
+        "scan_photos": "Scanning photos",
+        "photo_prepare": "Preparing photos",
+        "photo_write": "Writing photo database",
     }
 
     def _friendly_stage(self, stage: str) -> str:
@@ -1611,6 +1627,7 @@ class SyncReviewWidget(QWidget):
         self._plan = plan
         self._category_cards.clear()
         self._playlist_card = None
+        self._photo_card_meta.clear()
         self._storage_frame.setVisible(False)  # reset until updated
 
         # Clear previous cards
@@ -1651,6 +1668,15 @@ class SyncReviewWidget(QWidget):
         self._set_footer_for_state("plan")
 
         # ── Summary stats pills ─────────────────────────────────────
+        def _track_add_bytes(items: list[SyncItem]) -> int:
+            return sum(
+                (it.estimated_size if it.estimated_size is not None else (it.pc_track.size if it.pc_track else 0))
+                for it in items
+            )
+
+        def _track_remove_bytes(items: list[SyncItem]) -> int:
+            return sum((it.ipod_track.get("size", 0) if it.ipod_track else 0) for it in items)
+
         def _add_pill(text: str, color: str):
             pill = QLabel(text, self._stats_bar)
             pill.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
@@ -1675,6 +1701,12 @@ class SyncReviewWidget(QWidget):
             _add_pill(f"♪ {len(plan.to_sync_playcount)} plays", _CAT_COLORS["playcount"])
         if plan.to_sync_rating:
             _add_pill(f"★ {len(plan.to_sync_rating)} ratings", _CAT_COLORS["rating"])
+        if plan.photo_plan and plan.photo_plan.photos_to_add:
+            _add_pill(f"🖼 {len(plan.photo_plan.photos_to_add)} photos", _CAT_COLORS["add"])
+        if plan.photo_plan and plan.photo_plan.photos_to_remove:
+            _add_pill(f"🗑 {len(plan.photo_plan.photos_to_remove)} photos", _CAT_COLORS["remove"])
+        if plan.photo_plan and plan.photo_plan.albums_to_add:
+            _add_pill(f"📚 {len(plan.photo_plan.albums_to_add)} albums", _CAT_COLORS["playlist"])
 
         # Net size pill
         if plan.storage.bytes_to_add or plan.storage.bytes_to_remove:
@@ -1688,6 +1720,10 @@ class SyncReviewWidget(QWidget):
             len(plan.to_update_metadata), len(plan.to_update_file),
             len(plan.to_update_artwork),
             len(plan.to_sync_playcount), len(plan.to_sync_rating),
+            len(plan.photo_plan.photos_to_add) if plan.photo_plan else 0,
+            len(plan.photo_plan.photos_to_remove) if plan.photo_plan else 0,
+            len(plan.photo_plan.albums_to_add) if plan.photo_plan else 0,
+            len(plan.photo_plan.albums_to_remove) if plan.photo_plan else 0,
         ])
         summary_text = (
             f"{plan.total_pc_tracks} PC tracks · "
@@ -1752,7 +1788,7 @@ class SyncReviewWidget(QWidget):
                     _insert_card(card)
             else:
                 card = SyncCategoryCard("plus", "Add to iPod", len(plan.to_add),
-                                        _CAT_COLORS["add"], size_bytes=plan.storage.bytes_to_add,
+                                        _CAT_COLORS["add"], size_bytes=_track_add_bytes(plan.to_add),
                                         subtitle="New tracks found on PC — will be copied to iPod",
                                         parent=self._cards_container)
                 for item in plan.to_add:
@@ -1788,7 +1824,7 @@ class SyncReviewWidget(QWidget):
                     _insert_card(card)
             else:
                 card = SyncCategoryCard("minus", "Remove from iPod", len(plan.to_remove),
-                                        _CAT_COLORS["remove"], size_bytes=-plan.storage.bytes_to_remove,
+                                        _CAT_COLORS["remove"], size_bytes=-_track_remove_bytes(plan.to_remove),
                                         start_checked=_rm_checked,
                                         subtitle="No longer in PC library — will be deleted from iPod",
                                         parent=self._cards_container)
@@ -1800,8 +1836,12 @@ class SyncReviewWidget(QWidget):
 
         # ── Re-sync changed files ───────────────────────────────────
         if plan.to_update_file:
+            update_file_bytes = sum(
+                (item.estimated_size if item.estimated_size is not None else (item.pc_track.size if item.pc_track else 0))
+                for item in plan.to_update_file
+            )
             card = SyncCategoryCard("refresh", "Re-sync Changed Files", len(plan.to_update_file),
-                                    _CAT_COLORS["update_file"], size_bytes=plan.storage.bytes_to_update,
+                                    _CAT_COLORS["update_file"], size_bytes=update_file_bytes,
                                     subtitle="Audio file changed on PC — will be re-copied to iPod",
                                     parent=self._cards_container)
             for item in plan.to_update_file:
@@ -1893,6 +1933,117 @@ class SyncReviewWidget(QWidget):
             self._category_cards.append(card)
             self._playlist_card = card
             _insert_card(card)
+
+        # ── Photo changes ─────────────────────────────────────────────
+        if plan.photo_plan:
+            photo_plan = plan.photo_plan
+
+            def _add_photo_card(key: str, title: str, count: int, accent: str, subtitle: str,
+                                rows: list[tuple[str, str]], *, start_checked: bool = True,
+                                size_bytes: int = 0) -> None:
+                if not count:
+                    return
+                card = SyncCategoryCard(
+                    "photo", title, count, accent,
+                    checkable=True, start_expanded=False, start_checked=start_checked,
+                    size_bytes=size_bytes,
+                    subtitle=subtitle,
+                    parent=self._cards_container,
+                )
+                for row_title, row_detail in rows[:60]:
+                    card.add_info_row(row_title, row_detail)
+                if len(rows) > 60:
+                    card.add_info_row(f"...and {len(rows) - 60} more", "")
+                card.selection_changed.connect(self._schedule_selection_update)
+                self._category_cards.append(card)
+                self._photo_card_meta.append((key, card))
+                _insert_card(card)
+
+            _add_photo_card(
+                "photos_to_add",
+                "Add Photos",
+                len(photo_plan.photos_to_add),
+                _CAT_COLORS["add"],
+                "New still images found in the sync folder",
+                [
+                    (
+                        item.display_name,
+                        " · ".join(part for part in [
+                            ", ".join(sorted(a for a in item.album_names if a)) or "All Photos",
+                            item.source_path,
+                        ] if part),
+                    )
+                    for item in photo_plan.photos_to_add
+                ],
+                size_bytes=photo_plan.thumb_bytes_to_add,
+            )
+            _add_photo_card(
+                "photos_to_remove",
+                "Remove Photos",
+                len(photo_plan.photos_to_remove),
+                _CAT_COLORS["remove"],
+                "Photos missing from the sync folder",
+                [
+                    (
+                        item.display_name,
+                        " · ".join(part for part in [
+                            ", ".join(sorted(a for a in item.album_names if a)) or "All Photos",
+                            item.source_path,
+                        ] if part),
+                    )
+                    for item in photo_plan.photos_to_remove
+                ],
+                start_checked=False,
+                size_bytes=-photo_plan.thumb_bytes_to_remove,
+            )
+            _add_photo_card(
+                "photos_to_update",
+                "Update Device Photos",
+                len(photo_plan.photos_to_update),
+                _CAT_COLORS["metadata"],
+                "Device photo viewing settings changed",
+                [
+                    (
+                        item.display_name,
+                        item.source_path or item.description,
+                    )
+                    for item in photo_plan.photos_to_update
+                ],
+            )
+            _add_photo_card(
+                "albums_to_add",
+                "Create Photo Albums",
+                len(photo_plan.albums_to_add),
+                _CAT_COLORS["playlist"],
+                "Nested folders found in the sync root",
+                [(item.album_name, f"{item.item_count} photo{'s' if item.item_count != 1 else ''}") for item in photo_plan.albums_to_add],
+            )
+            _add_photo_card(
+                "albums_to_remove",
+                "Remove Photo Albums",
+                len(photo_plan.albums_to_remove),
+                _CAT_COLORS["remove"],
+                "Albums no longer present in the sync root",
+                [(item.album_name, f"{item.item_count} photo{'s' if item.item_count != 1 else ''}") for item in photo_plan.albums_to_remove],
+                start_checked=False,
+            )
+            _add_photo_card(
+                "album_membership_adds",
+                "Add Photos To Albums",
+                len(photo_plan.album_membership_adds),
+                _CAT_COLORS["playlist"],
+                "Existing device photos matched by image content",
+                [(item.display_name, f"{item.album_name} · {item.source_path}") for item in photo_plan.album_membership_adds],
+            )
+            _add_photo_card(
+                "album_membership_removes",
+                "Remove Photos From Albums",
+                len(photo_plan.album_membership_removes),
+                _CAT_COLORS["remove"],
+                "Album memberships no longer present in the sync root",
+                [(item.display_name, item.album_name) for item in photo_plan.album_membership_removes],
+                start_checked=False,
+            )
 
         # ── Fingerprint errors ──────────────────────────────────────
         if plan.fingerprint_errors:
@@ -2023,6 +2174,7 @@ class SyncReviewWidget(QWidget):
     def show_executing(self):
         """Show executing state - similar to loading but for sync execution."""
         self._cancelled = False
+        self._scrobble_timeout_retrying = False
         self._completed_stages = []
         self._current_exec_stage = ""
         self._eta_tracker.start()
@@ -2106,9 +2258,17 @@ class SyncReviewWidget(QWidget):
 
         # During the backup stage, repurpose the footer cancel as "Skip"
         is_backup = (stage == "backup")
+        is_scrobble_timeout = (
+            stage == "scrobble"
+            and "still trying to connect" in message.lower()
+        )
+        self._scrobble_timeout_retrying = is_scrobble_timeout
         self._backup_hint.setVisible(is_backup and self._is_auto_presync)
         if is_backup:
             self.cancel_btn.setText("Skip Backup && Sync")
+            self.cancel_btn.setEnabled(True)
+        elif is_scrobble_timeout:
+            self.cancel_btn.setText("Give Up Scrobble")
             self.cancel_btn.setEnabled(True)
         else:
             self.cancel_btn.setText("Cancel")
@@ -2210,6 +2370,11 @@ class SyncReviewWidget(QWidget):
         updated_file = getattr(result, 'tracks_updated_file', 0)
         playcounts = getattr(result, 'playcounts_synced', 0)
         ratings = getattr(result, 'ratings_synced', 0)
+        photos_added = getattr(result, 'photos_added', 0)
+        photos_removed = getattr(result, 'photos_removed', 0)
+        photos_updated = getattr(result, 'photos_updated', 0)
+        photo_albums_added = getattr(result, 'photo_albums_added', 0)
+        photo_albums_removed = getattr(result, 'photo_albums_removed', 0)
 
         if added:
             lines.append(f"<span style='color: {Colors.SUCCESS};'>Added {added} track{'s' if added != 1 else ''}</span>")
@@ -2226,6 +2391,16 @@ class SyncReviewWidget(QWidget):
             lines.append(f"<span style='color: {Colors.INFO};'>Scrobbled {scrobbles} play{'s' if scrobbles != 1 else ''} to ListenBrainz</span>")
         if ratings:
             lines.append(f"<span style='color: {Colors.WARNING};'>Synced ratings for {ratings} track{'s' if ratings != 1 else ''}</span>")
+        if photos_added:
+            lines.append(f"<span style='color: {Colors.SUCCESS};'>Added {photos_added} photo{'s' if photos_added != 1 else ''}</span>")
+        if photos_removed:
+            lines.append(f"<span style='color: {Colors.DANGER};'>Removed {photos_removed} photo{'s' if photos_removed != 1 else ''}</span>")
+        if photos_updated:
+            lines.append(f"<span style='color: {Colors.INFO};'>Updated {photos_updated} device photo view{'s' if photos_updated != 1 else ''}</span>")
+        if photo_albums_added:
+            lines.append(f"<span style='color: {Colors.INFO};'>Created {photo_albums_added} photo album{'s' if photo_albums_added != 1 else ''}</span>")
+        if photo_albums_removed:
+            lines.append(f"<span style='color: {Colors.INFO};'>Removed {photo_albums_removed} photo album{'s' if photo_albums_removed != 1 else ''}</span>")
 
         if not lines:
             lines.append("No changes were made.")
@@ -2297,7 +2472,7 @@ class SyncReviewWidget(QWidget):
         self.result_details.setTextFormat(Qt.TextFormat.RichText)
 
         # Update summary
-        total_actions = added + removed + updated_file + updated_meta + playcounts + ratings
+        total_actions = added + removed + updated_file + updated_meta + playcounts + ratings + photos_added + photos_removed + photos_updated + photo_albums_added + photo_albums_removed
         if partial_save:
             self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} saved (partial sync)")
         else:
@@ -2324,6 +2499,10 @@ class SyncReviewWidget(QWidget):
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Skipping backup…")
                 self.skip_backup_signal.emit()
+            elif self._current_exec_stage == "scrobble" and self._scrobble_timeout_retrying:
+                self.cancel_btn.setEnabled(False)
+                self.cancel_btn.setText("Giving up…")
+                self.give_up_scrobble_signal.emit()
             else:
                 # Full cancel
                 self._cancelled = True
@@ -2399,6 +2578,21 @@ class SyncReviewWidget(QWidget):
                         elif item.pc_track:
                             bytes_to_add += item.pc_track.size
 
+        for _key, card in self._photo_card_meta:
+            total += 1
+            if card._select_all_cb.isChecked():
+                selected += 1
+
+        if self._plan is not None and self._plan.photo_plan is not None:
+            selected_photo_keys = {
+                key for key, card in self._photo_card_meta
+                if card._select_all_cb.isChecked()
+            }
+            if "photos_to_add" in selected_photo_keys:
+                bytes_to_add += self._plan.photo_plan.thumb_bytes_to_add
+            if "photos_to_remove" in selected_photo_keys:
+                bytes_to_remove += self._plan.photo_plan.thumb_bytes_to_remove
+
         # Build git-diff style size string
         size_parts = []
         if bytes_to_add > 0:
@@ -2430,9 +2624,39 @@ class SyncReviewWidget(QWidget):
             selected_items.extend(card.get_checked_items())
         return selected_items
 
+    def get_selected_photo_plan(self):
+        from SyncEngine.photos import PhotoSyncPlan
+
+        if self._plan is None or self._plan.photo_plan is None:
+            return None
+
+        original = self._plan.photo_plan
+        selected = PhotoSyncPlan(
+            skipped_files=list(original.skipped_files),
+            current_db=original.current_db,
+            desired_library=original.desired_library,
+        )
+        selected.photos_to_update = list(original.photos_to_update)
+
+        included = {key for key, card in self._photo_card_meta if card._select_all_cb.isChecked()}
+        for key in (
+            "albums_to_add",
+            "albums_to_remove",
+            "photos_to_add",
+            "photos_to_remove",
+            "photos_to_update",
+            "album_membership_adds",
+            "album_membership_removes",
+        ):
+            setattr(selected, key, copy.deepcopy(getattr(original, key)) if key in included else [])
+        selected.thumb_bytes_to_add = original.thumb_bytes_to_add if "photos_to_add" in included else 0
+        selected.thumb_bytes_to_remove = original.thumb_bytes_to_remove if "photos_to_remove" in included else 0
+        return selected if selected.has_changes else None
+
     def _apply_sync(self):
         """Show confirmation, then pre-sync backup prompt before syncing."""
         selected_items = self._get_selected_items()
+        selected_photo_plan = self.get_selected_photo_plan()
 
         # Check if there are playlist changes even when no track items selected
         # Playlist card is now checkable — only include if the card's select-all is checked
@@ -2448,7 +2672,7 @@ class SyncReviewWidget(QWidget):
             and bool(getattr(self._plan, '_integrity_removals', []))
         )
 
-        if not selected_items and not playlists_selected and not has_integrity_fixes:
+        if not selected_items and not playlists_selected and not has_integrity_fixes and not (selected_photo_plan and selected_photo_plan.has_changes):
             QMessageBox.information(self, "No Selection", "Please select items to sync.")
             return
 
@@ -2460,6 +2684,11 @@ class SyncReviewWidget(QWidget):
         art_count = sum(1 for s in selected_items if s.action == SyncAction.UPDATE_ARTWORK)
         playcount_count = sum(1 for s in selected_items if s.action == SyncAction.SYNC_PLAYCOUNT)
         rating_count = sum(1 for s in selected_items if s.action == SyncAction.SYNC_RATING)
+        photo_add_count = len(selected_photo_plan.photos_to_add) if selected_photo_plan else 0
+        photo_remove_count = len(selected_photo_plan.photos_to_remove) if selected_photo_plan else 0
+        photo_update_count = len(selected_photo_plan.photos_to_update) if selected_photo_plan else 0
+        photo_album_add_count = len(selected_photo_plan.albums_to_add) if selected_photo_plan else 0
+        photo_album_remove_count = len(selected_photo_plan.albums_to_remove) if selected_photo_plan else 0
 
         msg_parts = []
         if add_count:
@@ -2476,6 +2705,16 @@ class SyncReviewWidget(QWidget):
             msg_parts.append(f"Sync {playcount_count} play counts")
         if rating_count:
             msg_parts.append(f"Sync {rating_count} ratings")
+        if photo_add_count:
+            msg_parts.append(f"Add {photo_add_count} photos")
+        if photo_remove_count:
+            msg_parts.append(f"Remove {photo_remove_count} photos")
+        if photo_update_count:
+            msg_parts.append(f"Update {photo_update_count} device photos")
+        if photo_album_add_count:
+            msg_parts.append(f"Create {photo_album_add_count} photo albums")
+        if photo_album_remove_count:
+            msg_parts.append(f"Remove {photo_album_remove_count} photo albums")
 
         # Playlist changes (only if playlist card is checked)
         if playlists_selected and self._plan:

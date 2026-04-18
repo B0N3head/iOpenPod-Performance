@@ -3,8 +3,8 @@ macOS-only IOKit SCSI VPD query for iPods.
 
 Uses IOKit's SCSITaskLib CFPlugIn to send SCSI INQUIRY VPD commands
 directly to iPod hardware without requiring root, driver detach, or
-disk unmount.  Provides the same dict shape as ipod_usb_query so
-device_info._enrich_from_usb_vpd can consume it unchanged.
+disk unmount.  Provides the same dict shape as vpd_libusb so
+ipod_device.info._enrich_from_usb_vpd can consume it unchanged.
 
 Requirements:  macOS only (IOKit framework).  No third-party packages.
 """
@@ -33,7 +33,7 @@ from ctypes import (
 from typing import Optional
 
 if sys.platform != "darwin":
-    raise ImportError("ipod_iokit_query is macOS-only")
+    raise ImportError("ipod_device.vpd_iokit is macOS-only")
 
 log = logging.getLogger(__name__)
 

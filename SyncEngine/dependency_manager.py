@@ -107,7 +107,7 @@ def _download(url: str, dest: Path, progress_callback=None) -> bool:
     """Download a URL to a file. Returns True on success."""
     logger.info(f"Downloading {url}")
     try:
-        req = Request(url, headers={"User-Agent": "iOpenPod/1.0.44"})
+        req = Request(url, headers={"User-Agent": "iOpenPod/1.0.46"})
         with urlopen(req, timeout=120) as resp:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0

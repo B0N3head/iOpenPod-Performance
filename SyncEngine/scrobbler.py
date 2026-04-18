@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,26 @@ class RateLimitInfo:
         )
 
 
+class ScrobbleAborted(Exception):
+    """Raised when the user chooses to stop retrying scrobbles."""
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return True when an exception represents a network timeout."""
+    if isinstance(exc, TimeoutError | socket.timeout):
+        return True
+
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, TimeoutError | socket.timeout):
+            return True
+        text = str(reason).lower()
+        return "timed out" in text or "timeout" in text
+
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 # ── Low-level HTTP helpers ──────────────────────────────────────────────────
 
 def _make_request(
@@ -139,6 +160,8 @@ def _make_request(
     body: Optional[bytes] = None,
     params: Optional[dict[str, str]] = None,
     timeout: int = 30,
+    on_timeout: Optional[Callable[[float, int, int], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> tuple[dict, RateLimitInfo]:
     """Send an HTTP request to the ListenBrainz API.
 
@@ -157,7 +180,14 @@ def _make_request(
     if params:
         url += "?" + urllib.parse.urlencode(params)
 
-    for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
+    rate_limit_attempt = 0
+    timeout_attempt = 0
+    timeout_start = time.monotonic()
+
+    while True:
+        if should_abort and should_abort():
+            raise ScrobbleAborted("User gave up while connecting to ListenBrainz")
+
         req = urllib.request.Request(url, data=body, method=method)
         for k, v in _BASE_HEADERS.items():
             req.add_header(k, v)
@@ -172,13 +202,31 @@ def _make_request(
 
         except urllib.error.HTTPError as exc:
             rl = RateLimitInfo.from_headers(exc.headers)
-            if exc.code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+            if exc.code == 429:
+                rate_limit_attempt += 1
+            if exc.code == 429 and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
                 wait = max(rl.reset_in, 1.0)
                 logger.warning(
                     "ListenBrainz 429 rate-limited; sleeping %.1fs (attempt %d/%d)",
-                    wait, attempt, MAX_RATE_LIMIT_RETRIES,
+                    wait, rate_limit_attempt, MAX_RATE_LIMIT_RETRIES,
                 )
                 time.sleep(wait)
+                continue
+            raise
+
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                timeout_attempt += 1
+                elapsed = time.monotonic() - timeout_start
+                if on_timeout:
+                    on_timeout(elapsed, timeout_attempt, timeout)
+                logger.warning(
+                    "ListenBrainz request timed out after %ds (attempt %d, %.1fs elapsed)",
+                    timeout,
+                    timeout_attempt,
+                    elapsed,
+                )
+                # Keep trying until the user gives up.
                 continue
             raise
 
@@ -286,6 +334,9 @@ def _build_listen_payload(entry: ScrobbleEntry) -> dict:
 def scrobble_listenbrainz(
     entries: list[ScrobbleEntry],
     token: str,
+    *,
+    on_timeout: Optional[Callable[[float, int, int], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> ScrobbleResult:
     """Submit listens to ListenBrainz.
 
@@ -326,6 +377,9 @@ def scrobble_listenbrainz(
                 "POST", "/1/submit-listens",
                 token=token,
                 body=body,
+                timeout=12,
+                on_timeout=on_timeout,
+                should_abort=should_abort,
             )
 
             if resp_data.get("status") == "ok":
@@ -346,6 +400,10 @@ def scrobble_listenbrainz(
             body_text = exc.read().decode("utf-8", errors="replace")
             result.errors.append(f"HTTP {exc.code}: {body_text}")
             logger.error("ListenBrainz HTTP %d: %s", exc.code, body_text)
+        except ScrobbleAborted:
+            result.errors.append("User gave up while connecting to ListenBrainz")
+            logger.info("ListenBrainz scrobble aborted by user")
+            break
         except Exception as exc:
             result.errors.append(f"Batch at index {batch_start}: {exc}")
             logger.error("ListenBrainz batch error: %s", exc)
@@ -491,6 +549,9 @@ def build_scrobble_entries(
 def scrobble_plays(
     playcount_items: list,
     listenbrainz_token: str = "",
+    *,
+    on_timeout: Optional[Callable[[float, int, int], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> list[ScrobbleResult]:
     """Submit scrobbles to ListenBrainz.
 
@@ -515,7 +576,12 @@ def scrobble_plays(
 
     if listenbrainz_token:
         try:
-            r = scrobble_listenbrainz(entries, listenbrainz_token)
+            r = scrobble_listenbrainz(
+                entries,
+                listenbrainz_token,
+                on_timeout=on_timeout,
+                should_abort=should_abort,
+            )
             results.append(r)
         except Exception as exc:
             logger.error("ListenBrainz scrobbling failed: %s", exc)

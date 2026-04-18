@@ -376,15 +376,3 @@ AUDIO_FORMAT_FLAG_MAP: dict[str, int] = {
     'm4b': 0x0001,
 }
 AUDIO_FORMAT_FLAG_DEFAULT: int = 0xFFFF
-
-
-# ============================================================
-# Re-exports — canonical definitions live in their own modules.
-# Kept here for backward-compatible imports.
-# ============================================================
-from .field_base import filetype_to_string  # noqa: E402, F401
-from .extraction import (  # noqa: E402, F401
-    extract_datasets,
-    extract_mhod_strings,
-    extract_playlist_extras,
-)
