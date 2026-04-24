@@ -208,7 +208,7 @@ class _SyncContext:
     existing_smart_raw: list[dict] = field(default_factory=list)
 
     # ── Track state (mutated by stage methods) ──────────────────────
-    tracks_by_db_id: dict[int, TrackInfo] = field(default_factory=dict)
+    tracks_by_db_track_id: dict[int, TrackInfo] = field(default_factory=dict)
     tracks_by_location: dict[str, TrackInfo] = field(default_factory=dict)
     new_tracks: list[TrackInfo] = field(default_factory=list)
 
@@ -401,7 +401,7 @@ class SyncExecutor:
                 logger.info(
                     "Sync stopped early — attempting partial database write "
                     "(%d existing + %d newly added tracks).",
-                    len(ctx.tracks_by_db_id), _n_added,
+                    len(ctx.tracks_by_db_track_id), _n_added,
                 )
                 self._execute_write_and_finalize(ctx)
 
@@ -496,7 +496,7 @@ class SyncExecutor:
         all_tracks: list[TrackInfo] = []
         for t in tracks_data:
             ti = self._track_dict_to_info(t)
-            if ti.db_id:
+            if ti.db_track_id:
                 all_tracks.append(ti)
 
         _progress("playlist_sync", 1, 3, "Merging playlists…")
@@ -687,8 +687,8 @@ class SyncExecutor:
 
         for t in ctx.existing_tracks_data:
             track_info = self._track_dict_to_info(t)
-            if track_info.db_id:
-                ctx.tracks_by_db_id[track_info.db_id] = track_info
+            if track_info.db_track_id:
+                ctx.tracks_by_db_track_id[track_info.db_track_id] = track_info
             if track_info.location:
                 ctx.tracks_by_location[track_info.location] = track_info
 
@@ -732,15 +732,15 @@ class SyncExecutor:
 
         _advance("Preparing tracks")
 
-        all_tracks = list(ctx.tracks_by_db_id.values()) + ctx.new_tracks
+        all_tracks = list(ctx.tracks_by_db_track_id.values()) + ctx.new_tracks
 
-        # ── Pre-assign db_ids for new tracks ──────────────────────
-        # New tracks arrive with db_id=0.  Assign now so
+        # ── Pre-assign db_track_ids for new tracks ──────────────────────
+        # New tracks arrive with db_track_id=0.  Assign now so
         # _build_and_evaluate_playlists can build correct track lists.
-        from iTunesDB_Writer.mhit_writer import generate_db_id
+        from iTunesDB_Writer.mhit_writer import generate_db_track_id
         for t in all_tracks:
-            if not t.db_id:
-                t.db_id = generate_db_id()
+            if not t.db_track_id:
+                t.db_track_id = generate_db_track_id()
 
         # ── Auto-detect gapless_album_flag ────────────────────────
         albums: dict[tuple[str, str], list[TrackInfo]] = defaultdict(list)
@@ -790,7 +790,7 @@ class SyncExecutor:
             ctx.progress("write_database", _TOTAL_STEPS, _TOTAL_STEPS,
                          message=f"Database written — {len(all_tracks)} tracks")
 
-            # ── Backpatch: new tracks now have real db_ids ──
+            # ── Backpatch: new tracks now have real db_track_ids ──
             self._backpatch_new_tracks(ctx)
 
             # Save mapping ONLY after successful DB write + backpatch.
@@ -867,12 +867,12 @@ class SyncExecutor:
                          message=f"Merged playlist: {upl.get('Title', '?')}")
 
     def _backpatch_new_tracks(self, ctx: _SyncContext) -> None:
-        """Create mapping entries for newly added tracks (db_ids now assigned)."""
+        """Create mapping entries for newly added tracks (db_track_ids now assigned)."""
         for track in ctx.new_tracks:
             obj_key = id(track)
             fp = ctx.new_track_fingerprints.get(obj_key)
             info = ctx.new_track_info.get(obj_key)
-            if fp and info and track.db_id != 0:
+            if fp and info and track.db_track_id != 0:
                 pc_track, ipod_dest, was_transcoded = info
                 # Re-stat the source file to capture post-fingerprint
                 # size/mtime.  The fingerprinting phase may have written
@@ -881,7 +881,7 @@ class SyncExecutor:
                 source_size, source_mtime = _current_source_stat(pc_track)
                 ctx.mapping.add_track(
                     fingerprint=fp,
-                    db_id=track.db_id,
+                    db_track_id=track.db_track_id,
                     source_format=Path(pc_track.path).suffix.lstrip("."),
                     ipod_format=ipod_dest.suffix.lstrip("."),
                     source_size=source_size,
@@ -914,7 +914,7 @@ class SyncExecutor:
 
         changed = False
 
-        # Mark added podcast episodes as on_ipod with their db_id
+        # Mark added podcast episodes as on_ipod with their db_track_id
         for track in ctx.new_tracks:
             if not (track.media_type & 0x04):
                 continue
@@ -925,10 +925,10 @@ class SyncExecutor:
             if entry:
                 ep, _feed = entry
                 ep.status = STATUS_ON_IPOD
-                ep.ipod_db_id = track.db_id
+                ep.ipod_db_track_id = track.db_track_id
                 changed = True
-                logger.debug("Podcast subscription: marked '%s' as on_ipod (db_id=%d)",
-                             ep.title, track.db_id)
+                logger.debug("Podcast subscription: marked '%s' as on_ipod (db_track_id=%d)",
+                             ep.title, track.db_track_id)
 
         # Mark removed podcast episodes as downloaded (no longer on iPod)
         all_removals = list(ctx.plan.to_remove) + list(
@@ -947,7 +947,7 @@ class SyncExecutor:
             if entry:
                 ep, _feed = entry
                 ep.status = STATUS_DOWNLOADED if ep.downloaded_path else "not_downloaded"
-                ep.ipod_db_id = 0
+                ep.ipod_db_track_id = 0
                 changed = True
                 logger.debug("Podcast subscription: marked '%s' as removed from iPod",
                              ep.title)
@@ -974,12 +974,12 @@ class SyncExecutor:
         all_removes = list(ctx.plan.to_remove)
         integrity_removals = getattr(ctx.plan, '_integrity_removals', [])
         if integrity_removals:
-            # Deduplicate by db_id in case any overlap
-            existing_db_ids = {item.db_id for item in all_removes if item.db_id}
+            # Deduplicate by db_track_id in case any overlap
+            existing_db_track_ids = {item.db_track_id for item in all_removes if item.db_track_id}
             for item in integrity_removals:
-                if item.db_id and item.db_id not in existing_db_ids:
+                if item.db_track_id and item.db_track_id not in existing_db_track_ids:
                     all_removes.append(item)
-                    existing_db_ids.add(item.db_id)
+                    existing_db_track_ids.add(item.db_track_id)
 
         if not all_removes:
             return
@@ -1005,21 +1005,21 @@ class SyncExecutor:
 
                     if file_path in ctx.tracks_by_location:
                         track_to_remove = ctx.tracks_by_location.pop(file_path)
-                        if track_to_remove.db_id in ctx.tracks_by_db_id:
-                            del ctx.tracks_by_db_id[track_to_remove.db_id]
+                        if track_to_remove.db_track_id in ctx.tracks_by_db_track_id:
+                            del ctx.tracks_by_db_track_id[track_to_remove.db_track_id]
 
             if item.fingerprint:
-                ctx.mapping.remove_track(item.fingerprint, db_id=item.db_id)
-            elif item.db_id:
-                ctx.mapping.remove_by_db_id(item.db_id)
+                ctx.mapping.remove_track(item.fingerprint, db_track_id=item.db_track_id)
+            elif item.db_track_id:
+                ctx.mapping.remove_by_db_track_id(item.db_track_id)
 
-            if item.db_id and item.db_id in ctx.tracks_by_db_id:
-                del ctx.tracks_by_db_id[item.db_id]
+            if item.db_track_id and item.db_track_id in ctx.tracks_by_db_track_id:
+                del ctx.tracks_by_db_track_id[item.db_track_id]
 
             ctx.result.tracks_removed += 1
 
-        for fp, db_id in getattr(ctx.plan, '_stale_mapping_entries', []):
-            ctx.mapping.remove_track(fp, db_id=db_id)
+        for fp, db_track_id in getattr(ctx.plan, '_stale_mapping_entries', []):
+            ctx.mapping.remove_track(fp, db_track_id=db_track_id)
 
     def _parallel_copy_stage(
         self,
@@ -1227,9 +1227,9 @@ class SyncExecutor:
             source_path = Path(item.pc_track.path)
 
             # Update existing TrackInfo
-            db_id = item.db_id
-            if db_id and db_id in ctx.tracks_by_db_id:
-                existing_track = ctx.tracks_by_db_id[db_id]
+            db_track_id = item.db_track_id
+            if db_track_id and db_track_id in ctx.tracks_by_db_track_id:
+                existing_track = ctx.tracks_by_db_track_id[db_track_id]
                 old_location = existing_track.location
                 if existing_track.location in ctx.tracks_by_location:
                     del ctx.tracks_by_location[existing_track.location]
@@ -1273,14 +1273,14 @@ class SyncExecutor:
                     except Exception as exc:
                         logger.warning("Could not remove old iPod file %s: %s", old_location, exc)
 
-            if db_id:
-                ctx.pc_file_paths[db_id] = str(source_path)
+            if db_track_id:
+                ctx.pc_file_paths[db_track_id] = str(source_path)
 
             if item.fingerprint and ipod_path:
                 source_size, source_mtime = _current_source_stat(item.pc_track)
                 ctx.mapping.add_track(
                     fingerprint=item.fingerprint,
-                    db_id=db_id or 0,
+                    db_track_id=db_track_id or 0,
                     source_format=source_path.suffix.lstrip("."),
                     ipod_format=ipod_path.suffix.lstrip("."),
                     source_size=source_size,
@@ -1374,9 +1374,9 @@ class SyncExecutor:
                 ctx.result.tracks_updated_metadata += 1
                 continue
 
-            db_id = item.db_id
-            if db_id and db_id in ctx.tracks_by_db_id:
-                track = ctx.tracks_by_db_id[db_id]
+            db_track_id = item.db_track_id
+            if db_track_id and db_track_id in ctx.tracks_by_db_track_id:
+                track = ctx.tracks_by_db_track_id[db_track_id]
                 for field_name, (pc_value, _ipod_value) in item.metadata_changes.items():
                     mapping_entry = self._META_FIELD_MAP.get(field_name)
                     if mapping_entry is not None:
@@ -1392,13 +1392,13 @@ class SyncExecutor:
 
             # Refresh mapping mtime/size so next sync doesn't see a spurious file change
             if item.fingerprint and item.pc_track and not ctx.dry_run:
-                fp_result = ctx.mapping.get_by_db_id(db_id) if db_id else None
+                fp_result = ctx.mapping.get_by_db_track_id(db_track_id) if db_track_id else None
                 if fp_result:
                     fp, existing = fp_result
                     source_size, source_mtime = _current_source_stat(item.pc_track)
                     ctx.mapping.add_track(
                         fingerprint=fp,
-                        db_id=db_id or 0,
+                        db_track_id=db_track_id or 0,
                         source_format=existing.source_format,
                         ipod_format=existing.ipod_format,
                         source_size=source_size,
@@ -1424,12 +1424,12 @@ class SyncExecutor:
         for item in ctx.plan.to_update_artwork:
             if not item.fingerprint:
                 continue
-            fp_result = ctx.mapping.get_by_db_id(item.db_id) if item.db_id else None
+            fp_result = ctx.mapping.get_by_db_track_id(item.db_track_id) if item.db_track_id else None
             if fp_result:
                 fp, existing = fp_result
                 ctx.mapping.add_track(
                     fingerprint=fp,
-                    db_id=item.db_id or 0,
+                    db_track_id=item.db_track_id or 0,
                     source_format=existing.source_format,
                     ipod_format=existing.ipod_format,
                     source_size=existing.source_size,
@@ -1620,8 +1620,8 @@ class SyncExecutor:
                 pc_track, _ipod_path, _was_transcoded = info
                 candidates.append((t, pc_track.path))
 
-        for db_id, pc_path in ctx.pc_file_paths.items():
-            t = ctx.tracks_by_db_id.get(db_id)
+        for db_track_id, pc_path in ctx.pc_file_paths.items():
+            t = ctx.tracks_by_db_track_id.get(db_track_id)
             if t and not t.sound_check and t.media_type not in VIDEO_TYPES:
                 candidates.append((t, pc_path))
 
@@ -1772,9 +1772,9 @@ class SyncExecutor:
                 ctx.result.ratings_synced += 1
                 continue
 
-            db_id = item.db_id
-            if db_id and db_id in ctx.tracks_by_db_id and item.new_rating is not None:
-                ctx.tracks_by_db_id[db_id].rating = item.new_rating
+            db_track_id = item.db_track_id
+            if db_track_id and db_track_id in ctx.tracks_by_db_track_id and item.new_rating is not None:
+                ctx.tracks_by_db_track_id[db_track_id].rating = item.new_rating
 
             if ctx.write_back_to_pc and item.pc_track and item.new_rating is not None:
                 self._write_rating_to_pc(item.pc_track.path, item.new_rating)

@@ -3,7 +3,7 @@ iPod Integrity Checker — validates consistency between three sources of truth:
 
   1. **Filesystem**: actual audio files under /iPod_Control/Music/F**/
   2. **iTunesDB**: the binary database the iPod firmware reads
-  3. **iOpenPod.json**: our mapping file (fingerprint → db_id)
+  3. **iOpenPod.json**: our mapping file (fingerprint → db_track_id)
 
 Run this BEFORE the diff engine so the sync plan is built on accurate data.
 Any discrepancies are repaired automatically (conservative: never delete files
@@ -17,7 +17,7 @@ A. iTunesDB → Filesystem
    diff engine doesn't think it's on the iPod.
 
 B. iOpenPod.json → iTunesDB
-   For every db_id in the mapping, verify the db_id exists in iTunesDB.
+   For every db_track_id in the mapping, verify the db_track_id exists in iTunesDB.
    If stale → remove from mapping so the diff engine treats the PC
    track as a fresh add.
 
@@ -30,6 +30,7 @@ from ._formats import MEDIA_EXTENSIONS as _MEDIA_EXTS
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Optional, Callable
 
 from .mapping import MappingFile
@@ -44,8 +45,8 @@ class IntegrityReport:
     # Tracks in iTunesDB whose file is missing from the iPod filesystem
     missing_files: list[dict] = field(default_factory=list)
 
-    # Mapping entries whose db_id is not present in the iTunesDB
-    stale_mappings: list[tuple[str, int]] = field(default_factory=list)  # (fingerprint, db_id)
+    # Mapping entries whose db_track_id is not present in the iTunesDB
+    stale_mappings: list[tuple[str, int]] = field(default_factory=list)  # (fingerprint, db_track_id)
 
     # Files on iPod not referenced by any iTunesDB track
     orphan_files: list[Path] = field(default_factory=list)
@@ -86,7 +87,7 @@ def check_integrity(
     Run all three consistency checks and repair discrepancies.
 
     This mutates ``ipod_tracks`` (removes entries whose files are missing)
-    and ``mapping`` (removes stale db_ids).  Orphan files are deleted from
+    and ``mapping`` (removes stale db_track_ids).  Orphan files are deleted from
     the iPod filesystem if *delete_orphans* is True.
 
     Args:
@@ -119,7 +120,7 @@ def check_integrity(
     if progress_callback:
         progress_callback("integrity", 0, 0, "Checking mapping against iTunesDB…")
 
-    _check_mapping_db_ids(ipod_tracks, mapping, report)
+    _check_mapping_db_track_ids(ipod_tracks, mapping, report)
 
     if _cancelled():
         return report
@@ -154,9 +155,13 @@ def _check_db_files_exist(
         if not location:
             continue
 
-        # iTunesDB Location format:  :iPod_Control:Music:F00:FILE.mp3
-        relative = location.replace(":", "/").lstrip("/")
-        full_path = ipod_root / relative
+        full_path = _resolve_location_to_path(ipod_root, location)
+        if full_path is None:
+            logger.debug(
+                "Integrity: could not resolve Location for track '%s' — skipping missing-file check",
+                track.get("Title", "?"),
+            )
+            continue
 
         if not full_path.exists():
             logger.warning(
@@ -176,32 +181,32 @@ def _check_db_files_exist(
         )
 
 
-# ── Check B: mapping db_ids → iTunesDB ─────────────────────────────────────
+# ── Check B: mapping db_track_ids → iTunesDB ─────────────────────────────────────
 
 
-def _check_mapping_db_ids(
+def _check_mapping_db_track_ids(
     ipod_tracks: list[dict],
     mapping: MappingFile,
     report: IntegrityReport,
 ) -> None:
-    """Remove mapping entries whose db_id is not in *ipod_tracks*."""
-    # Build set of valid db_ids from the (already-cleaned) track list
-    valid_db_ids: set[int] = set()
+    """Remove mapping entries whose db_track_id is not in *ipod_tracks*."""
+    # Build set of valid db_track_ids from the (already-cleaned) track list
+    valid_db_track_ids: set[int] = set()
     for track in ipod_tracks:
-        db_id = track.get("db_id")
-        if db_id:
-            valid_db_ids.add(db_id)
+        db_track_id = track.get("db_track_id", track.get("db_id"))
+        if db_track_id:
+            valid_db_track_ids.add(db_track_id)
 
-    mapping_db_ids = mapping.all_db_ids()
-    stale_db_ids = mapping_db_ids - valid_db_ids
+    mapping_db_track_ids = mapping.all_db_track_ids()
+    stale_db_track_ids = mapping_db_track_ids - valid_db_track_ids
 
-    for db_id in stale_db_ids:
-        result = mapping.get_by_db_id(db_id)
+    for db_track_id in stale_db_track_ids:
+        result = mapping.get_by_db_track_id(db_track_id)
         if result:
             fp, _entry = result
-            report.stale_mappings.append((fp, db_id))
-            mapping.remove_track(fp, db_id=db_id)
-            logger.warning(f"Integrity: removed stale mapping db_id={db_id} (fingerprint {fp[:20]}…)")
+            report.stale_mappings.append((fp, db_track_id))
+            mapping.remove_track(fp, db_track_id=db_track_id)
+            logger.warning(f"Integrity: removed stale mapping db_track_id={db_track_id} (fingerprint {fp[:20]}…)")
 
     if report.stale_mappings:
         logger.info(
@@ -230,13 +235,14 @@ def _check_orphan_files(
     # so normalised string comparison is sufficient.
     import os
     referenced: set[str] = set()
-    ipod_str = str(ipod_root)
     for track in ipod_tracks:
         location = track.get("Location")
         if not location:
             continue
-        relative = location.replace(":", os.sep).lstrip(os.sep)
-        referenced.add(os.path.normcase(os.path.join(ipod_str, relative)))
+        resolved = _resolve_location_to_path(ipod_root, location)
+        if resolved is None:
+            continue
+        referenced.add(os.path.normcase(str(resolved)))
 
     # Scan F00–F## for actual audio files
     orphans: list[Path] = []
@@ -279,3 +285,44 @@ def _check_orphan_files(
                     logger.error(f"Integrity: failed to delete orphan {orphan}: {e}")
 
             logger.info(f"Integrity: deleted {deleted}/{len(orphans)} orphan files")
+
+
+def _resolve_location_to_path(ipod_root: Path, location: str) -> Path | None:
+    """Resolve a track Location field to an on-device file path.
+
+    Supports:
+      - iTunes colon paths: :iPod_Control:Music:F00:FILE.mp3
+      - Absolute Windows paths: X:\\iPod_Control\\Music\\F00\\FILE.mp3
+      - Absolute/relative POSIX-style paths containing iPod_Control
+    """
+    if not location:
+        return None
+
+    loc = str(location).strip()
+
+    direct = Path(loc)
+    if direct.is_file():
+        return direct
+
+    unified = loc.replace("\\", "/")
+    lower = unified.lower()
+    marker = "ipod_control"
+    marker_idx = lower.find(marker)
+    if marker_idx >= 0:
+        rel_from_marker = unified[marker_idx:].lstrip("/")
+        candidate = ipod_root / rel_from_marker
+        if candidate.is_file():
+            return candidate
+
+    # Colon-delimited iTunes path (exclude drive-letter absolute paths)
+    if not re.match(r"^[a-zA-Z]:[\\/]", loc) and ":" in loc:
+        rel_colon = loc.replace(":", "/").lstrip("/")
+        candidate = ipod_root / rel_colon
+        if candidate.is_file():
+            return candidate
+
+    fallback = ipod_root / unified.lstrip("/")
+    if fallback.is_file():
+        return fallback
+
+    return None
