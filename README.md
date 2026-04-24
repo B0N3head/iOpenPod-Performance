@@ -16,7 +16,7 @@ iOpenPod is a free, open-source desktop app that lets you manage your iPod witho
 
 ## Download
 
-Grab the latest release for your platform. No Python required, no setup wizards, just download, extract, and run:
+Grab the latest release for your platform. No Python required for the native builds, no setup wizards, just download, extract, and run:
 
 ### ➡️ [Download iOpenPod here](https://github.com/TheRealSavi/iOpenPod/releases/latest)
 
@@ -28,7 +28,23 @@ Grab the latest release for your platform. No Python required, no setup wizards,
 | **Linux (Arch-based)** | [`iopenpod`](https://aur.archlinux.org/packages/iopenpod)<sup>AUR</sup> | Available in the AUR |
 | **Linux (All distros)** | `iOpenPod-linux.tar.gz` | Extract, and run `./iOpenPod` |
 
-Once installed, iOpenPod can check for updates automatically and can update itself right from the app. (Except when installed from AUR.)
+Once installed, iOpenPod can check for updates automatically and can update itself right from the app. (Except when installed from AUR or a Python package manager.)
+
+### Install from PyPI
+
+If you prefer a Python package install, iOpenPod is also available through `pip`, `pipx`, and `uv tool`. These options expose the same `iopenpod` command.
+
+| Method | Install | Run | Upgrade |
+|--------|---------|-----|---------|
+| `pip` | `python -m pip install iopenpod` | `iopenpod` | `python -m pip install --upgrade iopenpod` |
+| `pipx` | `pipx install iopenpod` | `iopenpod` | `pipx upgrade iopenpod` |
+| `uv tool` | `uv tool install iopenpod` | `iopenpod` | `uv tool upgrade iopenpod` |
+
+Requires **Python 3.11+**.
+
+If `iopenpod` is not on your shell `PATH` yet, run `pipx ensurepath` for `pipx` installs or `uv tool update-shell` for `uv tool` installs.
+
+Package-manager installs should be updated with the same tool you used to install them, not with the in-app binary updater.
 
 > **Optional extras:** Install [FFmpeg](https://ffmpeg.org/) for transcoding (FLAC to ALAC, etc.) and [Chromaprint](https://acoustid.org/chromaprint) for acoustic fingerprinting needed for syncing.
 
@@ -116,7 +132,7 @@ Want to help make iOpenPod? Here's how to get a dev environment running.
 
 ### Prerequisites
 
-- **Python 3.13+**
+- **Python 3.11+**
 - **[uv](https://docs.astral.sh/uv/)** (Python package manager)
 - **[FFmpeg](https://ffmpeg.org/)** (for transcoding)
 - **[Chromaprint](https://acoustid.org/chromaprint)** (for fingerprinting)

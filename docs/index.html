@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>iOpenPod — Sync Your iPod Without iTunes</title>
-    <meta name="description" content="Ditch iTunes. iOpenPod is a free app that syncs music, podcasts, audiobooks, play counts, and album art to your iPod. Download for Windows, macOS, or Linux — no Python required.">
+    <meta name="description" content="Ditch iTunes. iOpenPod is a free app that syncs music, podcasts, audiobooks, play counts, and album art to your iPod. Download native builds or install with pip, pipx, or uv tool.">
     <meta name="keywords" content="iPod sync tool, iPod Classic manager, iTunes alternative, iTunesDB, iPod music sync, open source iPod, iPod Linux, iPod Windows, iPod manager without iTunes, FLAC to iPod, iPod Nano sync, iPod podcast manager, download iPod manager">
     <meta name="author" content="John Gibbons">
 
@@ -437,6 +437,64 @@
         .prereq-note a { color: var(--accent); text-decoration: none; }
         .prereq-note a:hover { text-decoration: underline; }
 
+        .install-subhead {
+            text-align: center;
+            margin: 28px 0 8px;
+            font-size: 1.15rem;
+            color: var(--text);
+        }
+
+        .install-subtext {
+            text-align: center;
+            color: var(--text-3);
+            font-size: 0.92rem;
+            margin: 0 auto 18px;
+            max-width: 720px;
+            line-height: 1.7;
+        }
+
+        .install-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 18px;
+            margin-top: 22px;
+        }
+
+        .install-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--r-lg);
+            padding: 20px;
+        }
+
+        .install-card h3 {
+            margin: 0 0 8px;
+            font-size: 1rem;
+            color: var(--text);
+        }
+
+        .install-card p {
+            margin: 0 0 16px;
+            color: var(--text-3);
+            font-size: 0.88rem;
+            line-height: 1.6;
+        }
+
+        .install-card .terminal {
+            max-width: none;
+            margin: 0;
+            padding: 16px 18px;
+        }
+
+        .install-card .terminal-line {
+            font-size: 0.82rem;
+        }
+
+        .install-hint {
+            margin-top: 14px !important;
+            margin-bottom: 0 !important;
+        }
+
         /* ── Dev section / terminal ──────────────────────── */
         .terminal {
             background: #080d12;
@@ -548,6 +606,7 @@
             .feature-pillars { grid-template-columns: 1fr; }
             .feature-grid { grid-template-columns: 1fr 1fr; }
             .screenshot-gallery { grid-template-columns: 1fr; }
+            .install-grid { grid-template-columns: 1fr; }
             .support-banner { flex-direction: column; align-items: flex-start; }
         }
 
@@ -562,7 +621,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "iOpenPod",
-        "description": "Free, open-source iPod sync tool. Manage music, podcasts, audiobooks, play counts, ratings, and album art on iPod Classic and Nano without iTunes. Download for Windows, macOS, and Linux.",
+        "description": "Free, open-source iPod sync tool. Manage music, podcasts, audiobooks, play counts, ratings, and album art on iPod Classic and Nano without iTunes. Download native builds or install with pip, pipx, or uv tool.",
         "applicationCategory": "MultimediaApplication",
         "operatingSystem": "Windows, macOS, Linux",
         "screenshot": "https://raw.githubusercontent.com/TheRealSavi/iOpenPod/main/assets/screenshots/hero.png",
@@ -579,11 +638,11 @@
         "@type": "FAQPage",
         "mainEntity": [
             { "@type": "Question", "name": "How do I sync my iPod without iTunes?",
-              "acceptedAnswer": { "@type": "Answer", "text": "Download iOpenPod from the releases page, extract it, and run it. Connect your iPod via USB, select your media folder, and click sync. No Python or iTunes needed." }},
+              "acceptedAnswer": { "@type": "Answer", "text": "Download iOpenPod from the releases page or install it from PyPI with pip, pipx, or uv tool. Launch it, connect your iPod via USB, select your media folder, and click sync. No iTunes required." }},
             { "@type": "Question", "name": "Can I put FLAC files on an iPod?",
               "acceptedAnswer": { "@type": "Answer", "text": "Yes. iOpenPod automatically converts FLAC files to Apple Lossless (ALAC) during sync, so your iPod can play them natively with no quality loss." }},
             { "@type": "Question", "name": "Does iOpenPod work on Linux and macOS?",
-              "acceptedAnswer": { "@type": "Answer", "text": "Yes. Precompiled binaries are available for Windows, macOS, and Linux. Just download, extract, and run — no Python installation required." }},
+              "acceptedAnswer": { "@type": "Answer", "text": "Yes. Precompiled binaries are available for Windows, macOS, and Linux, and Python users can also install iOpenPod with pip, pipx, or uv tool." }},
             { "@type": "Question", "name": "Which iPod models are supported?",
               "acceptedAnswer": { "@type": "Answer", "text": "All iPod Classic generations, iPod Mini, iPod Photo, and iPod Nano 1G through 7G have full read and write support. Shuffle support is coming soon." }},
             { "@type": "Question", "name": "Will syncing with iOpenPod erase my iPod?",
@@ -781,7 +840,7 @@
         <section class="section" id="install">
             <div class="section-header">
                 <h2>Download &amp; Install</h2>
-                <p>No Python needed. Download, extract, run.</p>
+                <p>Native builds for most users. Python package installs are also available.</p>
             </div>
             <div class="download-cta">
                 <a href="https://github.com/TheRealSavi/iOpenPod/releases/latest" class="btn btn-primary" style="font-size: 1rem; padding: 13px 32px;">Download Latest Release</a>
@@ -800,8 +859,61 @@
                     </tbody>
                 </table>
             </div>
+            <h3 class="install-subhead">Install from PyPI</h3>
+            <p class="install-subtext">
+                For technical users who prefer package managers. After install, launch iOpenPod with
+                <code style="color:var(--accent);font-family:monospace">iopenpod</code>.
+            </p>
+            <div class="install-grid">
+                <article class="install-card">
+                    <h3><code style="color:var(--accent);font-family:monospace">pip</code></h3>
+                    <p>Installs iOpenPod into your current Python environment.</p>
+                    <div class="terminal">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>python -m pip install iopenpod</em></span>
+                        </div>
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>iopenpod</em></span>
+                        </div>
+                    </div>
+                    <p class="install-hint">Upgrade with <code style="color:var(--accent);font-family:monospace">python -m pip install --upgrade iopenpod</code>.</p>
+                </article>
+                <article class="install-card">
+                    <h3><code style="color:var(--accent);font-family:monospace">pipx</code></h3>
+                    <p>Creates an isolated app environment and exposes the <code style="color:var(--accent);font-family:monospace">iopenpod</code> command.</p>
+                    <div class="terminal">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>pipx install iopenpod</em></span>
+                        </div>
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>iopenpod</em></span>
+                        </div>
+                    </div>
+                    <p class="install-hint">Upgrade with <code style="color:var(--accent);font-family:monospace">pipx upgrade iopenpod</code>.</p>
+                </article>
+                <article class="install-card">
+                    <h3><code style="color:var(--accent);font-family:monospace">uv tool</code></h3>
+                    <p>If you already use uv, this gives you the same isolated app-style install.</p>
+                    <div class="terminal">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>uv tool install iopenpod</em></span>
+                        </div>
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">$</span>
+                            <span class="terminal-cmd"><em>iopenpod</em></span>
+                        </div>
+                    </div>
+                    <p class="install-hint">Upgrade with <code style="color:var(--accent);font-family:monospace">uv tool upgrade iopenpod</code>.</p>
+                </article>
+            </div>
             <p class="prereq-note">
-                Once installed, iOpenPod checks for updates and can update itself from the app (except AUR).<br>
+                Native downloads can update themselves from the app (except AUR). Package-manager installs should be upgraded with the same tool you used to install them.<br>
+                Python package installs require Python 3.11+. If <code style="color:var(--accent);font-family:monospace">iopenpod</code> is not on your PATH yet, run <code style="color:var(--accent);font-family:monospace">pipx ensurepath</code> for pipx or <code style="color:var(--accent);font-family:monospace">uv tool update-shell</code> for uv tool.<br>
                 Optional: <a href="https://ffmpeg.org/">FFmpeg</a> for transcoding and <a href="https://acoustid.org/chromaprint">Chromaprint</a> for fingerprinting.
             </p>
         </section>
@@ -810,7 +922,7 @@
         <section class="section" id="developers">
             <div class="section-header">
                 <h2>For Developers</h2>
-                <p>Requires Python 3.13+ and <a href="https://docs.astral.sh/uv/" style="color:var(--accent);text-decoration:none">uv</a>.</p>
+                <p>Requires Python 3.11+ and <a href="https://docs.astral.sh/uv/" style="color:var(--accent);text-decoration:none">uv</a>.</p>
             </div>
             <div class="terminal">
                 <div class="terminal-line">
@@ -845,13 +957,13 @@
                     <summary>How do I sync my iPod without iTunes?
                         <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
                     </summary>
-                    <p>Download iOpenPod from the releases page, extract it, and run it. Connect your iPod via USB, select your media folder, and click sync — no iTunes or Python needed.</p>
+                    <p>Download iOpenPod from the releases page or install it from PyPI with pip, pipx, or uv tool. Launch it, connect your iPod via USB, select your media folder, and click sync — no iTunes required.</p>
                 </details>
                 <details>
                     <summary>Do I need Python to use iOpenPod?
                         <svg class="faq-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
                     </summary>
-                    <p>No. Precompiled binaries are available for Windows, macOS, and Linux. Just download, extract, and run. Python is only needed to contribute to development.</p>
+                    <p>No for most users. Precompiled binaries are available for Windows, macOS, and Linux. If you prefer a Python-based install, you can also use pip, pipx, or uv tool.</p>
                 </details>
                 <details>
                     <summary>Can I put FLAC files on an iPod?

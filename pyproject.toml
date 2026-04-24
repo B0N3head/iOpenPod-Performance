@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iopenpod"
-version = "1.0.46"
+version = "1.0.47"
 description = "Open-source iPod Classic sync tool — manage your iPod media library without iTunes. Reads and writes iTunesDB directly."
 authors = [
     {name = "John Gibbons", email = "johngibbons167@gmail.com"}
 ]
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 keywords = [
     "ipod", "ipod-classic", "itunes", "itunesdb", "music-sync",
     "ipod-manager", "pyqt6", "music-library", "ipod-sync",
@@ -22,6 +22,8 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Multimedia :: Sound/Audio :: Players",
@@ -52,8 +54,12 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = [
+only-include = [
+    "main.py",
+    "settings.py",
     "GUI",
+    "PodcastManager",
+    "ipod_device",
     "iTunesDB_Parser",
     "iTunesDB_Shared",
     "iTunesDB_Writer",
@@ -61,6 +67,10 @@ packages = [
     "ArtworkDB_Writer",
     "SyncEngine",
     "SQLiteDB_Writer",
+    "assets/fonts",
+    "assets/glyphs",
+    "assets/icons",
+    "assets/ipod_images",
 ]
 
 [tool.flake8]

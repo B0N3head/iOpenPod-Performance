@@ -185,13 +185,59 @@ jobs:
             ${{ matrix.appimage_name }}
             ${{ matrix.appimage_name }}.sha256
 
+  # ── Build Python distributions for PyPI ─────────────────────────────────
+  python-dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Verify tag matches package version
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = pyproject["project"]["version"]
+          tag_name = os.environ["GITHUB_REF_NAME"]
+          expected_tag = f"v{version}"
+          if tag_name != expected_tag:
+              raise SystemExit(
+                  f"Refusing to publish: tag {tag_name!r} does not match pyproject version {version!r}"
+              )
+          print(f"Publishing Python package version {version} from tag {tag_name}")
+          PY
+
+      - name: Build Python distributions
+        run: uv build
+
+      - name: Upload Python distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iopenpod-python-dist
+          if-no-files-found: error
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+
   # ── Publish GitHub Release ──────────────────────────────────────────────
   release:
-    needs: build
+    needs:
+      - build
+      - python-dist
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: iOpenPod-*
           merge-multiple: true
 
       - name: Create GitHub Release
@@ -203,6 +249,22 @@ jobs:
             *.tar.gz
             *.AppImage
             *.sha256
+
+  # ── Publish to PyPI via Trusted Publishing ──────────────────────────────
+  pypi-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: iopenpod-python-dist
+          path: dist
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
 
   trigger-flatpak:
     needs: release
