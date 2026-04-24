@@ -79,7 +79,7 @@ def write_mhia(album_id: int, album_name: str, album_artist: str,
         podcast_url: Podcast RSS URL (MHOD type 203)
         show_name: Show/series name (MHOD type 204)
         is_compilation: True for Various Artists / compilation albums
-        album_track_db_id: db_id of a representative track in this album
+        album_track_db_id: db_track_id of a representative track in this album
 
     Returns:
         Complete MHIA chunk with MHODs
@@ -184,14 +184,14 @@ def write_mhla(tracks: list["TrackInfo"], starting_index_for_album_id) -> tuple[
             t.compilation
             for t in album_tracks[(album_name, album_artist)]
         )
-        # Use first track's db_id as the representative track for this album
+        # Use first track's db_track_id as the representative track for this album
         rep_tracks = album_tracks[(album_name, album_artist)]
-        rep_db_id = rep_tracks[0].db_id if rep_tracks else 0
+        rep_db_track_id = rep_tracks[0].db_track_id if rep_tracks else 0
         album_items.extend(write_mhia(
             album_id, album_name, album_artist, sort_artist,
             podcast_url=podcast_url, show_name=show_name,
             is_compilation=is_compilation,
-            album_track_db_id=rep_db_id,
+            album_track_db_id=rep_db_track_id,
         ))
         album_id += 1
 

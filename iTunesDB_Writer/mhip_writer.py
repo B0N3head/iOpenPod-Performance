@@ -49,7 +49,7 @@ def write_mhip(
         timestamp: Mac timestamp (usually 0)
         podcast_group_flag: For podcast grouping (usually 0)
         podcast_group_ref: For podcast grouping (usually 0)
-        track_persistent_id: The track's db_id (persistent identifier)
+        track_persistent_id: The track's db_track_id (persistent identifier)
         mhip_persistent_id: Per-track persistent ID for this playlist item
 
     Returns:

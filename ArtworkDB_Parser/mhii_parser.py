@@ -15,7 +15,7 @@ def parse_imageItem(data, offset, header_length, chunk_length) -> dict:
     # (on mobile phones the first mhii appears to be 0x64, second 0x65, ...)
 
     image["songId"] = struct.unpack("<Q", data[offset + 20: offset + 28])[0]
-    # unique ID that matches the db_id field in the iTunesDB Track Item record.
+    # unique ID that matches the db_track_id field in the iTunesDB Track Item record.
     # this is what is used to map the ArtworkDB items to iTunesDB Items.
 
     image["unk1"] = struct.unpack(

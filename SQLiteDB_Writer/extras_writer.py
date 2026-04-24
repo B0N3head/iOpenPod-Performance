@@ -52,7 +52,7 @@ def write_extras_itdb(
             checksum = sum(track.lyrics.encode('utf-8')) & 0xFFFFFFFF
             cur.execute(
                 "INSERT INTO lyrics (item_pid, checksum, lyrics) VALUES (?, ?, ?)",
-                (_s64(track.db_id), checksum, track.lyrics)
+                (_s64(track.db_track_id), checksum, track.lyrics)
             )
             lyrics_count += 1
 
@@ -72,7 +72,7 @@ def write_extras_itdb(
             if blob:
                 cur.execute(
                     "INSERT INTO chapter (item_pid, data) VALUES (?, ?)",
-                    (_s64(track.db_id), blob)
+                    (_s64(track.db_track_id), blob)
                 )
                 chapter_count += 1
 

@@ -52,7 +52,9 @@ import subprocess
 import sys
 from typing import Optional
 
+from .diagnostic_log import CAPABILITY_FIELDS, IDENTITY_FIELDS, format_fields
 from .models import IPOD_USB_PIDS as IPOD_PIDS
+from .usb_backend import backend_diagnostic, get_libusb_backend
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +78,13 @@ def _find_ipod_devices() -> list:
         logger.error("pyusb not installed — run: uv add pyusb")
         return []
 
+    backend = get_libusb_backend()
+    if backend is None:
+        logger.debug("No PyUSB backend available: %s", backend_diagnostic())
+        return []
+
     devices = []
-    found = usb.core.find(find_all=True, idVendor=APPLE_VID)
+    found = usb.core.find(find_all=True, idVendor=APPLE_VID, backend=backend)
     if found is None:
         return devices
     for dev in found:
@@ -341,8 +348,11 @@ def query_ipod_vpd(
             raise
 
     result: dict = {
+        "usb_vid": APPLE_VID,
         "usb_pid": pid,
         "usb_serial": usb_serial,
+        "_source": "scsi_vpd",
+        "_transport": "usb_bulk_scsi_vpd",
     }
 
     claimed = False
@@ -414,7 +424,10 @@ def query_all_ipods() -> list[dict]:
     """
     import time
 
-    if importlib.util.find_spec("usb.core") is None:
+    try:
+        if importlib.util.find_spec("usb.core") is None:
+            return []
+    except ModuleNotFoundError:
         return []
 
     devices = _find_ipod_devices()
@@ -554,8 +567,8 @@ def identify_via_vpd(
     """Full iPod identification via SCSI VPD + model lookup + SysInfo write.
 
     Tries **IOKit** (macOS, no root, no unmount) first, then falls back to
-    **pyusb** (root required on Linux, no root on Windows; unmounts disk on
-    Linux/macOS).
+    **pyusb** on supported non-Windows platforms (root required on Linux;
+    may unmount/remount on Linux/macOS).
 
     On success, resolves the exact model (family, generation, capacity,
     color) from the Apple serial's last 3 characters and optionally writes
@@ -581,14 +594,41 @@ def identify_via_vpd(
         ``mount_path`` (may differ from input after pyusb remount),
         ``sysinfo_written`` (bool), ``vpd_info`` (raw VPD dict).
     """
+    if sys.platform == "win32":
+        logger.debug(
+            "identify_via_vpd skipped on Windows: mount=%s pid=%s fwguid=%s",
+            mount_path or "unknown",
+            f"0x{usb_pid:04X}" if usb_pid else "any",
+            firewire_guid or "unknown",
+        )
+        return None
+
+    logger.debug(
+        "identify_via_vpd start: mount=%s pid=%s fwguid=%s write_sysinfo=%s",
+        mount_path or "unknown",
+        f"0x{usb_pid:04X}" if usb_pid else "any",
+        firewire_guid or "unknown",
+        write_sysinfo_to_device,
+    )
     # ── Step 1: VPD query (IOKit fast path, then pyusb fallback) ───
-    vpd_info = _vpd_query_any_platform(usb_pid, firewire_guid)
+    vpd_info = _vpd_query_any_platform(usb_pid, firewire_guid, mount_path)
     if vpd_info is None:
+        logger.debug(
+            "identify_via_vpd: no live SysInfoExtended result for mount=%s "
+            "pid=%s fwguid=%s",
+            mount_path or "unknown",
+            f"0x{usb_pid:04X}" if usb_pid else "any",
+            firewire_guid or "unknown",
+        )
         return None
 
     apple_serial = vpd_info.get("SerialNumber", "")
     if not apple_serial:
-        logger.debug("identify_via_vpd: VPD returned no Apple serial")
+        logger.debug(
+            "identify_via_vpd: VPD returned no Apple serial source=%s keys=%d",
+            vpd_info.get("_source", "unknown"),
+            len([key for key in vpd_info if not str(key).startswith("_")]),
+        )
         return None
 
     # ── Step 2: Resolve model from serial-last-3 ──────────────────
@@ -596,7 +636,12 @@ def identify_via_vpd(
     result: dict = {
         "serial": apple_serial,
         "firewire_guid": vpd_fw_guid.upper() or firewire_guid,
-        "firmware": vpd_info.get("VisibleBuildID", vpd_info.get("BuildID", "")),
+        "firmware": (
+            vpd_info.get("FireWireVersion")
+            or vpd_info.get("scsi_revision")
+            or vpd_info.get("VisibleBuildID")
+            or vpd_info.get("BuildID", "")
+        ),
         "model_number": "",
         "model_family": "",
         "generation": "",
@@ -605,6 +650,7 @@ def identify_via_vpd(
         "mount_path": mount_path,
         "sysinfo_written": False,
         "vpd_info": vpd_info,
+        "source": vpd_info.get("_source", "vpd"),
     }
 
     try:
@@ -618,7 +664,7 @@ def identify_via_vpd(
             result["generation"] = info[1]
             result["capacity"] = info[2]
             result["color"] = info[3]
-            logger.info(
+            logger.debug(
                 "identify_via_vpd: serial=%s → %s %s %s %s (%s)",
                 apple_serial, info[0], info[1], info[2], info[3], model_num,
             )
@@ -641,11 +687,44 @@ def identify_via_vpd(
         except Exception as exc:
             logger.debug("identify_via_vpd: SysInfo write failed: %s", exc)
 
+    logger.debug(
+        "identify_via_vpd complete: source=%s mount=%s identity=[%s] caps=[%s] "
+        "sysinfo_written=%s",
+        result.get("source", "vpd"),
+        result.get("mount_path") or "unknown",
+        format_fields(result, IDENTITY_FIELDS),
+        format_fields(vpd_info, CAPABILITY_FIELDS, include_false=True),
+        result["sysinfo_written"],
+    )
     return result
 
 
-def _vpd_query_any_platform(usb_pid: int, firewire_guid: str) -> Optional[dict]:
-    """Try IOKit (macOS) first, then pyusb, returning the raw VPD dict."""
+def _vpd_query_any_platform(
+    usb_pid: int,
+    firewire_guid: str,
+    mount_path: str = "",
+    *,
+    include_usb_vendor: bool | None = None,
+) -> Optional[dict]:
+    """Try live SysInfoExtended transports, returning one merged raw dict."""
+    scsi_vpd: Optional[dict] = None
+    usb_vendor: Optional[dict] = None
+
+    if include_usb_vendor is None:
+        # Windows keeps the iPod bound to USBSTOR while mounted.  The vendored
+        # libusb backend can enumerate devices, but device-level vendor-control
+        # transfers are normally blocked by the active mass-storage driver.
+        include_usb_vendor = sys.platform != "win32"
+
+    logger.debug(
+        "Live SysInfoExtended query start: platform=%s mount=%s pid=%s "
+        "fwguid=%s usb_vendor=%s",
+        sys.platform,
+        mount_path or "unknown",
+        f"0x{usb_pid:04X}" if usb_pid else "any",
+        firewire_guid or "unknown",
+        include_usb_vendor,
+    )
 
     # ── macOS fast path: IOKit SCSI (no root, no unmount) ──────────
     if sys.platform == "darwin":
@@ -654,35 +733,156 @@ def _vpd_query_any_platform(usb_pid: int, firewire_guid: str) -> Optional[dict]:
 
             vpd = iokit_query(usb_pid=usb_pid, serial_filter=firewire_guid)
             if vpd and vpd.get("SerialNumber"):
-                logger.debug("_vpd_query_any_platform: IOKit success")
-                return vpd
+                vpd["_source"] = "scsi_vpd"
+                vpd["_transport"] = "iokit_scsi_vpd"
+                logger.debug("_vpd_query_any_platform: IOKit SCSI success")
+                scsi_vpd = vpd
         except ImportError:
             logger.debug("_vpd_query_any_platform: ipod_device.vpd_iokit not available")
         except Exception as exc:
             logger.debug("_vpd_query_any_platform: IOKit failed: %s", exc)
 
-    # ── Fallback: pyusb (root on Linux/macOS, no root on Windows) ──
-    if sys.platform != "win32":
+    # ── Windows drive-anchored SCSI pass-through ───────────────────
+    if scsi_vpd is None and sys.platform == "win32" and mount_path:
+        try:
+            from .vpd_windows import query_ipod_vpd_for_path
+
+            vpd = query_ipod_vpd_for_path(
+                mount_path,
+                usb_pid=usb_pid,
+                serial_filter=firewire_guid,
+            )
+            if vpd and vpd.get("SerialNumber"):
+                scsi_vpd = vpd
+        except ImportError:
+            logger.debug(
+                "_vpd_query_any_platform: ipod_device.vpd_windows not available",
+            )
+        except Exception as exc:
+            logger.debug("_vpd_query_any_platform: Windows SCSI failed: %s", exc)
+
+    # ── Linux drive-anchored SG_IO SCSI pass-through ────────────────
+    if scsi_vpd is None and sys.platform == "linux" and mount_path:
+        try:
+            from .vpd_linux import query_ipod_vpd_for_path
+
+            vpd = query_ipod_vpd_for_path(
+                mount_path,
+                usb_pid=usb_pid,
+                serial_filter=firewire_guid,
+            )
+            if vpd and vpd.get("SerialNumber"):
+                scsi_vpd = vpd
+        except ImportError:
+            logger.debug("_vpd_query_any_platform: ipod_device.vpd_linux not available")
+        except Exception as exc:
+            logger.debug("_vpd_query_any_platform: Linux SG_IO failed: %s", exc)
+
+    # ── Fallback: pyusb bulk-only SCSI (root on Linux/macOS, no root on Windows) ──
+    pyusb_allowed = sys.platform != "win32"
+    if scsi_vpd is None and sys.platform == "win32":
+        logger.debug(
+            "_vpd_query_any_platform: pyusb bulk SCSI skipped on Windows "
+            "during normal identification",
+        )
+    if scsi_vpd is None and sys.platform != "win32":
         try:
             if os.geteuid() != 0:
                 logger.debug("_vpd_query_any_platform: pyusb skipped (not root)")
-                return None
+                pyusb_allowed = False
         except AttributeError:
             pass
 
-    try:
-        vpd = query_ipod_vpd(usb_pid=usb_pid, serial_filter=firewire_guid)
-        if vpd and vpd.get("SerialNumber"):
-            vpd["_used_pyusb"] = True
-            return vpd
-    except PermissionError:
-        logger.debug("_vpd_query_any_platform: pyusb needs root")
-    except ImportError:
-        logger.debug("_vpd_query_any_platform: pyusb not available")
-    except Exception as exc:
-        logger.debug("_vpd_query_any_platform: pyusb failed: %s", exc)
+    if scsi_vpd is None and pyusb_allowed:
+        try:
+            vpd = query_ipod_vpd(usb_pid=usb_pid, serial_filter=firewire_guid)
+            if vpd and vpd.get("SerialNumber"):
+                vpd["_used_pyusb"] = True
+                vpd.setdefault("_source", "scsi_vpd")
+                vpd.setdefault("_transport", "usb_bulk_scsi_vpd")
+                scsi_vpd = vpd
+        except PermissionError:
+            logger.debug("_vpd_query_any_platform: pyusb needs root")
+        except ImportError:
+            logger.debug("_vpd_query_any_platform: pyusb not available")
+        except Exception as exc:
+            logger.debug("_vpd_query_any_platform: pyusb failed: %s", exc)
 
-    return None
+    # ── Apple USB vendor-control SysInfoExtended (extra fields on some nanos) ──
+    if include_usb_vendor:
+        try:
+            from .vpd_usb_control import query_ipod_usb_sysinfo_extended
+
+            usb_vendor = query_ipod_usb_sysinfo_extended(
+                usb_pid=usb_pid,
+                serial_filter=firewire_guid or (
+                    (scsi_vpd or {}).get("FireWireGUID")
+                    or (scsi_vpd or {}).get("usb_serial")
+                    or ""
+                ),
+            )
+        except ImportError:
+            logger.debug(
+                "_vpd_query_any_platform: ipod_device.vpd_usb_control not available",
+            )
+        except Exception as exc:
+            logger.debug("_vpd_query_any_platform: USB vendor query failed: %s", exc)
+    elif sys.platform == "win32":
+        logger.debug(
+            "_vpd_query_any_platform: USB vendor-control skipped on Windows "
+            "during normal identification",
+        )
+
+    merged = _merge_live_sysinfoextended(scsi_vpd, usb_vendor)
+    logger.debug(
+        "Live SysInfoExtended query result: scsi=%s usb_vendor=%s merged=%s "
+        "source=%s identity=[%s] caps=[%s]",
+        (scsi_vpd or {}).get("_source", "none"),
+        (usb_vendor or {}).get("_source", "none"),
+        "yes" if merged else "no",
+        (merged or {}).get("_source", "none"),
+        format_fields(merged or {}, IDENTITY_FIELDS),
+        format_fields(merged or {}, CAPABILITY_FIELDS, include_false=True),
+    )
+    return merged
+
+
+def _merge_live_sysinfoextended(
+    primary: Optional[dict],
+    secondary: Optional[dict],
+) -> Optional[dict]:
+    """Merge live SCSI and USB vendor SysInfoExtended results.
+
+    The primary transport wins conflicts; the secondary fills missing fields and
+    is retained under ``usb_vendor_info`` for diagnostics and future parsing.
+    """
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+
+    merged = dict(primary)
+    raw_sources = dict(primary.get("_raw_field_sources", {}))
+    for key, value in secondary.items():
+        if key.startswith("_"):
+            continue
+        if key not in merged or merged[key] in (None, "", b"", []):
+            merged[key] = value
+            raw_sources[key] = secondary.get("_source", "usb_vendor")
+
+    merged["_raw_field_sources"] = raw_sources
+    merged["_usb_vendor_info"] = secondary
+    merged["_usb_vendor_raw_xml"] = secondary.get("vpd_raw_xml", b"")
+    merged["_transport"] = "+".join(
+        part for part in (
+            str(primary.get("_transport", "scsi_vpd")),
+            str(secondary.get("_transport", "usb_vendor_control")),
+        )
+        if part
+    )
+    merged["_source"] = primary.get("_source", "scsi_vpd")
+    merged["_used_usb_vendor"] = True
+    return merged
 
 
 def _wait_for_remount(

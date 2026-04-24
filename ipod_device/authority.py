@@ -13,7 +13,8 @@ determines whether the new or existing value is more trustworthy.
 Source reliability (most → least)::
 
     Sure (live hardware):
-        vpd > iokit > ioctl > device_tree / ioreg / sysfs > wmi
+        scsi_vpd / windows_scsi / linux_scsi / usb_vendor > vpd > iokit > ioctl
+            > device_tree / ioreg / sysfs > wmi
     Guesses (files / lookups / derivations):
         sysinfo_extended > sysinfo > itunes > serial_lookup
             > usb_pid > hashing > unknown
@@ -40,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _SOURCE_ORDER: list[str] = [
     # ── Sure: live hardware probes ──────────────────────────────────
+    "scsi_vpd",             # Live SCSI INQUIRY VPD plist
+    "windows_scsi",         # Windows SCSI pass-through VPD
+    "linux_scsi",           # Linux SG_IO SCSI pass-through VPD
+    "usb_vendor",           # Live Apple USB vendor-control plist
     "vpd",                  # SCSI Vital Product Data — gold standard
     "iokit",                # macOS IOKit SCSI (effectively VPD, no unmount)
     "ioctl",                # Windows direct SCSI inquiry
@@ -51,6 +56,9 @@ _SOURCE_ORDER: list[str] = [
     "itunes",               # Pre-existing value assumed to be from iTunes
     "serial_lookup",        # Derived from serial last-3 chars
     "usb_pid",              # Coarse USB PID mapping
+    "disk_size",            # Live disk-size based capacity estimate
+    "model_table",          # Deterministic inference from known model tuples
+    "inferred",             # Other deterministic inference from known fields
     "sysinfo_extended",     # SysInfoExtended XML plist — on-disk, stale-prone
     "sysinfo",              # SysInfo plain text — on-disk, stale-prone
     "hashing",              # Inferred from hashing scheme
@@ -78,6 +86,8 @@ SYSINFO_FIELDS: list[tuple[str, str]] = [
     ("visibleBuildID", "firmware"),
     ("BoardHwName", "board"),
     ("ModelNumStr", "model_number"),
+    ("FamilyID", "family_id"),
+    ("UpdaterFamilyID", "updater_family_id"),
     # ── Derived / resolved by iOpenPod for full device granularity ────
     # These are deterministically derived from model_number (via
     # IPOD_MODELS or serial-last-3 lookup), but caching them in SysInfo
@@ -95,6 +105,14 @@ SYSINFO_FIELDS: list[tuple[str, str]] = [
 _SENTINEL_DEFAULTS: dict[str, str] = {
     "model_family": "iPod",
 }
+
+_DERIVED_SYSINFO_KEYS: frozenset[str] = frozenset({
+    "ModelFamily",
+    "Generation",
+    "Capacity",
+    "Color",
+    "USBProductID",
+})
 
 # Core identification fields — these drive the "all sure" determination for
 # the HIGH authority path.  If ALL core fields have sure (live hardware)
@@ -294,7 +312,7 @@ def _write_authority(ipod_path: str, authority: dict) -> None:
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(authority, f, indent=2, ensure_ascii=False)
-        logger.info("Wrote authority file to %s", path)
+        logger.debug("Wrote authority file to %s", path)
     except Exception as exc:
         logger.warning("Failed to write authority file: %s", exc)
 
@@ -328,6 +346,89 @@ def _write_sysinfo_file(ipod_path: str, fields: dict[str, str]) -> None:
         logger.info("Wrote SysInfo (%d fields) to %s", len(lines), path)
     except Exception as exc:
         logger.warning("Failed to write SysInfo: %s", exc)
+
+
+def _normalise_sysinfo_extended(raw_xml: bytes | str) -> bytes:
+    """Return canonical SysInfoExtended plist bytes suitable for caching."""
+    if isinstance(raw_xml, str):
+        raw = raw_xml.encode("utf-8", errors="replace")
+    else:
+        raw = bytes(raw_xml or b"")
+    if not raw:
+        return b""
+
+    try:
+        from .sysinfo import parse_sysinfo_extended
+
+        parsed = parse_sysinfo_extended(raw)
+        if parsed.plist and parsed.raw_xml:
+            return parsed.raw_xml
+    except Exception:
+        pass
+
+    for marker in (b"<?xml", b"<plist"):
+        idx = raw.find(marker)
+        if idx >= 0:
+            raw = raw[idx:]
+            break
+    raw = raw.strip(b"\x00\r\n\t ")
+    if raw and b"</plist>" not in raw:
+        raw += b"\n</dict>\n</plist>"
+    return raw
+
+
+def cache_sysinfo_extended(
+    ipod_path: str,
+    raw_xml: bytes | str,
+    *,
+    source: str = "unknown",
+    metadata: dict | None = None,
+) -> bool:
+    """Cache a live SysInfoExtended payload and refresh authority hashes."""
+    if not ipod_path or not raw_xml:
+        return False
+
+    device_dir = os.path.join(ipod_path, "iPod_Control", "Device")
+    if not os.path.isdir(device_dir):
+        return False
+
+    data = _normalise_sysinfo_extended(raw_xml)
+    if not data:
+        return False
+
+    path = _sysinfo_extended_path(ipod_path)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+    except Exception as exc:
+        logger.warning("Failed to cache SysInfoExtended: %s", exc)
+        return False
+
+    authority = read_authority(ipod_path)
+    now = datetime.now(timezone.utc).isoformat()
+    files = authority.setdefault("files", {})
+    files["SysInfoExtended"] = {
+        "source": source,
+        "updated": now,
+        "bytes": len(data),
+    }
+    if metadata:
+        files["SysInfoExtended"]["metadata"] = {
+            str(k): v
+            for k, v in metadata.items()
+            if isinstance(v, (str, int, float, bool)) and v not in ("", None)
+        }
+    authority["version"] = 1
+    authority["last_updated"] = now
+    _store_file_hashes(ipod_path, authority)
+    _write_authority(ipod_path, authority)
+    logger.debug(
+        "Cached SysInfoExtended (%d bytes, source=%s) to %s",
+        len(data),
+        source,
+        path,
+    )
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -406,6 +507,15 @@ def _rank(source: str) -> int:
     return SOURCE_RANK.get(source, _WORST_RANK)
 
 
+def _default_existing_source(sysinfo_key: str, old_raw: str) -> str:
+    """Return provenance for an existing SysInfo value with no authority entry."""
+    if not old_raw:
+        return "unknown"
+    if sysinfo_key in _DERIVED_SYSINFO_KEYS:
+        return "sysinfo"
+    return "itunes"
+
+
 def update_sysinfo(info: DeviceInfo) -> None:
     """Reconcile gathered DeviceInfo with the on-disk SysInfo.
 
@@ -456,7 +566,7 @@ def update_sysinfo(info: DeviceInfo) -> None:
 
         old_raw = existing_sysinfo.get(sysinfo_key, "")
         old_source: str = fields.get(sysinfo_key, {}).get(
-            "source", "itunes" if old_raw else "unknown",
+            "source", _default_existing_source(sysinfo_key, old_raw),
         )
 
         # ── Field missing from SysInfo → add it ──────────────────────
@@ -468,7 +578,7 @@ def update_sysinfo(info: DeviceInfo) -> None:
                 "updated": now,
             }
             sysinfo_changed = True
-            logger.info(
+            logger.debug(
                 "SysInfo: adding %s = %s (source: %s)",
                 sysinfo_key, new_formatted, new_source,
             )
@@ -483,7 +593,11 @@ def update_sysinfo(info: DeviceInfo) -> None:
             # more (or equally) reliable, otherwise ensure the existing
             # best source is still recorded (so authority coverage check
             # sees the field as tracked).
-            best_source = new_source if _rank(new_source) <= _rank(old_source) else old_source
+            best_source = (
+                new_source
+                if _rank(new_source) <= _rank(old_source)
+                else old_source
+            )
             if sysinfo_key not in fields or _rank(best_source) <= _rank(
                 fields[sysinfo_key].get("source", "unknown"),
             ):
@@ -492,6 +606,27 @@ def update_sysinfo(info: DeviceInfo) -> None:
                     "source": best_source,
                     "updated": now,
                 }
+            continue
+
+        # iOpenPod-derived fields are cache material, not immutable iTunes
+        # facts.  If our current resolver produces a different derived label
+        # after a table/provenance fix, let it refresh stale authority entries
+        # even when the old cached source had a better historical rank.
+        if sysinfo_key in _DERIVED_SYSINFO_KEYS:
+            updated_sysinfo[sysinfo_key] = new_formatted
+            fields[sysinfo_key] = {
+                "value": new_formatted,
+                "source": new_source,
+                "updated": now,
+            }
+            sysinfo_changed = True
+            logger.debug(
+                "SysInfo: refreshing derived %s: %r → %r (source: %s)",
+                sysinfo_key,
+                old_raw,
+                new_formatted,
+                new_source,
+            )
             continue
 
         # ── Values differ — use the more reliable source ──────────────
@@ -505,7 +640,7 @@ def update_sysinfo(info: DeviceInfo) -> None:
             }
             sysinfo_changed = True
 
-            logger.info(
+            logger.debug(
                 "SysInfo: updating %s: %r → %r (source %s [rank %d] "
                 "beats %s [rank %d])",
                 sysinfo_key, old_raw, new_formatted,
@@ -514,7 +649,7 @@ def update_sysinfo(info: DeviceInfo) -> None:
             )
         else:
             # Existing value from a more reliable source → keep it
-            logger.info(
+            logger.debug(
                 "SysInfo: keeping %s = %r (source %s [rank %d] beats "
                 "new %s [rank %d] with %r)",
                 sysinfo_key, old_raw,

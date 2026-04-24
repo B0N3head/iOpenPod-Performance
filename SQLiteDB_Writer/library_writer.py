@@ -573,7 +573,7 @@ def write_library_itdb(
 
     Args:
         path: Output file path.
-        tracks: List of TrackInfo objects (with db_id already assigned).
+        tracks: List of TrackInfo objects (with db_track_id already assigned).
         playlists: User playlists (master is auto-generated).
         smart_playlists: Smart playlists for dataset 5.
         master_playlist_name: Name for the master playlist.
@@ -686,11 +686,11 @@ def write_library_itdb(
         composer_map: dict[str, int] = {}             # composer_name → pid
         pid_counter = 100  # Start above small IDs used for other things
 
-        # db_id → track_id map for playlist references
-        db_id_to_track_idx: dict[int, int] = {}
+        # db_track_id → track_id map for playlist references
+        db_track_id_to_track_idx: dict[int, int] = {}
 
         for idx, track in enumerate(tracks):
-            db_id_to_track_idx[track.db_id] = idx
+            db_track_id_to_track_idx[track.db_track_id] = idx
 
             # Album
             album_name = track.album or ""
@@ -740,7 +740,7 @@ def write_library_itdb(
                 album_artist_pids[key] = artist_map[aa]
             # Store artwork item pid (first track in album with artwork)
             if track.mhii_link and key not in album_artwork_pids:
-                album_artwork_pids[key] = track.db_id
+                album_artwork_pids[key] = track.db_track_id
             # Store feed_url for podcast albums
             if track.podcast_rss_url and key not in album_feed_urls:
                 album_feed_urls[key] = track.podcast_rss_url
@@ -971,7 +971,7 @@ def write_library_itdb(
                     ?, ?
                 )""",
                 (
-                    _s64(track.db_id), media_kind,
+                    _s64(track.db_track_id), media_kind,
                     *_media_kind_flags(media_kind),
                     date_mod, track.year,
                     track.explicit_flag,
@@ -1022,7 +1022,7 @@ def write_library_itdb(
                     volume_normalization_energy
                 ) VALUES (?, 0, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, 0, ?)""",
                 (
-                    _s64(track.db_id), audio_format, track.bitrate,
+                    _s64(track.db_track_id), audio_format, track.bitrate,
                     float(track.sample_rate), duration_samples,
                     track.gapless_track_flag, track.pregap, track.postgap,
                     track.gapless_data,
@@ -1038,7 +1038,7 @@ def write_library_itdb(
                         feed_url, feed_keywords
                     ) VALUES (?, ?, NULL, ?, NULL)""",
                     (
-                        _s64(track.db_id),
+                        _s64(track.db_track_id),
                         date_released,
                         track.podcast_rss_url,
                     )
@@ -1069,7 +1069,7 @@ def write_library_itdb(
             cur.execute(
                 "INSERT INTO item_to_container (item_pid, container_pid, physical_order, shuffle_order) "
                 "VALUES (?, ?, ?, NULL)",
-                (_s64(track.db_id), _s64(master_pid), idx)
+                (_s64(track.db_track_id), _s64(master_pid), idx)
             )
 
         # User playlists
@@ -1087,12 +1087,12 @@ def write_library_itdb(
             )
             container_pos += 1
 
-            for order, db_id in enumerate(pl.track_ids):
-                if db_id in db_id_to_track_idx:
+            for order, db_track_id in enumerate(pl.track_ids):
+                if db_track_id in db_track_id_to_track_idx:
                     cur.execute(
                         "INSERT INTO item_to_container (item_pid, container_pid, physical_order, shuffle_order) "
                         "VALUES (?, ?, ?, NULL)",
-                        (_s64(db_id), _s64(pl_pid), order)
+                        (_s64(db_track_id), _s64(pl_pid), order)
                     )
 
         # Smart playlists
@@ -1160,12 +1160,12 @@ def write_library_itdb(
             container_pos += 1
 
             # Add evaluated track list for smart playlists
-            for order, db_id in enumerate(spl.track_ids):
-                if db_id in db_id_to_track_idx:
+            for order, db_track_id in enumerate(spl.track_ids):
+                if db_track_id in db_track_id_to_track_idx:
                     cur.execute(
                         "INSERT INTO item_to_container (item_pid, container_pid, physical_order, shuffle_order) "
                         "VALUES (?, ?, ?, NULL)",
-                        (_s64(db_id), _s64(spl_pid), order)
+                        (_s64(db_track_id), _s64(spl_pid), order)
                     )
 
         # ── Create indexes ─────────────────────────────────────────────────

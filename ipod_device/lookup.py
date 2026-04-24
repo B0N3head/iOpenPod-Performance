@@ -7,6 +7,10 @@ from .capabilities import _FAMILY_GEN_CAPABILITIES
 from .models import IPOD_MODELS, SERIAL_LAST3_TO_MODEL
 
 
+def _identity_text(value: str | None) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
 def extract_model_number(model_str: str) -> Optional[str]:
     """Extract normalised model number from ModelNumStr.
 
@@ -35,6 +39,48 @@ def extract_model_number(model_str: str) -> Optional[str]:
         return match.group(1)
 
     return model_str.upper()[:5] if len(model_str) >= 5 else model_str.upper()
+
+
+def usb_pid_identity_conflicts(
+    model_family: str,
+    generation: str,
+    pid_family: str,
+    pid_generation: str,
+) -> bool:
+    """Return True when an exact model tuple cannot belong to a USB PID hint."""
+    model_family_norm = _identity_text(model_family)
+    pid_family_norm = _identity_text(pid_family)
+    if not model_family_norm or not pid_family_norm:
+        return False
+
+    model_generation_norm = _identity_text(generation)
+    pid_generation_norm = _identity_text(pid_generation)
+    if pid_family_norm == "ipod" and not pid_generation_norm:
+        return False
+
+    family_compatible = model_family_norm == pid_family_norm
+
+    # Special editions use more specific family labels than USB PID tables.
+    if not family_compatible and "u2" in model_family_norm:
+        family_compatible = model_family_norm.startswith(pid_family_norm + " ")
+
+    if not family_compatible:
+        return True
+
+    if not model_generation_norm or not pid_generation_norm:
+        return False
+    if model_generation_norm == pid_generation_norm:
+        return False
+
+    # The Video 5.5G uses the same coarse USB PID family as the Video 5G.
+    if (
+        pid_family_norm == "ipod video"
+        and pid_generation_norm == "5th gen"
+        and model_generation_norm == "5.5th gen"
+    ):
+        return False
+
+    return True
 
 
 def get_model_info(model_number: Optional[str]) -> tuple[str, str, str, str] | None:

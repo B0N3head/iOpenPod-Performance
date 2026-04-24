@@ -581,9 +581,14 @@ def _query_one_service(
             log.debug("Failed to open SCSI session for service %d", service)
             return None
 
-        info: dict = {}
+        info: dict = {
+            "_source": "scsi_vpd",
+            "_transport": "iokit_scsi_vpd",
+        }
 
         # USB identifiers
+        if "usb_vid" in usb_info:
+            info["usb_vid"] = usb_info["usb_vid"]
         if "usb_pid" in usb_info:
             info["usb_pid"] = usb_info["usb_pid"]
         if "usb_serial" in usb_info:

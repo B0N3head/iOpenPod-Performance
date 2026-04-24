@@ -16,6 +16,6 @@ MHIA_FIELDS: list[FieldDef] = [
     _u64("sql_id", 0x14, section_type=_S),
     _u16("platform_flag", 0x1C, section_type=_S, default=2),
     _u16("album_compilation_flag", 0x1E, section_type=_S),
-    # Representative track db_id — only populated by some iTunes versions
+    # Representative track db_track_id — only populated by some iTunes versions
     _u64("album_track_db_id", 0x20, section_type=_S, min_header_length=0x28),
 ]

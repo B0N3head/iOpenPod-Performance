@@ -344,15 +344,15 @@ IPOD_MODELS: dict[str, tuple[str, str, str, str]] = {
 USB_PID_TO_MODEL: dict[int, tuple[str, str]] = {
     # ── Normal-mode PIDs (0x120x) ──────────────────────────────────────────
     0x1201: ("iPod", "3rd Gen"),
-    0x1202: ("iPod", "2nd Gen"),
+    0x1202: ("iPod", ""),  # 1st/2nd Gen share this PID in USB ID tables
     0x1203: ("iPod", "4th Gen"),
     0x1204: ("iPod Photo", "4th Gen"),
-    0x1205: ("iPod Mini", "1st Gen"),
-    0x1206: ("iPod Nano", "1st Gen"),
-    0x1207: ("iPod Mini", "2nd Gen"),
-    0x1208: ("iPod", "1st Gen"),
-    0x1209: ("iPod Video", "5th Gen"),
-    0x120A: ("iPod Nano", "2nd Gen"),
+    0x1205: ("iPod Mini", ""),  # Mini 1st/2nd Gen share this PID
+    0x1206: ("iPod", ""),       # USB IDs label this only as "iPod '06'"
+    0x1207: ("iPod", ""),       # USB IDs label this only as "iPod '07'"
+    0x1208: ("iPod", ""),       # USB IDs label this only as "iPod '08'"
+    0x1209: ("iPod Video", ""),  # 5th/5.5th Gen share this coarse PID
+    0x120A: ("iPod Nano", ""),  # Original nano-era generic PID
 
     # ── DFU / WTF recovery mode PIDs (0x124x) ─────────────────────────────
     0x1240: ("iPod Nano", "2nd Gen (Recovery)"),

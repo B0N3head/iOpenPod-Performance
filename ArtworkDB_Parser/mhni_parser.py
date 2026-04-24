@@ -1,11 +1,19 @@
 import struct
 
 from ipod_device import ITHMB_FORMAT_MAP
+from ipod_device.artwork_presets import artwork_format_candidates
 
 
 def _expected_img_size_bytes(candidate) -> int:
     pf = candidate.pixel_format
-    if pf in ("RGB565_LE", "RGB565_BE", "RGB565_BE_90", "UYVY", "RGB555_LE", "RGB555_BE"):
+    if pf in (
+        "RGB565_LE",
+        "RGB565_BE",
+        "RGB565_BE_90",
+        "UYVY",
+        "RGB555_LE",
+        "RGB555_BE",
+    ):
         return candidate.row_bytes * candidate.height
     if pf.startswith("REC_RGB555"):
         return candidate.row_bytes * candidate.height
@@ -69,7 +77,12 @@ def parse_mhni(data, offset, header_length, chunk_length) -> dict:
     image_format = None
 
     format_id = imageName["correlationID"]
-    af = ITHMB_FORMAT_MAP.get(format_id)
+    candidates = artwork_format_candidates()
+    same_id_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.format_id == format_id
+    ]
     est_w = imageName["estimatedPixmapWidth"]
     est_h = imageName["estimatedPixmapHeight"]
     img_size = imageName["imgSize"]
@@ -77,7 +90,48 @@ def parse_mhni(data, offset, header_length, chunk_length) -> dict:
     # Prefer correlationID mapping only when it is plausibly compatible with
     # observed MHNI geometry or payload size. Some legacy/corrupt databases
     # carry mismatched correlation IDs (e.g. 140x140 metadata for ~57x58 data).
-    if af is not None:
+    if same_id_candidates:
+        best_match = None
+        best_match_score = float("inf")
+        for af in same_id_candidates:
+            expected = _expected_img_size_bytes(af)
+            corr_exact = expected > 0 and expected == img_size
+            corr_close = (
+                est_w > 0
+                and est_h > 0
+                and (
+                    (abs(est_w - af.width) <= 2 and abs(est_h - af.height) <= 2)
+                    or (abs(est_w - af.height) <= 2 and abs(est_h - af.width) <= 2)
+                )
+            )
+            # For variable-sized payloads (e.g. JPEG), trust correlation ID + geometry.
+            if expected == 0 and corr_close:
+                corr_exact = True
+            if not (corr_exact or corr_close):
+                continue
+
+            size_delta = abs(img_size - expected) if expected > 0 else 0
+            dim_delta = abs(est_w - af.width) + abs(est_h - af.height)
+            score = size_delta + dim_delta
+            if score < best_match_score:
+                best_match = af
+                best_match_score = score
+
+        if best_match is not None:
+            image_format = {
+                "height": best_match.height,
+                "width": best_match.width,
+                "format": best_match.pixel_format,
+                "description": best_match.description,
+                "format_id": format_id,
+            }
+
+    if image_format is None:
+        af = ITHMB_FORMAT_MAP.get(format_id)
+    else:
+        af = None
+
+    if image_format is None and af is not None:
         expected = _expected_img_size_bytes(af)
         corr_exact = expected > 0 and expected == img_size
         corr_close = (
@@ -106,12 +160,14 @@ def parse_mhni(data, offset, header_length, chunk_length) -> dict:
         best_candidate = None
         best_score = float("inf")
 
-        for candidate in ITHMB_FORMAT_MAP.values():
+        for candidate in candidates:
             dim_diff = abs(est_h - candidate.height) + abs(est_w - candidate.width)
             expected = _expected_img_size_bytes(candidate)
             if expected > 0:
                 size_delta = abs(img_size - expected)
-                score = dim_diff + (size_delta / max(1, candidate.row_bytes, candidate.width))
+                score = dim_diff + (
+                    size_delta / max(1, candidate.row_bytes, candidate.width)
+                )
             else:
                 score = dim_diff
             if score < best_score:

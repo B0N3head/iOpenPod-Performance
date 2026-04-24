@@ -163,7 +163,7 @@ MHIT_FIELDS: list[FieldDef] = [
     _f(0x64, 4, "user_id", _u32, desc="iTunes/Audible DRM user ID"),
     _f(0x68, 4, "date_added", _u32, xform="mac_timestamp"),
     _f(0x6C, 4, "bookmark_time", _u32, desc="ms"),
-    _f(0x70, 8, "db_id", _u64),
+    _f(0x70, 8, "db_track_id", _u64),
     _f(0x78, 1, "checked_flag", _u8),
     _f(0x79, 1, "app_rating", _u8, desc="stars*20 backup"),
     _f(0x7A, 2, "bpm", _u16),
@@ -185,7 +185,7 @@ MHIT_FIELDS: list[FieldDef] = [
     _f(0xA5, 1, "skip_when_shuffling", _u8, _C, 0xA6),
     _f(0xA6, 1, "remember_position", _u8, _C, 0xA7),
     _f(0xA7, 1, "use_podcast_now_playing_flag", _u8, _C, 0xA8),
-    _f(0xA8, 8, "db_id_2", _u64, _C, 0xB0),
+    _f(0xA8, 8, "db_track_id_2", _u64, _C, 0xB0),
     _f(0xB0, 1, "lyrics_flag", _u8, _C, 0xB1),
     _f(0xB1, 1, "movie_flag", _u8, _C, 0xB2),
     _f(0xB2, 1, "not_played_flag", _u8, _C, 0xB3),
@@ -214,7 +214,7 @@ MHIT_FIELDS: list[FieldDef] = [
     _f(0x118, 4, "unk0x118", _u32, _U, 0x11C, desc="iPodLinux: unk40, seen 0xBF"),
     _f(0x11C, 4, "unk0x11C", _u32, _U, 0x120),
     _f(0x120, 4, "album_id", _u32, _C, 0x124),
-    _f(0x124, 8, "mhbd_id_ref", _u64, _C, 0x12C),
+    _f(0x124, 8, "db_id_2_ref", _u64, _C, 0x12C),
     _f(0x12C, 4, "size_2", _u32, _C, 0x130, desc="duplicate of size at 0x24"),
     _f(0x130, 4, "unk0x130", _u32, _U, 0x134),
     _f(0x134, 8, "sort_mhod_indicators", _raw, _C, 0x13C, desc="6 sort flags + 2 pad"),
@@ -238,9 +238,9 @@ MHIA_FIELDS: list[FieldDef] = [
     _f(0x14, 8, "sql_id", _u64),
     _f(0x1C, 2, "platform_flag", _u16),
     _f(0x1E, 2, "album_compilation_flag", _u16),
-    # Discovered by iOpenPod analyzer: db_id of a representative track in this album
+    # Discovered by iOpenPod analyzer: db_track_id of a representative track in this album
     _f(0x20, 8, "album_track_db_id", _u64, _C, 0x28,
-       desc="representative track db_id, only populated by some iTunes versions"),
+       desc="representative track db_track_id, only populated by some iTunes versions"),
 ]
 
 
@@ -270,9 +270,9 @@ MHIP_FIELDS: list[FieldDef] = [
     _f(0x18, 4, "track_id", _u32, desc="references mhit track_id"),
     _f(0x1C, 4, "timestamp", _u32, xform="mac_timestamp"),
     _f(0x20, 4, "group_id_ref", _u32),
-    # Discovered by iOpenPod analyzer: track's db_id stored in MHIP
+    # Discovered by iOpenPod analyzer: track's db_track_id stored in MHIP
     _f(0x2C, 8, "track_persistent_id", _u64, _C, 0x34,
-       desc="track db_id — 100% match across all tested databases"),
+       desc="track db_track_id — 100% match across all tested databases"),
     # Per-track persistent ID, consistent across playlists, absent in older iTunes
     _f(0x3C, 8, "mhip_persistent_id", _u64, _C, 0x44,
        desc="per-track persistent ID, same value in all playlists"),

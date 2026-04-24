@@ -1,4 +1,4 @@
-"""Device capabilities — per-generation feature map and artwork format definitions.
+"""Device capabilities — per-generation feature map backed by canonical artwork formats.
 
 Sources:
   - libgpod ``itdb_device.c`` — itdb_device_supports_*() functions,
@@ -11,35 +11,16 @@ writing, artwork generation, or sync behaviour.  It is the single
 authority for "what does this device support?" questions.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
+from .artwork_presets import (
+    ARTWORK_FORMATS_BY_ID,
+    CLASSIC_1G_80GB_COVER_ART_FORMATS,
+    NANO_7G_COVER_ART_FORMATS,
+    ArtworkFormat,
+)
 from .checksum import ChecksumType
-
-
-@dataclass(frozen=True)
-class ArtworkFormat:
-    """One artwork thumbnail size for a device generation.
-
-    Attributes:
-        format_id:    Ithmb correlation ID (e.g. 1055, 1060, 1061) — the
-                      value stored in MHNIs and MHIFs in the ArtworkDB binary.
-        width:        Pixel width
-        height:       Pixel height
-        row_bytes:    Bytes per row (often ``width * 2`` for RGB565)
-        pixel_format: ``"RGB565_LE"`` (most iPods), ``"RGB565_LE_90"``
-                      (rotated, Nano 4G), ``"RGB565_BE"`` (Mobile/Motorola)
-        role:         ``"cover_small"``, ``"cover_large"``, ``"photo_full"``,
-                      ``"tv_out"``, etc.
-        description:  Human-readable label for logs / parser output.
-    """
-    format_id: int
-    width: int
-    height: int
-    row_bytes: int
-    pixel_format: str = "RGB565_LE"
-    role: str = "cover"
-    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,13 +64,8 @@ class DeviceCapabilities:
     """Device has an ArtworkDB and .ithmb files for album art."""
     supports_photo: bool = False
     """Device has additional photo artwork formats (for photo viewer)."""
-    photo_format_ids: tuple[int, ...] = ()
-    """Photo slideshow/display format IDs used by the Photos database pipeline.
-
-    These IDs are resolved via ``ipod_device.artwork.ITHMB_FORMAT_MAP`` and are
-    intentionally separate from ``cover_art_formats`` because many devices use
-    different ithmb sets for Photos vs album artwork.
-    """
+    photo_formats: tuple[ArtworkFormat, ...] = ()
+    """Photo/slideshow ithmb formats used by the Photos database pipeline."""
     supports_chapter_image: bool = False
     """Device has chapter image artwork formats (for enhanced podcasts)."""
     supports_sparse_artwork: bool = False
@@ -147,50 +123,16 @@ class DeviceCapabilities:
     Nano 3G/4G are limited to Level 1.3 by their hardware decoder."""
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Cover-art format sets — ithmb correlation IDs
-# ──────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DeviceCapabilityOverride:
+    """Targeted corrections for model/capacity-specific hardware variants."""
 
-_ART_PHOTO = (
-    ArtworkFormat(1017, 56, 56, 112, "RGB565_LE", "cover_small", "Photo album art small"),
-    ArtworkFormat(1016, 140, 140, 280, "RGB565_LE", "cover_large", "Photo album art large"),
-)
-
-_ART_NANO_1G2G = (
-    ArtworkFormat(1031, 42, 42, 84, "RGB565_LE", "cover_small", "Nano album art small"),
-    ArtworkFormat(1027, 100, 100, 200, "RGB565_LE", "cover_large", "Nano album art large"),
-)
-
-_ART_VIDEO = (
-    ArtworkFormat(1028, 100, 100, 200, "RGB565_LE", "cover_small", "Video album art small"),
-    ArtworkFormat(1029, 200, 200, 400, "RGB565_LE", "cover_large", "Video album art large"),
-)
-
-_ART_CLASSIC = (
-    ArtworkFormat(1061, 56, 56, 112, "RGB565_LE", "cover_small", "Classic album art small"),
-    ArtworkFormat(1055, 128, 128, 256, "RGB565_LE", "cover_medium", "Classic album art medium"),
-    ArtworkFormat(1060, 320, 320, 640, "RGB565_LE", "cover_large", "Classic album art large"),
-)
-
-_ART_NANO_4G = (
-    ArtworkFormat(1071, 240, 240, 480, "RGB565_LE", "cover_large", "Nano 4G album art large"),
-    ArtworkFormat(1074, 50, 50, 100, "RGB565_LE", "cover_xsmall", "Nano 4G album art tiny"),
-    ArtworkFormat(1078, 80, 80, 160, "RGB565_LE", "cover_small", "Nano 4G/5G album art small"),
-)
-
-_ART_NANO_5G = (
-    ArtworkFormat(1073, 240, 240, 480, "RGB565_LE", "cover_large", "Nano 5G album art large"),
-    ArtworkFormat(1056, 128, 128, 256, "RGB565_LE", "cover_medium", "Nano 5G album art medium"),
-    ArtworkFormat(1078, 80, 80, 160, "RGB565_LE", "cover_small", "Nano 4G/5G album art small"),
-    ArtworkFormat(1074, 50, 50, 100, "RGB565_LE", "cover_xsmall", "Nano 4G/5G album art tiny"),
-)
-
-_ART_NANO_6G = (
-    ArtworkFormat(1073, 240, 240, 480, "RGB565_LE", "cover_large", "Nano 6G album art large"),
-    ArtworkFormat(1085, 88, 88, 176, "RGB565_LE", "cover_medium", "Nano 6G album art medium"),
-    ArtworkFormat(1089, 58, 58, 116, "RGB565_LE", "cover_small", "Nano 6G album art small"),
-    ArtworkFormat(1074, 50, 50, 100, "RGB565_LE", "cover_xsmall", "Nano 6G album art tiny"),
-)
+    family: str
+    generation: str = ""
+    capacity: str = ""
+    model_numbers: tuple[str, ...] = ()
+    cover_art_formats: tuple[ArtworkFormat, ...] | None = None
+    photo_formats: tuple[ArtworkFormat, ...] | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -243,8 +185,16 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod Photo", "4th Gen"): DeviceCapabilities(
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1009, 1013, 1015, 1019),
-        cover_art_formats=_ART_PHOTO,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1009],
+            ARTWORK_FORMATS_BY_ID[1013],
+            ARTWORK_FORMATS_BY_ID[1015],
+            ARTWORK_FORMATS_BY_ID[1019],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1017],
+            ARTWORK_FORMATS_BY_ID[1016],
+        ),
         music_dirs=20,
         db_version=0x13,
     ),
@@ -254,8 +204,16 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_video=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1036, 1024, 1015, 1019),
-        cover_art_formats=_ART_VIDEO,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1036],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1015],
+            ARTWORK_FORMATS_BY_ID[1019],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1028],
+            ARTWORK_FORMATS_BY_ID[1029],
+        ),
         music_dirs=20,
         db_version=0x19,
         max_video_width=640,
@@ -268,8 +226,16 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1036, 1024, 1015, 1019),
-        cover_art_formats=_ART_VIDEO,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1036],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1015],
+            ARTWORK_FORMATS_BY_ID[1019],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1028],
+            ARTWORK_FORMATS_BY_ID[1029],
+        ),
         music_dirs=20,
         db_version=0x19,
         max_video_width=640,
@@ -281,8 +247,16 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_video=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1036, 1024, 1015, 1019),
-        cover_art_formats=_ART_VIDEO,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1036],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1015],
+            ARTWORK_FORMATS_BY_ID[1019],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1028],
+            ARTWORK_FORMATS_BY_ID[1029],
+        ),
         music_dirs=20,
         db_version=0x19,
         max_video_width=640,
@@ -293,8 +267,16 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1036, 1024, 1015, 1019),
-        cover_art_formats=_ART_VIDEO,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1036],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1015],
+            ARTWORK_FORMATS_BY_ID[1019],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1028],
+            ARTWORK_FORMATS_BY_ID[1029],
+        ),
         music_dirs=20,
         db_version=0x19,
         max_video_width=640,
@@ -308,10 +290,19 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1067, 1024, 1066),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1067],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1066],
+        ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=_ART_CLASSIC,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1061],
+            ARTWORK_FORMATS_BY_ID[1055],
+            ARTWORK_FORMATS_BY_ID[1068],
+            ARTWORK_FORMATS_BY_ID[1060],
+        ),
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -323,10 +314,19 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1067, 1024, 1066),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1067],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1066],
+        ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=_ART_CLASSIC,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1061],
+            ARTWORK_FORMATS_BY_ID[1055],
+            ARTWORK_FORMATS_BY_ID[1068],
+            ARTWORK_FORMATS_BY_ID[1060],
+        ),
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -338,10 +338,19 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1067, 1024, 1066),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1067],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1066],
+        ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=_ART_CLASSIC,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1061],
+            ARTWORK_FORMATS_BY_ID[1055],
+            ARTWORK_FORMATS_BY_ID[1068],
+            ARTWORK_FORMATS_BY_ID[1060],
+        ),
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -365,16 +374,28 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod Nano", "1st Gen"): DeviceCapabilities(
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1032, 1023),
-        cover_art_formats=_ART_NANO_1G2G,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1032],
+            ARTWORK_FORMATS_BY_ID[1023],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1031],
+            ARTWORK_FORMATS_BY_ID[1027],
+        ),
         music_dirs=14,
         db_version=0x13,
     ),
     ("iPod Nano", "2nd Gen"): DeviceCapabilities(
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1032, 1023),
-        cover_art_formats=_ART_NANO_1G2G,
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1032],
+            ARTWORK_FORMATS_BY_ID[1023],
+        ),
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1031],
+            ARTWORK_FORMATS_BY_ID[1027],
+        ),
         music_dirs=14,
         db_version=0x13,
     ),
@@ -386,9 +407,18 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1067, 1024, 1066),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1067],
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1066],
+        ),
         supports_sparse_artwork=True,
-        cover_art_formats=_ART_CLASSIC,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1061],
+            ARTWORK_FORMATS_BY_ID[1055],
+            ARTWORK_FORMATS_BY_ID[1068],
+            ARTWORK_FORMATS_BY_ID[1060],
+        ),
         music_dirs=20,
         db_version=0x30,
         max_video_width=320,
@@ -404,10 +434,22 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1024, 1066, 1079, 1083),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1024],
+            ARTWORK_FORMATS_BY_ID[1066],
+            ARTWORK_FORMATS_BY_ID[1079],
+            ARTWORK_FORMATS_BY_ID[1083],
+        ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=_ART_NANO_4G,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1055],
+            ARTWORK_FORMATS_BY_ID[1068],
+            ARTWORK_FORMATS_BY_ID[1071],
+            ARTWORK_FORMATS_BY_ID[1074],
+            ARTWORK_FORMATS_BY_ID[1078],
+            ARTWORK_FORMATS_BY_ID[1084],
+        ),
         music_dirs=20,
         db_version=0x30,
         max_video_width=480,
@@ -423,11 +465,20 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1087, 1079, 1066),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1087],
+            ARTWORK_FORMATS_BY_ID[1079],
+            ARTWORK_FORMATS_BY_ID[1066],
+        ),
         supports_sparse_artwork=True,
         supports_compressed_db=True,
         uses_sqlite_db=True,
-        cover_art_formats=_ART_NANO_5G,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1056],
+            ARTWORK_FORMATS_BY_ID[1078],
+            ARTWORK_FORMATS_BY_ID[1073],
+            ARTWORK_FORMATS_BY_ID[1074],
+        ),
         music_dirs=14,
         db_version=0x30,
         max_video_width=640,
@@ -441,11 +492,19 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1092, 1093),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1092],
+            ARTWORK_FORMATS_BY_ID[1093],
+        ),
         supports_sparse_artwork=True,
         supports_compressed_db=True,
         uses_sqlite_db=True,
-        cover_art_formats=_ART_NANO_6G,
+        cover_art_formats=(
+            ARTWORK_FORMATS_BY_ID[1073],
+            ARTWORK_FORMATS_BY_ID[1085],
+            ARTWORK_FORMATS_BY_ID[1089],
+            ARTWORK_FORMATS_BY_ID[1074],
+        ),
         music_dirs=20,
         db_version=0x30,
     ),
@@ -457,11 +516,14 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         supports_gapless=True,
         supports_artwork=True,
         supports_photo=True,
-        photo_format_ids=(1007, 1005),
+        photo_formats=(
+            ARTWORK_FORMATS_BY_ID[1007],
+            ARTWORK_FORMATS_BY_ID[1005],
+        ),
         supports_sparse_artwork=True,
         supports_compressed_db=True,
         uses_sqlite_db=True,
-        cover_art_formats=_ART_NANO_6G,
+        cover_art_formats=NANO_7G_COVER_ART_FORMATS,
         music_dirs=20,
         db_version=0x30,
         max_video_width=720,
@@ -514,9 +576,80 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
 }
 
 
+_MODEL_CAPABILITY_OVERRIDES: tuple[DeviceCapabilityOverride, ...] = (
+    DeviceCapabilityOverride(
+        family="iPod Classic",
+        generation="1st Gen",
+        capacity="80GB",
+        model_numbers=("MB029", "MB147"),
+        cover_art_formats=CLASSIC_1G_80GB_COVER_ART_FORMATS,
+    ),
+)
+
+
+def _normalize_capacity(capacity: str | None) -> str:
+    return (capacity or "").replace(" ", "").upper()
+
+
+def _normalize_model_number(model_number: str | None) -> str:
+    return (model_number or "").strip().upper()
+
+
+def _override_matches(
+    override: DeviceCapabilityOverride,
+    family: str,
+    generation: str,
+    capacity: str | None,
+    model_number: str | None,
+) -> bool:
+    if override.family != family:
+        return False
+    if override.generation and override.generation != generation:
+        return False
+
+    capacity_norm = _normalize_capacity(capacity)
+    model_norm = _normalize_model_number(model_number)
+    model_numbers = {_normalize_model_number(m) for m in override.model_numbers}
+
+    capacity_match = bool(
+        override.capacity
+        and _normalize_capacity(override.capacity) == capacity_norm
+    )
+    model_match = bool(model_norm and model_norm in model_numbers)
+
+    if override.capacity or override.model_numbers:
+        return capacity_match or model_match
+    return True
+
+
+def _apply_capability_overrides(
+    base: DeviceCapabilities,
+    family: str,
+    generation: str,
+    capacity: str | None,
+    model_number: str | None,
+) -> DeviceCapabilities:
+    caps = base
+    for override in _MODEL_CAPABILITY_OVERRIDES:
+        if not _override_matches(override, family, generation, capacity, model_number):
+            continue
+
+        updates = {}
+        if override.cover_art_formats is not None:
+            updates["cover_art_formats"] = override.cover_art_formats
+        if override.photo_formats is not None:
+            updates["photo_formats"] = override.photo_formats
+        if updates:
+            caps = replace(caps, **updates)
+    return caps
+
+
 def capabilities_for_family_gen(
     family: str,
     generation: str,
+    *,
+    capacity: str | None = None,
+    model_number: str | None = None,
 ) -> Optional[DeviceCapabilities]:
     """Return the device capabilities for a (family, generation) pair.
 
@@ -524,12 +657,44 @@ def capabilities_for_family_gen(
     checks whether all known generations of *family* share identical
     capabilities and returns those.
 
+    Optional *capacity* and *model_number* hints select hardware variants
+    within the same marketing generation without forcing call sites to carry
+    one-off artwork tables.
+
     Returns ``None`` if the pair is not in the lookup table and the
     family-level fallback is ambiguous.
     """
     caps = _FAMILY_GEN_CAPABILITIES.get((family, generation))
     if caps is not None:
-        return caps
+        return _apply_capability_overrides(
+            caps,
+            family,
+            generation,
+            capacity,
+            model_number,
+        )
+
+    if family and not generation and (capacity or model_number):
+        for override in _MODEL_CAPABILITY_OVERRIDES:
+            if not override.generation:
+                continue
+            if not _override_matches(
+                override,
+                family,
+                override.generation,
+                capacity,
+                model_number,
+            ):
+                continue
+            base = _FAMILY_GEN_CAPABILITIES.get((family, override.generation))
+            if base is not None:
+                return _apply_capability_overrides(
+                    base,
+                    family,
+                    override.generation,
+                    capacity,
+                    model_number,
+                )
 
     if family and not generation:
         family_caps = [

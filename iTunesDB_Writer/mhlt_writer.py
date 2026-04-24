@@ -27,7 +27,7 @@ def write_mhlt(tracks: List[TrackInfo], start_track_id: int, db_id_2: int,
     Args:
         tracks: List of TrackInfo objects
         start_track_id: Starting track ID (increments for each track)
-        db_id_2: Database-wide ID from MHBD (written into every MHIT at offset 0x124)
+        db_id_2: Database-wide ID from MHBD (written into every MHIT db_id_2_ref at offset 0x124)
         capabilities: Optional DeviceCapabilities for gapless/video filtering
         db_version: Database version — forwarded to write_mhit for header sizing
 

@@ -15,24 +15,24 @@ from PIL import Image
 from ipod_device import ITHMB_FORMAT_MAP
 
 
-def _fmt(format_id: int):
-    return ITHMB_FORMAT_MAP.get(format_id)
+def _fmt(format_id: int, fmt_override=None):
+    return fmt_override if fmt_override is not None else ITHMB_FORMAT_MAP.get(format_id)
 
 
-def format_pixel_format(format_id: int) -> str:
-    fmt = _fmt(format_id)
+def format_pixel_format(format_id: int, fmt_override=None) -> str:
+    fmt = _fmt(format_id, fmt_override)
     return (fmt.pixel_format if fmt is not None else "UNKNOWN")
 
 
-def format_dimensions(format_id: int, fallback_w: int, fallback_h: int) -> tuple[int, int]:
-    fmt = _fmt(format_id)
+def format_dimensions(format_id: int, fallback_w: int, fallback_h: int, fmt_override=None) -> tuple[int, int]:
+    fmt = _fmt(format_id, fmt_override)
     if fmt is None:
         return fallback_w, fallback_h
     return int(fmt.width), int(fmt.height)
 
 
-def default_stride_pixels(format_id: int, width: int) -> int:
-    fmt = _fmt(format_id)
+def default_stride_pixels(format_id: int, width: int, fmt_override=None) -> int:
+    fmt = _fmt(format_id, fmt_override)
     if fmt is None:
         return width
 
@@ -47,9 +47,19 @@ def default_stride_pixels(format_id: int, width: int) -> int:
     return width
 
 
-def expected_size_bytes(format_id: int, width: int, height: int, stride_pixels: Optional[int] = None) -> int:
-    pf = format_pixel_format(format_id)
-    stride = stride_pixels if stride_pixels is not None else default_stride_pixels(format_id, width)
+def expected_size_bytes(
+    format_id: int,
+    width: int,
+    height: int,
+    stride_pixels: Optional[int] = None,
+    fmt_override=None,
+) -> int:
+    pf = format_pixel_format(format_id, fmt_override=fmt_override)
+    stride = stride_pixels if stride_pixels is not None else default_stride_pixels(
+        format_id,
+        width,
+        fmt_override=fmt_override,
+    )
 
     if pf in (
         "RGB565_LE",
@@ -339,12 +349,14 @@ def encode_image_for_format(
     format_id: int,
     target_width: Optional[int] = None,
     target_height: Optional[int] = None,
+    fmt_override=None,
 ) -> dict:
-    pf = format_pixel_format(format_id)
+    pf = format_pixel_format(format_id, fmt_override=fmt_override)
     w, h = format_dimensions(
         format_id,
         int(target_width or source_img.width),
         int(target_height or source_img.height),
+        fmt_override=fmt_override,
     )
 
     base = source_img.convert("RGB").resize((w, h), Image.Resampling.LANCZOS)
@@ -358,7 +370,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -370,7 +382,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -382,7 +394,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -394,7 +406,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -408,7 +420,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -437,7 +449,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -463,7 +475,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w),
+            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
             "pixel_format": pf,
         }
 
@@ -478,7 +490,7 @@ def encode_image_for_format(
         "width": w,
         "height": h,
         "size": len(raw),
-        "stride_pixels": default_stride_pixels(format_id, w),
+        "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
         "pixel_format": "RGB565_LE",
     }
 

@@ -24,10 +24,14 @@ from .capabilities import (
 
 # ── artwork ──────────────────────────────────────────────────────────
 from .artwork import (
+    ARTWORK_FORMATS_BY_ID,
     ITHMB_FORMAT_MAP,
     ITHMB_SIZE_MAP,
+    cover_art_format_definitions_for_device,
     ithmb_formats_for_device,
     photo_formats_for_device,
+    resolve_cover_art_format_definitions,
+    resolve_cover_art_format_definitions_for_device,
 )
 
 # ── models ───────────────────────────────────────────────────────────
@@ -74,11 +78,23 @@ from .info import (
     generate_library_id,
 )
 
+# ── sysinfo parsing/evidence ─────────────────────────────────────────
+from .sysinfo import (
+    DeviceEvidence,
+    EvidenceValue,
+    ParsedSysInfoExtended,
+    identity_from_sysinfo,
+    identity_from_sysinfo_extended,
+    parse_sysinfo_extended,
+    parse_sysinfo_text,
+)
+
 # ── authority ────────────────────────────────────────────────────────
 from .authority import (
     SOURCE_RANK,
     SYSINFO_FIELDS,
     AUTHORITY_FILENAME,
+    cache_sysinfo_extended,
     check_authority_coverage,
     update_sysinfo,
     read_authority,
@@ -92,9 +108,24 @@ from .vpd_libusb import (
     identify_via_vpd,
 )
 
+from .vpd_usb_control import (
+    query_ipod_usb_sysinfo_extended,
+    query_all_ipod_usb_sysinfo_extended,
+)
+
+try:
+    from .vpd_linux import query_ipod_vpd_for_path as linux_query_ipod_vpd_for_path
+except ImportError:
+    pass
+
+try:
+    from .vpd_windows import query_ipod_vpd_for_path as windows_query_ipod_vpd_for_path
+except ImportError:
+    pass
+
 # ── vpd_iokit is macOS-only and raises ImportError on other platforms,
 #    so we don't import it at package level.  Import directly:
 #        from ipod_device.vpd_iokit import query_ipod_vpd
 
 # ── scanner (GUI/device_scanner) ────────────────────────────────────
-from .scanner import scan_for_ipods
+from .scanner import identify_ipod_at_path, scan_for_ipods

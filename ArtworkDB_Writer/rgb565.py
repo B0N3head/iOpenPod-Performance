@@ -13,8 +13,11 @@ from PIL import Image
 from typing import Optional
 
 from ipod_device import (
+    ArtworkFormat,
     ITHMB_FORMAT_MAP,
     ithmb_formats_for_device,
+    resolve_cover_art_format_definitions,
+    resolve_cover_art_format_definitions_for_device,
 )
 
 
@@ -44,6 +47,18 @@ IPOD_NANO_5G_FORMATS = ithmb_formats_for_device("iPod Nano", "5th Gen")
 IPOD_STRIDE_OVERRIDE: dict[int, int] = {}
 
 
+def get_artwork_format_definitions(ipod_path: str) -> dict[int, ArtworkFormat]:
+    """Return device-specific artwork format objects for the connected iPod."""
+    from ipod_device import get_current_device
+
+    device = get_current_device()
+    resolved = resolve_cover_art_format_definitions_for_device(device)
+    if resolved:
+        return resolved
+
+    return resolve_cover_art_format_definitions("iPod Classic", "1st Gen")
+
+
 def get_artwork_formats(ipod_path: str) -> dict[int, tuple[int, int]]:
     """Return the correct format table for the connected iPod.
 
@@ -54,23 +69,14 @@ def get_artwork_formats(ipod_path: str) -> dict[int, tuple[int, int]]:
     import logging
     _log = logging.getLogger(__name__)
 
-    from ipod_device import get_current_device
-    device = get_current_device()
-    if device is not None and device.artwork_formats:
-        _log.info(
-            "ART: using formats from DeviceInfo: %s",
-            list(device.artwork_formats.keys()),
-        )
-        return device.artwork_formats
+    defs = get_artwork_format_definitions(ipod_path)
+    if defs:
+        _log.info("ART: using resolved format definitions: %s", list(defs.keys()))
+        return {fid: (int(fmt.width), int(fmt.height)) for fid, fmt in defs.items()}
 
-    # Try capabilities table via device family/generation
-    if device is not None and device.model_family and device.generation:
-        caps_fmts = ithmb_formats_for_device(device.model_family, device.generation)
-        if caps_fmts:
-            _log.info("ART: using formats from capabilities: %s", list(caps_fmts.keys()))
-            return caps_fmts
-
-    _log.info("ART: no DeviceInfo available — defaulting to iPod Classic formats")
+    _log.info(
+        "ART: no artwork definitions available — defaulting to iPod Classic formats"
+    )
     return IPOD_CLASSIC_FORMATS
 
 
@@ -89,14 +95,26 @@ def _extract_format_ids(data: bytes) -> list[int]:
         ds_type = struct.unpack('<H', data[offset + 12:offset + 14])[0]
         if ds_type == 3:  # file list
             mhlf_off = offset + mhsd_hdr
-            if mhlf_off + 12 <= len(data) and data[mhlf_off:mhlf_off + 4] == b'mhlf':
+            if (
+                mhlf_off + 12 <= len(data)
+                and data[mhlf_off:mhlf_off + 4] == b'mhlf'
+            ):
                 mhlf_hdr = struct.unpack('<I', data[mhlf_off + 4:mhlf_off + 8])[0]
                 mhif_count = struct.unpack('<I', data[mhlf_off + 8:mhlf_off + 12])[0]
                 mhif_off = mhlf_off + mhlf_hdr
                 for _ in range(mhif_count):
-                    if mhif_off + 20 <= len(data) and data[mhif_off:mhif_off + 4] == b'mhif':
-                        mhif_size = struct.unpack('<I', data[mhif_off + 4:mhif_off + 8])[0]
-                        corr_id = struct.unpack('<I', data[mhif_off + 16:mhif_off + 20])[0]
+                    if (
+                        mhif_off + 20 <= len(data)
+                        and data[mhif_off:mhif_off + 4] == b'mhif'
+                    ):
+                        mhif_size = struct.unpack(
+                            '<I',
+                            data[mhif_off + 4:mhif_off + 8],
+                        )[0]
+                        corr_id = struct.unpack(
+                            '<I',
+                            data[mhif_off + 16:mhif_off + 20],
+                        )[0]
                         result.append(corr_id)
                         mhif_off += mhif_size
                     else:

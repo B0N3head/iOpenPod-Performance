@@ -46,19 +46,6 @@ class InvalidFieldValueError(WriteError):
         self.field_name = field_name
 
 
-class SectionLengthMismatchError(WriteError):
-    """Written byte count does not match ``total_length``."""
-
-    def __init__(self, section_type: str, expected: int, actual: int) -> None:
-        super().__init__(
-            f"Section '{section_type}' length mismatch: "
-            f"expected {expected}, got {actual}"
-        )
-        self.section_type = section_type
-        self.expected = expected
-        self.actual = actual
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  2. Transform & Validator Functions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -102,26 +89,6 @@ def validate_volume(value: int) -> None:
     """Raise if volume adjustment is outside -255..+255."""
     if not (-255 <= value <= 255):
         raise ValueError(f"volume {value} outside -255..+255")
-
-
-def encode_soundcheck(db: float) -> int:
-    """Convert dB gain adjustment to Apple SoundCheck value.
-
-    SoundCheck is a linear multiplier × 1000.  Loud tracks get small
-    values (attenuation), quiet tracks get large values (boost).
-    ``0`` means no adjustment (treated as 1000 = unity gain by iPod).
-    """
-    if db == 0.0:
-        return 0
-    return max(0, int(round(1000.0 * (10.0 ** (-db / 10.0)))))
-
-
-def decode_soundcheck(raw: int) -> float:
-    """Convert Apple SoundCheck value to dB gain adjustment."""
-    import math
-    if raw == 0:
-        return 0.0
-    return -10.0 * math.log10(raw / 1000.0)
 
 
 def filetype_to_string(val: int) -> str:
@@ -218,10 +185,6 @@ def _u16(name: str, offset: int, **kw: Any) -> FieldDef:
     return FieldDef(name=name, offset=offset, size=2, struct_format="<H", **kw)
 
 
-def _i16(name: str, offset: int, **kw: Any) -> FieldDef:
-    return FieldDef(name=name, offset=offset, size=2, struct_format="<h", **kw)
-
-
 def _u64(name: str, offset: int, **kw: Any) -> FieldDef:
     return FieldDef(name=name, offset=offset, size=8, struct_format="<Q", **kw)
 
@@ -247,16 +210,6 @@ def _raw(name: str, offset: int, size: int, **kw: Any) -> FieldDef:
 # Populated by __init__.py after all *_defs modules have been imported.
 FIELD_REGISTRY: dict[str, list[FieldDef]] = {}
 
-# Quick name→FieldDef lookup per section — rebuilt when registry is filled.
-_FIELD_INDEX: dict[str, dict[str, FieldDef]] = {}
-
-
-def _rebuild_index() -> None:
-    """Rebuild the per-section name→FieldDef index from FIELD_REGISTRY."""
-    _FIELD_INDEX.clear()
-    for section, fields in FIELD_REGISTRY.items():
-        _FIELD_INDEX[section] = {f.name: f for f in fields}
-
 
 def get_fields(
     section_type: str,
@@ -279,11 +232,6 @@ def get_fields(
             if f.min_header_length is None or header_length >= f.min_header_length
         ]
     return list(fields)
-
-
-def get_field(section_type: str, field_name: str) -> FieldDef | None:
-    """Look up a single field by section and name."""
-    return _FIELD_INDEX.get(section_type, {}).get(field_name)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -374,13 +322,13 @@ def write_field(
     # Coerce to the type required by the format code so that floats or other
     # numeric types from metadata sources never reach struct.pack_into as the
     # wrong type (e.g. float for an integer field, or int for a float field).
-    _fmt = field.struct_format[-1]
-    if _fmt in 'IiHhQqBbNnP':
+    format_code = field.struct_format[-1]
+    if format_code in 'IiHhQqBbNnP':
         if not isinstance(value, int):
             value = int(value)
         # Clamp to the valid range for the format so bad metadata (e.g. negative
         # BPM, oversized play counts) never crashes the packer.
-        _INT_RANGES = {
+        int_ranges = {
             'B': (0, 0xFF),
             'H': (0, 0xFFFF),
             'I': (0, 0xFFFF_FFFF),
@@ -390,10 +338,10 @@ def write_field(
             'i': (-0x8000_0000, 0x7FFF_FFFF),
             'q': (-0x8000_0000_0000_0000, 0x7FFF_FFFF_FFFF_FFFF),
         }
-        if _fmt in _INT_RANGES:
-            _lo, _hi = _INT_RANGES[_fmt]
-            value = max(_lo, min(_hi, value))
-    elif _fmt in 'fd':
+        if format_code in int_ranges:
+            lower, upper = int_ranges[format_code]
+            value = max(lower, min(upper, value))
+    elif format_code in 'fd':
         if not isinstance(value, float):
             value = float(value)
     try:

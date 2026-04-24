@@ -31,4 +31,3 @@ _fb.FIELD_REGISTRY.update({
     "mhyp": _mhyp,
     "mhod": _mhod,
 })
-_fb._rebuild_index()

@@ -69,7 +69,7 @@ class PlaylistItemMeta:
       +0x10: podcast_group_flag (4B)
       +0x14: group_id (4B) — unique MHIP identifier (libgpod: podcastgroupid)
       +0x20: podcast_group_ref (4B) — references another MHIP's group_id
-      +0x2C: track_persistent_id (8B) — track's db_id
+      +0x2C: track_persistent_id (8B) — track's db_track_id
       +0x3C: mhip_persistent_id (8B) — per-track persistent ID
     """
     podcast_group_flag: int = 0

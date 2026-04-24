@@ -27,11 +27,84 @@ import hashlib
 import logging
 import os
 import socket
+import sys
 import threading
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+from .diagnostic_log import (
+    CAPABILITY_FIELDS,
+    IDENTITY_FIELDS,
+    SOURCE_FIELDS,
+    format_fields,
+    format_sources,
+)
+
+_LIVE_VALIDATION_LOCK = threading.Lock()
+_LIVE_VALIDATION_INFLIGHT: set[str] = set()
+
+
+def _source_rank(source: str) -> int:
+    try:
+        from .authority import SOURCE_RANK, _WORST_RANK
+
+        return SOURCE_RANK.get(source, _WORST_RANK)
+    except Exception:
+        return 999
+
+
+def _values_match(field: str, left, right) -> bool:
+    if field == "firewire_guid":
+        try:
+            from .sysinfo import normalize_guid
+
+            return normalize_guid(left) == normalize_guid(right)
+        except Exception:
+            pass
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def _set_field_from_source(
+    info: "DeviceInfo",
+    field: str,
+    value,
+    source: str,
+    *,
+    label: str = "live probe",
+) -> None:
+    """Set or provenance-upgrade a DeviceInfo field from a ranked source."""
+    if value in (None, "", b""):
+        return
+
+    current = getattr(info, field, None)
+    current_source = info._field_sources.get(field, "unknown")
+    new_rank = _source_rank(source)
+    current_rank = _source_rank(current_source)
+
+    if not current:
+        setattr(info, field, value)
+        info._field_sources[field] = source
+        logger.debug("enrich: %s from %s: %s", field, label, value)
+        return
+
+    if _values_match(field, current, value):
+        if new_rank <= current_rank:
+            info._field_sources[field] = source
+        return
+
+    if new_rank <= current_rank:
+        logger.warning(
+            "enrich: %s from %s overrides %r from %s with %r",
+            field,
+            label,
+            current,
+            current_source,
+            value,
+        )
+        setattr(info, field, value)
+        info._field_sources[field] = source
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -61,7 +134,34 @@ class DeviceInfo:
     serial: str = ""                  # Apple serial (e.g. "YM0350TRVQ5"), NOT the FW GUID
     firmware: str = ""
     board: str = ""                   # BoardHwName from SysInfo
+    family_id: int | str = 0
+    updater_family_id: int | str = 0
+    product_type: str = ""
     usb_pid: int = 0
+    usb_vid: int = 0
+    usb_serial: str = ""              # Usually the FireWire GUID on iPods
+    usbstor_instance_id: str = ""
+    usb_parent_instance_id: str = ""
+    usb_grandparent_instance_id: str = ""
+    scsi_vendor: str = ""
+    scsi_product: str = ""
+    scsi_revision: str = ""
+    connected_bus: str = ""
+    volume_format: str = ""
+
+    # ── Device capabilities from SysInfoExtended / VPD ────────────────
+    db_version: int = 0
+    shadow_db_version: int = 0
+    uses_sqlite_db: bool = False
+    supports_sparse_artwork: bool = False
+    max_tracks: int = 0
+    max_file_size_gb: int | float = 0
+    max_transfer_speed: int = 0
+    podcasts_supported: bool = False
+    voice_memos_supported: bool = False
+    audio_codecs: dict[str, Any] = field(default_factory=dict)
+    power_information: dict[str, Any] = field(default_factory=dict)
+    apple_drm_version: dict[str, Any] = field(default_factory=dict)
 
     # ── Hashing / Security ────────────────────────────────────────────
     checksum_type: int = 99           # ChecksumType value (99 = UNKNOWN)
@@ -75,9 +175,13 @@ class DeviceInfo:
 
     # ── Artwork ───────────────────────────────────────────────────────
     artwork_formats: dict[int, tuple[int, int]] = field(default_factory=dict)
+    photo_formats: dict[int, tuple[int, int]] = field(default_factory=dict)
+    chapter_image_formats: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     # ── Raw SysInfo cache (so nobody ever has to re-read the file) ────
     sysinfo: dict[str, str] = field(default_factory=dict)
+    raw_identity_evidence: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    identity_conflicts: list[dict[str, Any]] = field(default_factory=list)
 
     # ── Provenance ────────────────────────────────────────────────────
     identification_method: str = "unknown"
@@ -149,13 +253,26 @@ class DeviceInfo:
         generations of the family share identical capabilities.
         """
         from .capabilities import capabilities_for_family_gen, DeviceCapabilities
+        caps = None
         if self.model_family:
             caps = capabilities_for_family_gen(
                 self.model_family, self.generation or "",
             )
-            if caps:
-                return caps
-        return DeviceCapabilities()
+        if caps is None:
+            caps = DeviceCapabilities()
+
+        overrides: dict[str, Any] = {}
+        if self.db_version:
+            overrides["db_version"] = int(self.db_version)
+        if self.shadow_db_version:
+            overrides["shadow_db_version"] = int(self.shadow_db_version)
+        if "uses_sqlite_db" in self._field_sources:
+            overrides["uses_sqlite_db"] = bool(self.uses_sqlite_db)
+        if "supports_sparse_artwork" in self._field_sources:
+            overrides["supports_sparse_artwork"] = bool(self.supports_sparse_artwork)
+        if "podcasts_supported" in self._field_sources:
+            overrides["supports_podcast"] = bool(self.podcasts_supported)
+        return replace(caps, **overrides) if overrides else caps
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -238,15 +355,11 @@ def read_sysinfo(ipod_path: str) -> dict:
     if not os.path.exists(sysinfo_path):
         raise FileNotFoundError(f"SysInfo not found at {sysinfo_path}")
 
-    sysinfo: dict[str, str] = {}
     with open(sysinfo_path, "r", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if ":" in line:
-                key, value = line.split(":", 1)
-                sysinfo[key.strip()] = value.strip()
+        content = f.read()
 
-    return sysinfo
+    from .sysinfo import parse_sysinfo_text
+    return parse_sysinfo_text(content)
 
 
 def _estimate_capacity_from_disk_size(disk_gb: float) -> str:
@@ -259,13 +372,253 @@ def _estimate_capacity_from_disk_size(disk_gb: float) -> str:
     thresholds = [
         (140, "160GB"), (100, "120GB"), (65, "80GB"),
         (50, "60GB"), (35, "40GB"), (25, "30GB"),
-        (17, "20GB"), (13, "16GB"), (6.5, "8GB"), (3, "4GB"),
-        (1.5, "2GB"), (0.7, "1GB"), (0.3, "512MB"),
+        (17, "20GB"), (14, "16GB"), (12, "15GB"),
+        (8.5, "10GB"), (6.5, "8GB"), (5.2, "6GB"),
+        (4.2, "5GB"), (3, "4GB"), (1.5, "2GB"),
+        (0.7, "1GB"), (0.3, "512MB"),
     ]
     for threshold, label in thresholds:
         if disk_gb >= threshold:
             return label
     return ""
+
+
+def _normalise_identity_text(value: str | None) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _normalise_identity_capacity(value: str | None) -> str:
+    return str(value or "").replace(" ", "").strip().casefold()
+
+
+def _matching_model_variants(
+    family: str,
+    generation: str,
+    *,
+    capacity: str = "",
+    color: str = "",
+) -> list[tuple[str, str, str, str]]:
+    """Return known model-table tuples matching the supplied identity pieces."""
+    if not family or not generation:
+        return []
+
+    family_norm = _normalise_identity_text(family)
+    generation_norm = _normalise_identity_text(generation)
+    capacity_norm = _normalise_identity_capacity(capacity)
+    color_norm = _normalise_identity_text(color)
+
+    from .models import IPOD_MODELS
+
+    matches: list[tuple[str, str, str, str]] = []
+    for model_info in IPOD_MODELS.values():
+        model_family, model_generation, model_capacity, model_color = model_info
+        if _normalise_identity_text(model_family) != family_norm:
+            continue
+        if _normalise_identity_text(model_generation) != generation_norm:
+            continue
+        if (
+            capacity_norm
+            and _normalise_identity_capacity(model_capacity) != capacity_norm
+        ):
+            continue
+        if color_norm and _normalise_identity_text(model_color) != color_norm:
+            continue
+        matches.append(model_info)
+    return matches
+
+
+def _clear_variant_field(info: DeviceInfo, field: str, reason: str) -> None:
+    old_value = getattr(info, field, "")
+    if not old_value:
+        return
+    logger.warning(
+        "enrich: dropping inconsistent %s=%r for %s %s (%s)",
+        field,
+        old_value,
+        info.model_family or "unknown family",
+        info.generation or "unknown generation",
+        reason,
+    )
+    setattr(info, field, "")
+    info._field_sources.pop(field, None)
+
+
+def _restore_usb_pid_identity_if_needed(info: DeviceInfo) -> None:
+    """Use the live USB PID as an anchor when only cached identity is present."""
+    if not info.usb_pid:
+        return
+
+    try:
+        from .models import USB_PID_TO_MODEL
+    except ImportError:
+        return
+
+    pid_info = USB_PID_TO_MODEL.get(info.usb_pid)
+    if not pid_info:
+        return
+
+    pid_family, pid_generation = pid_info
+    if info.model_number:
+        try:
+            from .lookup import get_model_info, usb_pid_identity_conflicts
+            model_info = get_model_info(info.model_number)
+        except Exception:
+            model_info = None
+        if model_info and not usb_pid_identity_conflicts(
+            model_info[0],
+            model_info[1],
+            pid_family,
+            pid_generation,
+        ):
+            return
+        if model_info:
+            logger.warning(
+                "enrich: clearing stale model_number %s (%s %s) because "
+                "live USB PID 0x%04X identifies %s %s",
+                info.model_number,
+                model_info[0],
+                model_info[1],
+                info.usb_pid,
+                pid_family,
+                pid_generation,
+            )
+            info.model_number = ""
+            info._field_sources.pop("model_number", None)
+
+    if pid_family and info.model_family:
+        if (
+            _normalise_identity_text(info.model_family)
+            != _normalise_identity_text(pid_family)
+        ):
+            logger.warning(
+                "enrich: cached family %r conflicts with live USB PID "
+                "0x%04X family %r; using live USB identity",
+                info.model_family,
+                info.usb_pid,
+                pid_family,
+            )
+            info.model_family = pid_family
+            info._field_sources["model_family"] = "usb_pid"
+
+    if pid_generation and info.generation:
+        if (
+            _normalise_identity_text(info.generation)
+            != _normalise_identity_text(pid_generation)
+        ):
+            source = info._field_sources.get("generation", "unknown")
+            if source in {
+                "usb_pid",
+                "sysinfo",
+                "sysinfo_extended",
+                "hashing",
+                "unknown",
+            }:
+                logger.warning(
+                    "enrich: cached generation %r conflicts with live USB "
+                    "PID 0x%04X generation %r; using live USB identity",
+                    info.generation,
+                    info.usb_pid,
+                    pid_generation,
+                )
+                info.generation = pid_generation
+                info._field_sources["generation"] = "usb_pid"
+
+
+def _sanitize_variant_fields(info: DeviceInfo) -> None:
+    """Drop impossible capacity/color pairings before they reach the UI/SysInfo.
+
+    Family/generation often come from live USB PID data, while capacity/color can
+    come from cached SysInfo fields written by a previous run.  If those pieces
+    do not exist together in the model table, prefer a partial, honest identity
+    over a stitched-together impossible one.
+    """
+    if not info.model_family or not info.generation:
+        return
+    if not info.capacity and not info.color:
+        return
+
+    _restore_usb_pid_identity_if_needed(info)
+
+    base_matches = _matching_model_variants(info.model_family, info.generation)
+    if not base_matches:
+        return
+
+    if _matching_model_variants(
+        info.model_family,
+        info.generation,
+        capacity=info.capacity,
+        color=info.color,
+    ):
+        return
+
+    capacity_valid = (
+        not info.capacity
+        or bool(_matching_model_variants(
+            info.model_family,
+            info.generation,
+            capacity=info.capacity,
+        ))
+    )
+    color_valid = (
+        not info.color
+        or bool(_matching_model_variants(
+            info.model_family,
+            info.generation,
+            color=info.color,
+        ))
+    )
+
+    if not capacity_valid:
+        _clear_variant_field(info, "capacity", "no matching model capacity")
+    if not color_valid:
+        _clear_variant_field(info, "color", "no matching model color")
+
+    if capacity_valid and color_valid and info.capacity and info.color:
+        try:
+            from .authority import SOURCE_RANK, _WORST_RANK
+            cap_rank = SOURCE_RANK.get(
+                info._field_sources.get("capacity", "unknown"),
+                _WORST_RANK,
+            )
+            color_rank = SOURCE_RANK.get(
+                info._field_sources.get("color", "unknown"),
+                _WORST_RANK,
+            )
+        except Exception:
+            cap_rank = color_rank = 0
+
+        if cap_rank < color_rank:
+            _clear_variant_field(info, "color", "capacity/color combo is invalid")
+        elif color_rank < cap_rank:
+            _clear_variant_field(info, "capacity", "capacity/color combo is invalid")
+        else:
+            _clear_variant_field(info, "capacity", "capacity/color combo is invalid")
+            _clear_variant_field(info, "color", "capacity/color combo is invalid")
+
+
+def _infer_color_from_variant_table(info: DeviceInfo) -> None:
+    """Fill color when all known variants for the identity share one color."""
+    if info.color or not info.model_family or not info.generation:
+        return
+
+    matches = _matching_model_variants(
+        info.model_family,
+        info.generation,
+        capacity=info.capacity,
+    )
+    colors = sorted({variant[3] for variant in matches if variant[3]})
+    if len(colors) != 1:
+        return
+
+    info.color = colors[0]
+    info._field_sources["color"] = "model_table"
+    logger.debug(
+        "enrich: inferred color %s from %s %s%s",
+        info.color,
+        info.model_family,
+        info.generation,
+        f" {info.capacity}" if info.capacity else "",
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -491,19 +844,26 @@ def enrich(info: DeviceInfo) -> None:
     After all identification, ``update_sysinfo()`` writes the gathered
     data back to SysInfo and updates the authority file + hashes.
     """
+    logger.debug(
+        "Device enrich start: mount=%s identity=[%s] sources=[%s]",
+        info.path or "unknown",
+        format_fields(info.__dict__, IDENTITY_FIELDS),
+        format_sources(info._field_sources, SOURCE_FIELDS),
+    )
 
     # ── 0. Load SysInfo dict (always — needed for reference) ──────────
     if info.path and not info.sysinfo:
         try:
             info.sysinfo = read_sysinfo(info.path)
-            logger.info("enrich: SysInfo loaded (%d keys)", len(info.sysinfo))
+            logger.debug("enrich: SysInfo loaded (%d keys)", len(info.sysinfo))
         except FileNotFoundError:
-            logger.info("enrich: no SysInfo at %s", info.path)
+            logger.debug("enrich: no SysInfo at %s", info.path)
         except Exception as exc:
-            logger.info("enrich: SysInfo read failed: %s", exc)
+            logger.debug("enrich: SysInfo read failed: %s", exc)
 
     # ── 1. Authority coverage check ───────────────────────────────────
     _authority_is_high = False
+    _run_background_live_validation = False
     if info.path:
         try:
             from .authority import check_authority_coverage
@@ -515,14 +875,22 @@ def enrich(info: DeviceInfo) -> None:
                 for _field, _source in _auth_sources.items():
                     if _field not in info._field_sources:
                         info._field_sources[_field] = _source
-                logger.info(
+                logger.debug(
                     "enrich: authority covers all core fields — "
-                    "trusting SysInfo, skipping hardware/VPD probes",
+                    "trusting SysInfo, skipping hardware/VPD probes; "
+                    "sources=[%s]",
+                    format_sources(_auth_sources, SOURCE_FIELDS),
                 )
             elif _auth_sources:
-                logger.info(
+                logger.debug(
                     "enrich: authority has untracked core fields — "
-                    "probing highest → lowest authority",
+                    "probing highest to lowest authority; sources=[%s]",
+                    format_sources(_auth_sources, SOURCE_FIELDS),
+                )
+            else:
+                logger.debug(
+                    "enrich: no authority coverage — probing highest to "
+                    "lowest authority",
                 )
         except Exception as exc:
             logger.debug("enrich: authority check failed: %s", exc)
@@ -532,6 +900,7 @@ def enrich(info: DeviceInfo) -> None:
         _populate_fields_from_sysinfo(info)
         if info.path:
             _enrich_from_sysinfo_extended(info)
+            _run_background_live_validation = True
     else:
         # ── LOW authority path: probe highest → lowest ────────────────
         #   Each source fills only gaps (if not info.X guards), so the
@@ -541,9 +910,10 @@ def enrich(info: DeviceInfo) -> None:
         # 2a. Hardware probe (IOCTL + device tree + USB PID)
         _enrich_from_hardware_probe(info)
 
-        # 2b. USB VPD query (highest authority — Apple serial + model)
-        #   Runs even if SysInfo exists, because low-authority SysInfo
-        #   values should be upgraded with VPD data when possible.
+        # 2b. Live VPD query (highest authority on supported non-Windows
+        #   platforms — Apple serial + model). Runs even if SysInfo exists,
+        #   because low-authority SysInfo values should be upgraded with
+        #   live data when possible.
         if info.path:
             _enrich_from_usb_vpd(info)
 
@@ -578,8 +948,8 @@ def enrich(info: DeviceInfo) -> None:
                 if not info.color:
                     info.color = mi[3]
                     info._field_sources.setdefault("color", _mn_source)
-                logger.info("enrich: model DB → %s %s %s %s",
-                            mi[0], mi[1], mi[2], mi[3])
+                logger.debug("enrich: model DB -> %s %s %s %s",
+                             mi[0], mi[1], mi[2], mi[3])
         except ImportError:
             pass
 
@@ -605,8 +975,10 @@ def enrich(info: DeviceInfo) -> None:
                 if not info.generation and pid_info[1]:
                     info.generation = pid_info[1]
                     info._field_sources.setdefault("generation", "usb_pid")
-                logger.debug("enrich: USB PID 0x%04X → %s %s",
-                             info.usb_pid, pid_info[0], pid_info[1])
+                logger.debug(
+                    "enrich: USB PID 0x%04X -> %s %s",
+                    info.usb_pid, pid_info[0], pid_info[1],
+                )
         except ImportError:
             pass
 
@@ -635,12 +1007,17 @@ def enrich(info: DeviceInfo) -> None:
                 if _gen:
                     info.generation = _gen
                     info._field_sources.setdefault("generation", "inferred")
-                    logger.info(
+                    logger.debug(
                         "enrich: inferred generation %s from %s + %s",
                         _gen, info.model_family, _cap,
                     )
             except ImportError:
                 pass
+
+    # Cached derived SysInfo fields are useful, but they must not be allowed
+    # to combine with live USB identity into an impossible model label.
+    _restore_usb_pid_identity_if_needed(info)
+    _sanitize_variant_fields(info)
 
     # ── 4. iTunesDB header (hashing scheme, version) ─────────────────
     if info.path and info.hashing_scheme == -1:
@@ -663,8 +1040,10 @@ def enrich(info: DeviceInfo) -> None:
                 if len(hi_data) >= 54 and hi_data[:6] == b"HASHv0":
                     info.hash_info_iv = hi_data[38:54]
                     info.hash_info_rndpart = hi_data[26:38]
-                    logger.debug("enrich: cached HashInfo (iv=%d, rndpart=%d)",
-                                 len(info.hash_info_iv), len(info.hash_info_rndpart))
+                    logger.debug(
+                        "enrich: cached HashInfo present (iv=%d, rndpart=%d)",
+                        len(info.hash_info_iv), len(info.hash_info_rndpart),
+                    )
         except Exception as exc:
             logger.debug("enrich: HashInfo read failed: %s", exc)
 
@@ -696,11 +1075,18 @@ def enrich(info: DeviceInfo) -> None:
     if not info.artwork_formats and info.model_family:
         try:
             from .artwork import ithmb_formats_for_device
-            table = ithmb_formats_for_device(info.model_family, info.generation)
+            table = ithmb_formats_for_device(
+                info.model_family,
+                info.generation,
+                capacity=info.capacity,
+                model_number=info.model_number,
+            )
             if table:
                 info.artwork_formats = dict(table)
-                logger.info("enrich: artwork formats from model: %s",
-                            list(info.artwork_formats.keys()))
+                logger.debug(
+                    "enrich: artwork formats from model: %s",
+                    list(info.artwork_formats.keys()),
+                )
         except ImportError:
             pass
 
@@ -715,8 +1101,10 @@ def enrich(info: DeviceInfo) -> None:
             total, _used, free = shutil.disk_usage(info.path)
             info.disk_size_gb = round(total / 1e9, 1)
             info.free_space_gb = round(free / 1e9, 1)
-            logger.debug("enrich: disk %.1f GB, free %.1f GB",
-                         info.disk_size_gb, info.free_space_gb)
+            logger.debug(
+                "enrich: disk %.1f GB, free %.1f GB",
+                info.disk_size_gb, info.free_space_gb,
+            )
         except Exception as exc:
             logger.debug("enrich: disk_usage failed: %s", exc)
 
@@ -724,7 +1112,12 @@ def enrich(info: DeviceInfo) -> None:
     if not info.capacity and info.disk_size_gb > 0:
         info.capacity = _estimate_capacity_from_disk_size(info.disk_size_gb)
         if info.capacity:
-            logger.info("enrich: capacity from disk size: %s", info.capacity)
+            info._field_sources["capacity"] = "disk_size"
+            logger.debug("enrich: capacity from disk size: %s", info.capacity)
+
+    _restore_usb_pid_identity_if_needed(info)
+    _sanitize_variant_fields(info)
+    _infer_color_from_variant_table(info)
 
     # ── 10. Backfill _field_sources for derived fields ───────────────────
     #   The scanner's _resolve_model may have set model_family/generation/
@@ -732,10 +1125,20 @@ def enrich(info: DeviceInfo) -> None:
     #   authority, ensure every populated field has a source entry.
     #   Derived fields inherit from the identification method that resolved
     #   them (model_number's source, or the identification_method itself).
-    _derived_fields = ("model_family", "generation", "capacity", "color", "usb_pid")
+    _derived_fields = (
+        "model_family",
+        "generation",
+        "capacity",
+        "color",
+        "usb_pid",
+    )
     _backfill_src = info._field_sources.get(
         "model_number",
-        info.identification_method if info.identification_method != "unknown" else "unknown",
+        (
+            info.identification_method
+            if info.identification_method != "unknown"
+            else "unknown"
+        ),
     )
     for _df in _derived_fields:
         if getattr(info, _df, None) and _df not in info._field_sources:
@@ -751,19 +1154,339 @@ def enrich(info: DeviceInfo) -> None:
         except Exception as exc:
             logger.warning("enrich: SysInfo authority update failed: %s", exc)
 
-    logger.info(
-        "DeviceInfo enriched: %s %s (%s), serial=%s, fwguid=%s, "
-        "checksum=%s, scheme=%s, method=%s, capacity=%s, "
-        "formats=%s, disk=%.1fGB",
-        info.model_family, info.generation, info.model_number,
-        info.serial[-3:] if info.serial else "none",
-        info.firewire_guid or "none",
-        info.checksum_type, info.hashing_scheme,
+    if _run_background_live_validation:
+        _start_live_identity_validation(info)
+
+    logger.debug(
+        "DeviceInfo enriched: mount=%s identity=[%s] caps=[%s] checksum=%s "
+        "hash_scheme=%s method=%s disk=%.1fGB free=%.1fGB sources=[%s]",
+        info.path or "unknown",
+        format_fields(info.__dict__, IDENTITY_FIELDS),
+        format_fields(info.__dict__, CAPABILITY_FIELDS, include_false=True),
+        info.checksum_type,
+        info.hashing_scheme,
         info.identification_method,
-        info.capacity or "unknown",
-        list(info.artwork_formats.keys()) if info.artwork_formats else "none",
         info.disk_size_gb,
+        info.free_space_gb,
+        format_sources(info._field_sources, SOURCE_FIELDS),
     )
+
+
+def _live_validation_key(info: DeviceInfo) -> str:
+    path = os.path.abspath(info.path) if info.path else ""
+    return "|".join([
+        path,
+        info.firewire_guid.upper(),
+        f"0x{info.usb_pid:04X}" if info.usb_pid else "",
+    ])
+
+
+def _cache_live_sysinfo_extended(
+    ipod_path: str,
+    vpd_raw: dict,
+    source: str,
+) -> None:
+    raw_xml = vpd_raw.get("vpd_raw_xml") if isinstance(vpd_raw, dict) else b""
+    if not raw_xml:
+        return
+
+    live_sources = {
+        "windows_scsi",
+        "scsi_vpd",
+        "iokit",
+        "usb_vendor",
+        "vpd",
+    }
+    if source not in live_sources:
+        return
+
+    try:
+        from .authority import cache_sysinfo_extended
+
+        metadata = {
+            key: vpd_raw.get(key)
+            for key in (
+                "_transport",
+                "usb_vid",
+                "usb_pid",
+                "usb_serial",
+                "vpd_serial",
+                "scsi_vendor",
+                "scsi_product",
+                "scsi_revision",
+                "block_device",
+            )
+            if vpd_raw.get(key) not in (None, "", b"")
+        }
+        cache_sysinfo_extended(
+            ipod_path,
+            raw_xml,
+            source=source,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.debug("enrich: live SysInfoExtended cache failed: %s", exc)
+
+
+def _sysinfo_extended_cache_metadata(ipod_path: str) -> dict[str, Any]:
+    try:
+        from .authority import read_authority
+
+        authority = read_authority(ipod_path)
+        file_entry = authority.get("files", {}).get("SysInfoExtended", {})
+        metadata = file_entry.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return {}
+        result = dict(metadata)
+        if file_entry.get("source"):
+            result["_source"] = file_entry["source"]
+        return result
+    except Exception:
+        return {}
+
+
+def _log_live_validation_differences(
+    cached: DeviceInfo,
+    live_result: dict,
+    live_source: str,
+) -> None:
+    checks = {
+        "serial": live_result.get("serial", ""),
+        "firewire_guid": live_result.get("firewire_guid", ""),
+        "model_number": live_result.get("model_number", ""),
+        "model_family": live_result.get("model_family", ""),
+        "generation": live_result.get("generation", ""),
+        "capacity": live_result.get("capacity", ""),
+        "color": live_result.get("color", ""),
+    }
+    mismatches = []
+    for field, live_value in checks.items():
+        cached_value = getattr(cached, field, "")
+        if (
+            cached_value
+            and live_value
+            and not _values_match(field, cached_value, live_value)
+        ):
+            mismatches.append(f"{field}: cached={cached_value!r}, live={live_value!r}")
+    if mismatches:
+        logger.warning(
+            "Live identity validation from %s disagreed with cache for %s: %s",
+            live_source,
+            cached.path,
+            "; ".join(mismatches),
+        )
+
+
+def _apply_live_result_to_cache(
+    path: str,
+    mount_name: str,
+    usb_pid: int,
+    usb_pid_source: str,
+    live_result: dict,
+    live_source: str,
+) -> None:
+    validated = DeviceInfo(path=path, mount_name=mount_name)
+    validated.usb_pid = usb_pid
+    if usb_pid:
+        validated._field_sources["usb_pid"] = usb_pid_source or "unknown"
+
+    for field in (
+        "serial",
+        "firewire_guid",
+        "firmware",
+        "model_number",
+        "model_family",
+        "generation",
+        "capacity",
+        "color",
+    ):
+        value = live_result.get(field, "")
+        if value:
+            setattr(validated, field, value)
+            validated._field_sources[field] = live_source
+
+    vpd_info = live_result.get("vpd_info") or {}
+    for vpd_key, field in (
+        ("FamilyID", "family_id"),
+        ("UpdaterFamilyID", "updater_family_id"),
+    ):
+        value = vpd_info.get(vpd_key)
+        if value not in (None, ""):
+            setattr(validated, field, value)
+            validated._field_sources[field] = live_source
+
+    try:
+        from .authority import update_sysinfo as _update_sysinfo
+
+        _update_sysinfo(validated)
+        logger.debug(
+            "live validation: refreshed SysInfo authority cache for %s "
+            "identity=[%s] sources=[%s]",
+            path,
+            format_fields(validated.__dict__, IDENTITY_FIELDS),
+            format_sources(validated._field_sources, SOURCE_FIELDS),
+        )
+    except Exception as exc:
+        logger.debug("live validation: SysInfo authority update failed: %s", exc)
+
+
+def _start_live_identity_validation(info: DeviceInfo) -> None:
+    """Validate high-authority cached identity with live SCSI in the background."""
+    if not info.path:
+        return
+    if sys.platform == "win32":
+        logger.debug(
+            "Live identity validation skipped on Windows: mount=%s",
+            info.path,
+        )
+        return
+
+    key = _live_validation_key(info)
+    with _LIVE_VALIDATION_LOCK:
+        if key in _LIVE_VALIDATION_INFLIGHT:
+            logger.debug(
+                "Live identity validation already running: mount=%s key=%s",
+                info.path,
+                key,
+            )
+            return
+        _LIVE_VALIDATION_INFLIGHT.add(key)
+
+    logger.debug(
+        "Live identity validation scheduled: mount=%s identity=[%s] sources=[%s]",
+        info.path,
+        format_fields(info.__dict__, IDENTITY_FIELDS),
+        format_sources(info._field_sources, SOURCE_FIELDS),
+    )
+
+    cached = DeviceInfo(
+        path=info.path,
+        mount_name=info.mount_name,
+        model_number=info.model_number,
+        model_family=info.model_family,
+        generation=info.generation,
+        capacity=info.capacity,
+        color=info.color,
+        firewire_guid=info.firewire_guid,
+        serial=info.serial,
+        firmware=info.firmware,
+        usb_pid=info.usb_pid,
+    )
+    cached._field_sources.update(info._field_sources)
+
+    def _run() -> None:
+        try:
+            from .vpd_libusb import identify_via_vpd
+
+            logger.debug(
+                "Live identity validation start: mount=%s pid=%s fwguid=%s",
+                cached.path,
+                f"0x{cached.usb_pid:04X}" if cached.usb_pid else "unknown",
+                cached.firewire_guid or "unknown",
+            )
+            result = identify_via_vpd(
+                mount_path=cached.path,
+                usb_pid=cached.usb_pid or 0,
+                firewire_guid=cached.firewire_guid or "",
+                write_sysinfo_to_device=False,
+            )
+            if not result:
+                logger.debug(
+                    "Live identity validation returned no VPD data: mount=%s",
+                    cached.path,
+                )
+                return
+
+            vpd_raw = result.get("vpd_info") or {}
+            live_source = str(vpd_raw.get("_source") or result.get("source") or "vpd")
+            logger.debug(
+                "Live identity validation result: mount=%s source=%s "
+                "identity=[%s] caps=[%s]",
+                cached.path,
+                live_source,
+                format_fields(result, IDENTITY_FIELDS),
+                format_fields(vpd_raw, CAPABILITY_FIELDS, include_false=True),
+            )
+            _log_live_validation_differences(cached, result, live_source)
+            _cache_live_sysinfo_extended(cached.path, vpd_raw, live_source)
+            for field in (
+                "serial",
+                "firewire_guid",
+                "firmware",
+                "model_number",
+                "model_family",
+                "generation",
+                "capacity",
+                "color",
+            ):
+                _set_field_from_source(
+                    info,
+                    field,
+                    result.get(field),
+                    live_source,
+                    label=f"{live_source} validation",
+                )
+            try:
+                from .sysinfo import (
+                    ParsedSysInfoExtended,
+                    identity_from_sysinfo_extended,
+                    parse_sysinfo_extended,
+                )
+
+                parsed = (
+                    parse_sysinfo_extended(
+                        vpd_raw["vpd_raw_xml"],
+                        source=live_source,
+                        live=True,
+                    )
+                    if vpd_raw.get("vpd_raw_xml")
+                    else ParsedSysInfoExtended(
+                        plist=vpd_raw,
+                        source=live_source,
+                        live=True,
+                    )
+                )
+                identity = identity_from_sysinfo_extended(
+                    parsed,
+                    live_source,
+                    live=True,
+                )
+                identity_sources = identity.setdefault("_sources", {})
+                for field in (
+                    "usb_pid",
+                    "usb_vid",
+                    "usb_serial",
+                    "scsi_vendor",
+                    "scsi_product",
+                    "scsi_revision",
+                ):
+                    value = vpd_raw.get(field)
+                    if value not in (None, "", b""):
+                        identity[field] = value
+                        identity_sources[field] = live_source
+                _apply_sysinfo_extended_identity(info, identity, live_source)
+            except Exception as exc:
+                logger.debug("live validation: applying rich fields failed: %s", exc)
+            _apply_live_result_to_cache(
+                cached.path,
+                cached.mount_name,
+                cached.usb_pid,
+                cached._field_sources.get("usb_pid", ""),
+                result,
+                live_source,
+            )
+        except Exception as exc:
+            logger.debug("Live identity validation failed for %s: %s", cached.path, exc)
+        finally:
+            with _LIVE_VALIDATION_LOCK:
+                _LIVE_VALIDATION_INFLIGHT.discard(key)
+            logger.debug("Live identity validation finished: mount=%s", cached.path)
+
+    threading.Thread(
+        target=_run,
+        name=f"iPodLiveValidation-{os.path.basename(info.path.rstrip(os.sep))}",
+        daemon=True,
+    ).start()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -798,7 +1521,7 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
         if apple_serial and apple_serial != info.firewire_guid:
             info.serial = apple_serial
             info._field_sources.setdefault("serial", "sysinfo")
-            logger.info("enrich: serial (Apple) from SysInfo: %s", apple_serial)
+            logger.debug("enrich: serial (Apple) from SysInfo: %s", apple_serial)
         elif apple_serial and apple_serial == info.firewire_guid:
             logger.warning(
                 "enrich: SysInfo pszSerialNumber equals FW GUID (%s) "
@@ -811,7 +1534,7 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
         if fw_ver:
             info.firmware = fw_ver
             info._field_sources.setdefault("firmware", "sysinfo")
-            logger.info("enrich: firmware from SysInfo: %s", fw_ver)
+            logger.debug("enrich: firmware from SysInfo: %s", fw_ver)
 
     if not info.firewire_guid:
         guid = info.sysinfo.get("FirewireGuid", "")
@@ -821,7 +1544,7 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
             if guid and guid != "0" * len(guid):
                 info.firewire_guid = guid
                 info._field_sources.setdefault("firewire_guid", "sysinfo")
-                logger.info("enrich: FW GUID from SysInfo: %s", guid)
+                logger.debug("enrich: FW GUID from SysInfo: %s", guid)
 
     if not info.model_number:
         try:
@@ -832,7 +1555,7 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
                 if mn:
                     info.model_number = mn
                     info._field_sources.setdefault("model_number", "sysinfo")
-                    logger.info("enrich: model from SysInfo: %s", mn)
+                    logger.debug("enrich: model from SysInfo: %s", mn)
         except ImportError:
             pass
 
@@ -842,30 +1565,40 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
     # a more specific value.
     _mf = info.sysinfo.get("ModelFamily", "")
     if _mf and _mf != "iPod" and info.model_family in ("iPod", ""):
-        info.model_family = _mf
-        info._field_sources.setdefault("model_family", "sysinfo")
-        logger.info("enrich: model_family from SysInfo: %s", _mf)
+        current_source = info._field_sources.get("model_family", "unknown")
+        if current_source == "usb_pid" and info.generation:
+            logger.warning(
+                "enrich: ignoring cached SysInfo ModelFamily %r because "
+                "live USB PID already identified %s %s",
+                _mf,
+                info.model_family,
+                info.generation,
+            )
+        else:
+            info.model_family = _mf
+            info._field_sources.setdefault("model_family", "sysinfo")
+            logger.debug("enrich: model_family from SysInfo: %s", _mf)
 
     if not info.generation:
         _gen = info.sysinfo.get("Generation", "")
         if _gen:
             info.generation = _gen
             info._field_sources.setdefault("generation", "sysinfo")
-            logger.info("enrich: generation from SysInfo: %s", _gen)
+            logger.debug("enrich: generation from SysInfo: %s", _gen)
 
     if not info.capacity:
         _cap = info.sysinfo.get("Capacity", "")
         if _cap:
             info.capacity = _cap
             info._field_sources.setdefault("capacity", "sysinfo")
-            logger.info("enrich: capacity from SysInfo: %s", _cap)
+            logger.debug("enrich: capacity from SysInfo: %s", _cap)
 
     if not info.color:
         _col = info.sysinfo.get("Color", "")
         if _col:
             info.color = _col
             info._field_sources.setdefault("color", "sysinfo")
-            logger.info("enrich: color from SysInfo: %s", _col)
+            logger.debug("enrich: color from SysInfo: %s", _col)
 
     if not info.usb_pid:
         _pid_str = info.sysinfo.get("USBProductID", "")
@@ -873,96 +1606,75 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
             try:
                 info.usb_pid = int(_pid_str, 0)  # handles "0x1261" and "4705"
                 info._field_sources.setdefault("usb_pid", "sysinfo")
-                logger.info("enrich: usb_pid from SysInfo: 0x%04X", info.usb_pid)
+                logger.debug("enrich: usb_pid from SysInfo: 0x%04X", info.usb_pid)
             except ValueError:
                 pass
 
+    try:
+        from .sysinfo import identity_from_sysinfo
+
+        identity = identity_from_sysinfo(info.sysinfo, "sysinfo")
+        for field in ("family_id", "updater_family_id"):
+            if field in identity:
+                _set_field_from_source(
+                    info,
+                    field,
+                    identity[field],
+                    identity.get("_sources", {}).get(field, "sysinfo"),
+                    label="SysInfo",
+                )
+    except Exception:
+        pass
+
 
 def _enrich_from_sysinfo_extended(info: DeviceInfo) -> None:
-    """Read SysInfoExtended XML plist for FireWireGUID and model info."""
+    """Read SysInfoExtended XML plist for identity and artwork capabilities."""
     sysinfo_ex_path = os.path.join(
         info.path, "iPod_Control", "Device", "SysInfoExtended",
     )
     if not os.path.exists(sysinfo_ex_path):
+        logger.debug("enrich: SysInfoExtended not present at %s", sysinfo_ex_path)
         return
 
     try:
-        with open(sysinfo_ex_path, "r", errors="ignore") as f:
+        with open(sysinfo_ex_path, "rb") as f:
             content = f.read()
     except Exception as exc:
-        logger.info("enrich: SysInfoExtended read failed: %s", exc)
+        logger.debug("enrich: SysInfoExtended read failed: %s", exc)
         return
 
-    import re as _re
+    try:
+        from .sysinfo import parse_sysinfo_extended
 
-    # FireWireGUID
-    if not info.firewire_guid:
-        m = _re.search(
-            r"<key>FireWireGUID</key>\s*<string>([0-9A-Fa-f]+)</string>",
-            content,
+        parsed = parse_sysinfo_extended(content, source="sysinfo_extended")
+        identity = parsed.identity
+        metadata = _sysinfo_extended_cache_metadata(info.path)
+        if metadata:
+            sources = identity.setdefault("_sources", {})
+            for field, key in (
+                ("usb_vid", "usb_vid"),
+                ("usb_pid", "usb_pid"),
+                ("usb_serial", "usb_serial"),
+                ("scsi_vendor", "scsi_vendor"),
+                ("scsi_product", "scsi_product"),
+                ("scsi_revision", "scsi_revision"),
+            ):
+                value = metadata.get(key)
+                if value not in (None, "", b""):
+                    identity[field] = value
+                    sources[field] = metadata.get("_source", "sysinfo_extended")
+        logger.debug(
+            "enrich: SysInfoExtended parsed bytes=%d keys=%d regex_fallback=%s "
+            "identity=[%s] caps=[%s]",
+            len(content),
+            len(parsed.plist),
+            parsed.used_regex_fallback,
+            format_fields(identity, IDENTITY_FIELDS),
+            format_fields(identity, CAPABILITY_FIELDS, include_false=True),
         )
-        if m:
-            guid_hex = m.group(1)
-            if guid_hex.startswith(("0x", "0X")):
-                guid_hex = guid_hex[2:]
-            if guid_hex and guid_hex != "0" * len(guid_hex):
-                info.firewire_guid = guid_hex
-                info._field_sources["firewire_guid"] = "sysinfo_extended"
-                logger.info("enrich: FW GUID from SysInfoExtended: %s", guid_hex)
-
-    # Serial number
-    if not info.serial:
-        m = _re.search(
-            r"<key>SerialNumber</key>\s*<string>([^<]+)</string>",
-            content,
-        )
-        if m:
-            info.serial = m.group(1).strip()
-            info._field_sources["serial"] = "sysinfo_extended"
-            logger.info("enrich: serial from SysInfoExtended: %s", info.serial)
-
-    # Model number (ProductType or ModelNumStr)
-    if not info.model_number:
-        m = _re.search(
-            r"<key>ModelNumStr</key>\s*<string>([^<]+)</string>",
-            content,
-        )
-        if m:
-            try:
-                from .lookup import extract_model_number
-                mn = extract_model_number(m.group(1).strip())
-                if mn:
-                    info.model_number = mn
-                    info._field_sources["model_number"] = "sysinfo_extended"
-                    logger.info("enrich: model from SysInfoExtended: %s", mn)
-            except ImportError:
-                pass
-
-    # Board hardware name
-    if not info.board:
-        m = _re.search(
-            r"<key>BoardHwName</key>\s*<string>([^<]+)</string>",
-            content,
-        )
-        if m:
-            info.board = m.group(1).strip()
-            info._field_sources["board"] = "sysinfo_extended"
-            logger.info("enrich: board from SysInfoExtended: %s", info.board)
-
-    # ── Artwork formats from SysInfoExtended (Nano 6G/7G) ─────────
-    # Newer iPods (especially Nano 6G+) define their artwork formats in the
-    # SysInfoExtended XML plist rather than relying on hardcoded tables.
-    # libgpod's itdb_sysinfo.c parses these for cover-art format discovery.
-    if not info.artwork_formats:
-        try:
-            artwork_fmts = _parse_sysinfo_artwork_formats(content)
-            if artwork_fmts:
-                info.artwork_formats = artwork_fmts
-                info._field_sources["artwork_formats"] = "sysinfo_extended"
-                logger.info("enrich: artwork formats from SysInfoExtended: %s",
-                            list(artwork_fmts.keys()))
-        except Exception as exc:
-            logger.debug("enrich: SysInfoExtended artwork parse failed: %s", exc)
+        _apply_sysinfo_extended_identity(info, identity, "SysInfoExtended")
+    except Exception as exc:
+        logger.debug("enrich: SysInfoExtended parse failed: %s", exc)
 
 
 def _parse_sysinfo_artwork_formats(content: str) -> dict[int, tuple[int, int]]:
@@ -978,51 +1690,75 @@ def _parse_sysinfo_artwork_formats(content: str) -> dict[int, tuple[int, int]]:
         ``{correlation_id: (width, height)}`` — same format as
         ``ithmb_formats_for_device()``.  Empty dict if nothing found.
     """
-    import plistlib
-
-    # SysInfoExtended is an XML plist.  Parse it properly.
     try:
-        plist = plistlib.loads(content.encode("utf-8"))
+        from .sysinfo import parse_sysinfo_extended
+
+        return parse_sysinfo_extended(content).cover_art_formats
     except Exception:
         return {}
 
-    if not isinstance(plist, dict):
-        return {}
 
-    # Look for artwork format arrays under various known keys.
-    # libgpod checks: AlbumArt, ArtworkFormats, CoverArt
-    artwork_entries: list[dict] = []
-    for key in ("AlbumArt", "AlbumArt2", "ArtworkFormats", "CoverArt",
-                "ArtworkCoverArtFormats"):
-        val = plist.get(key)
-        if isinstance(val, list):
-            artwork_entries.extend(val)
+def _apply_sysinfo_extended_identity(
+    info: DeviceInfo,
+    identity: dict,
+    label: str,
+) -> None:
+    """Merge parsed SysInfoExtended identity/capability fields into DeviceInfo."""
+    if not identity:
+        return
 
-    if not artwork_entries:
-        return {}
+    sources = identity.get("_sources", {})
 
-    formats: dict[int, tuple[int, int]] = {}
-    for entry in artwork_entries:
-        if not isinstance(entry, dict):
+    fields = (
+        "firewire_guid",
+        "serial",
+        "model_number",
+        "model_family",
+        "generation",
+        "capacity",
+        "color",
+        "firmware",
+        "board",
+        "family_id",
+        "updater_family_id",
+        "product_type",
+        "usb_pid",
+        "usb_vid",
+        "usb_serial",
+        "usbstor_instance_id",
+        "usb_parent_instance_id",
+        "usb_grandparent_instance_id",
+        "scsi_vendor",
+        "scsi_product",
+        "scsi_revision",
+        "connected_bus",
+        "volume_format",
+        "db_version",
+        "shadow_db_version",
+        "uses_sqlite_db",
+        "supports_sparse_artwork",
+        "max_tracks",
+        "max_file_size_gb",
+        "max_transfer_speed",
+        "podcasts_supported",
+        "voice_memos_supported",
+        "audio_codecs",
+        "power_information",
+        "apple_drm_version",
+        "artwork_formats",
+        "photo_formats",
+        "chapter_image_formats",
+    )
+    for field in fields:
+        if field not in identity:
             continue
-
-        # FormatId / CorrelationID
-        fmt_id = entry.get("FormatId") or entry.get("CorrelationID")
-        if fmt_id is None:
-            continue
-        fmt_id = int(fmt_id)
-
-        # RenderWidth / Width, RenderHeight / Height
-        w = entry.get("RenderWidth") or entry.get("Width")
-        h = entry.get("RenderHeight") or entry.get("Height")
-        if w is None or h is None:
-            continue
-        w, h = int(w), int(h)
-
-        if fmt_id > 0 and w > 0 and h > 0:
-            formats[fmt_id] = (w, h)
-
-    return formats
+        _set_field_from_source(
+            info,
+            field,
+            identity[field],
+            sources.get(field, "sysinfo_extended"),
+            label=label,
+        )
 
 
 def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
@@ -1069,6 +1805,10 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
                     hw = None
 
             if not hw:
+                logger.debug(
+                    "enrich: hardware probe returned no data for mount=%s",
+                    info.path,
+                )
                 return
 
         elif _sys.platform == "darwin":
@@ -1076,6 +1816,10 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
             hw = _probe_hardware_macos(info.path)
             _hw_method = "ioreg"
             if not hw:
+                logger.debug(
+                    "enrich: hardware probe returned no data for mount=%s",
+                    info.path,
+                )
                 return
 
         else:  # Linux
@@ -1083,11 +1827,21 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
             hw = _probe_hardware_linux(info.path)
             _hw_method = "sysfs"
             if not hw:
+                logger.debug(
+                    "enrich: hardware probe returned no data for mount=%s",
+                    info.path,
+                )
                 return
 
     except (ImportError, Exception) as exc:
-        logger.debug("enrich: hardware probe failed: %s", exc)
+        logger.debug("enrich: hardware probe failed for %s: %s", info.path, exc)
         return
+
+    logger.debug(
+        "enrich: hardware probe result method=%s identity=[%s]",
+        _hw_method or "unknown",
+        format_fields(hw, IDENTITY_FIELDS),
+    )
 
     # On Windows, FW GUID comes from the device tree walk specifically
     _fw_source = "device_tree" if _hw_method in ("ioctl", "wmi") else _hw_method
@@ -1098,25 +1852,43 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
         if guid_hex != "0" * len(guid_hex):
             info.firewire_guid = guid_hex
             info._field_sources["firewire_guid"] = _fw_source
-            logger.info("enrich: FW GUID from hardware: %s", guid_hex)
+            logger.debug("enrich: FW GUID from hardware: %s", guid_hex)
 
     if not info.serial and hw.get("serial"):
         info.serial = hw["serial"]
         info._field_sources["serial"] = _hw_method
-        logger.info("enrich: serial from hardware: %s", info.serial)
+        logger.debug("enrich: serial from hardware: %s", info.serial)
 
     if not info.firmware and hw.get("firmware"):
         info.firmware = hw["firmware"]
         info._field_sources["firmware"] = _hw_method
-        logger.info("enrich: firmware from hardware: %s", info.firmware)
+        logger.debug("enrich: firmware from hardware: %s", info.firmware)
 
     if not info.usb_pid and hw.get("usb_pid"):
         info.usb_pid = hw["usb_pid"]
-        logger.info("enrich: USB PID from hardware: 0x%04X", info.usb_pid)
+        info._field_sources["usb_pid"] = _fw_source
+        logger.debug("enrich: USB PID from hardware: 0x%04X", info.usb_pid)
 
     if not info.model_number and hw.get("model_number"):
         info.model_number = hw["model_number"]
-        logger.info("enrich: model_number from hardware: %s", info.model_number)
+        info._field_sources["model_number"] = _hw_method
+        logger.debug("enrich: model_number from hardware: %s", info.model_number)
+
+    for field, value, source in (
+        ("usb_vid", hw.get("usb_vid"), _fw_source),
+        ("usb_serial", hw.get("usb_serial"), _fw_source),
+        ("usbstor_instance_id", hw.get("usbstor_instance_id"), _fw_source),
+        ("usb_parent_instance_id", hw.get("usb_parent_instance_id"), _fw_source),
+        (
+            "usb_grandparent_instance_id",
+            hw.get("usb_grandparent_instance_id"),
+            _fw_source,
+        ),
+        ("scsi_vendor", hw.get("scsi_vendor") or hw.get("vendor"), _hw_method),
+        ("scsi_product", hw.get("scsi_product") or hw.get("product"), _hw_method),
+        ("scsi_revision", hw.get("scsi_revision") or hw.get("firmware"), _hw_method),
+    ):
+        _set_field_from_source(info, field, value, source, label="hardware")
 
     if info.identification_method == "unknown":
         info.identification_method = "hardware"
@@ -1125,20 +1897,32 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
 def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
     """Query iPod firmware via USB SCSI VPD pages for device identification.
 
-    Delegates to :func:`ipod_device.vpd_libusb.identify_via_vpd` which handles all
-    platforms (IOKit on macOS, pyusb on Linux/Windows), resolves the exact
-    model via serial-last-3 lookup, and handles post-query remount on
-    Linux/macOS.
+    Delegates to :func:`ipod_device.vpd_libusb.identify_via_vpd` on supported
+    non-Windows platforms, resolves the exact model via serial-last-3 lookup,
+    and handles post-query remount on Linux/macOS.
 
     SysInfo writing is NOT done here — the authority module handles it
     after all identification is complete.
     """
+    if sys.platform == "win32":
+        logger.debug(
+            "enrich: live VPD skipped on Windows for mount=%s",
+            info.path,
+        )
+        return
+
     try:
         from .vpd_libusb import identify_via_vpd
     except ImportError:
         logger.debug("enrich: ipod_device.vpd_libusb not available")
         return
 
+    logger.debug(
+        "enrich: live VPD query start mount=%s pid=%s fwguid=%s",
+        info.path,
+        f"0x{info.usb_pid:04X}" if info.usb_pid else "unknown",
+        info.firewire_guid or "unknown",
+    )
     result = identify_via_vpd(
         mount_path=info.path,
         usb_pid=info.usb_pid or 0,
@@ -1146,39 +1930,109 @@ def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
         write_sysinfo_to_device=False,
     )
     if result is None:
+        logger.debug("enrich: live VPD query returned no data for %s", info.path)
         return
 
+    vpd_raw = result.get("vpd_info") or {}
+    vpd_source = str(vpd_raw.get("_source") or result.get("source") or "vpd")
+    logger.debug(
+        "enrich: live VPD query result source=%s identity=[%s] caps=[%s]",
+        vpd_source,
+        format_fields(result, IDENTITY_FIELDS),
+        format_fields(vpd_raw, CAPABILITY_FIELDS, include_false=True),
+    )
+    _cache_live_sysinfo_extended(info.path, vpd_raw, vpd_source)
+
     # Apply VPD-derived fields to DeviceInfo
-    if not info.serial and result["serial"]:
-        info.serial = result["serial"]
-        info._field_sources["serial"] = "vpd"
-    if not info.firewire_guid and result["firewire_guid"]:
-        info.firewire_guid = result["firewire_guid"]
-        info._field_sources["firewire_guid"] = "vpd"
-    if result["firmware"]:
-        info.firmware = result["firmware"]
-        info._field_sources["firmware"] = "vpd"
+    _set_field_from_source(
+        info,
+        "serial",
+        result["serial"],
+        vpd_source,
+        label=vpd_source,
+    )
+    _set_field_from_source(
+        info,
+        "firewire_guid",
+        result["firewire_guid"],
+        vpd_source,
+        label=vpd_source,
+    )
+    _set_field_from_source(
+        info,
+        "firmware",
+        result["firmware"],
+        vpd_source,
+        label=vpd_source,
+    )
     if result["model_number"]:
         info.model_number = result["model_number"]
         info.model_family = result["model_family"]
         info.generation = result["generation"]
-        info._field_sources["model_number"] = "vpd"
+        info._field_sources["model_number"] = vpd_source
+        info._field_sources["model_family"] = vpd_source
+        info._field_sources["generation"] = vpd_source
         # VPD serial-last-3 is authoritative — always overwrite capacity
         # and color even if they were pre-populated from a stale/wrong
         # SysInfo model number (e.g. MB029 → 80GB when device is MB565 → 120GB).
         if result["capacity"]:
             info.capacity = result["capacity"]
-            info._field_sources["capacity"] = "vpd"
+            info._field_sources["capacity"] = vpd_source
         if result["color"]:
             info.color = result["color"]
-            info._field_sources["color"] = "vpd"
+            info._field_sources["color"] = vpd_source
 
     # Extract board from VPD raw data (previously obtained via SysInfo re-read)
-    vpd_raw = result.get("vpd_info") or {}
-    if not info.board and vpd_raw.get("BoardHwName"):
-        info.board = vpd_raw["BoardHwName"]
-        info._field_sources["board"] = "vpd"
-        logger.info("enrich: board from VPD: %s", info.board)
+    _set_field_from_source(
+        info,
+        "board",
+        vpd_raw.get("BoardHwName"),
+        vpd_source,
+        label=vpd_source,
+    )
+
+    try:
+        from .sysinfo import (
+            ParsedSysInfoExtended,
+            identity_from_sysinfo_extended,
+            parse_sysinfo_extended,
+        )
+
+        parsed: ParsedSysInfoExtended | None = None
+        if vpd_raw.get("vpd_raw_xml"):
+            parsed = parse_sysinfo_extended(
+                vpd_raw["vpd_raw_xml"],
+                source=vpd_source,
+                live=True,
+            )
+        elif isinstance(vpd_raw, dict):
+            parsed = ParsedSysInfoExtended(
+                plist=vpd_raw,
+                source=vpd_source,
+                live=True,
+            )
+        if parsed:
+            identity = identity_from_sysinfo_extended(
+                parsed,
+                vpd_source,
+                live=True,
+            )
+            identity_sources = identity.setdefault("_sources", {})
+            for field in (
+                "usb_pid",
+                "usb_vid",
+                "usb_serial",
+                "scsi_vendor",
+                "scsi_product",
+                "scsi_revision",
+            ):
+                value = vpd_raw.get(field)
+                if value not in (None, "", b""):
+                    identity[field] = value
+                    identity_sources[field] = vpd_source
+            _apply_sysinfo_extended_identity(info, identity, vpd_source)
+    except Exception as exc:
+        logger.debug("enrich: VPD artwork/capability parse failed: %s", exc)
 
     # Update mount path if pyusb caused a remount to a different location
     if result["mount_path"] and result["mount_path"] != info.path:
@@ -1280,9 +2134,11 @@ def _enrich_from_serial_lookup(info: DeviceInfo) -> None:
 
     if info.identification_method in ("unknown", "hardware"):
         info.identification_method = "serial"
-    logger.debug("enrich: serial-last-3 '%s' → %s %s %s %s (source: %s)",
-                 info.serial[-3:], model_info[0], model_info[1],
-                 model_info[2], model_info[3], _src)
+    logger.debug(
+        "enrich: serial-last-3 '%s' -> %s %s %s %s model=%s source=%s",
+        info.serial[-3:], model_info[0], model_info[1],
+        model_info[2], model_info[3], model_num, _src,
+    )
 
 
 def _enrich_from_windows_registry(info: DeviceInfo) -> None:
@@ -1416,7 +2272,7 @@ def _enrich_from_itunesdb_header(info: DeviceInfo) -> None:
         hash72_present = hdr[0x72:0x74] == bytes([0x01, 0x00])  # sig marker
 
         logger.debug(
-            "enrich: iTunesDB hdr — scheme=%d, hash58=%s, hash72=%s",
+            "enrich: iTunesDB hdr: scheme=%d, hash58=%s, hash72=%s",
             info.hashing_scheme, hash58_present, hash72_present,
         )
     except Exception as exc:
@@ -1479,8 +2335,10 @@ def _resolve_checksum_type(info: DeviceInfo) -> None:
             version = int(info.firmware.split(".")[0])
             if version >= 2:
                 info.checksum_type = int(ChecksumType.UNKNOWN)
-                logger.debug("enrich: checksum UNKNOWN (firmware %s ≥ 2.x)",
-                             info.firmware)
+                logger.debug(
+                    "enrich: checksum UNKNOWN (firmware %s >= 2.x)",
+                    info.firmware,
+                )
                 return
         except (ValueError, IndexError):
             pass
@@ -1493,7 +2351,7 @@ def _resolve_checksum_type(info: DeviceInfo) -> None:
 
     # Priority 6: default
     info.checksum_type = int(ChecksumType.NONE)
-    logger.debug("enrich: checksum NONE (default — pre-2007 or unidentifiable)")
+    logger.debug("enrich: checksum NONE (default; pre-2007 or unidentifiable)")
 
 
 def _enrich_artwork_from_artworkdb(info: DeviceInfo) -> None:
@@ -1527,8 +2385,10 @@ def _enrich_artwork_from_artworkdb(info: DeviceInfo) -> None:
                     fmts[fid] = ALL_KNOWN_FORMATS[fid]
             if fmts:
                 info.artwork_formats = fmts
-                logger.debug("enrich: artwork formats from ArtworkDB scan: %s",
-                             list(fmts.keys()))
+                logger.debug(
+                    "enrich: artwork formats from ArtworkDB scan: %s",
+                    list(fmts.keys()),
+                )
     except Exception as exc:
         logger.debug("enrich: ArtworkDB scan failed: %s", exc)
 

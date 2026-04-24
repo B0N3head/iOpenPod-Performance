@@ -103,7 +103,7 @@ def get_version_name(version_hex: int | str) -> str:
         return version_map[version_hex]
 
     # If not exact match, find closest lower version
-    lower_versions = [v for v in version_map.keys() if v <= version_hex]
+    lower_versions = [v for v in version_map if v <= version_hex]
     if lower_versions:
         closest = max(lower_versions)
         return f"{version_map[closest]} (or newer)"
@@ -283,7 +283,7 @@ EXPLICIT_FLAG_MAP = {
 
 # ============================================================
 # MHOD Type Integer Constants
-# Previously duplicated in mhod_writer.py; now shared.
+# Shared by MHOD parser/writer modules.
 # ============================================================
 MHOD_TYPE_TITLE = 1
 MHOD_TYPE_LOCATION = 2
@@ -332,7 +332,7 @@ MHOD_TYPE_ARTIST_NAME = 300
 
 # ============================================================
 # File Type Codes (big-endian ASCII stored as LE u32)
-# Previously only in mhit_writer.py; now shared.
+# Shared by track and locations writers.
 # ============================================================
 FILETYPE_CODES: dict[str, int] = {
     'mp3': 0x4D503320,  # "MP3 "
@@ -350,7 +350,7 @@ FILETYPE_CODES: dict[str, int] = {
 
 # ============================================================
 # Media Type Integer Constants (from libgpod Itdb_Mediatype)
-# Previously duplicated in mhit_writer.py; now shared.
+# Shared by track conversion and writer code.
 # ============================================================
 MEDIA_TYPE_AUDIO = 0x01
 MEDIA_TYPE_VIDEO = 0x02
