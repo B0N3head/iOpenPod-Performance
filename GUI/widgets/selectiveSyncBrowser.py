@@ -18,8 +18,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -34,6 +32,7 @@ from ..styles import (
     Colors,
     FONT_FAMILY,
     Metrics,
+    back_btn_css,
     btn_css,
     make_scroll_area,
     sidebar_nav_css,
@@ -44,7 +43,7 @@ from .MBGridViewItem import MusicBrowserGridItem
 from .browserChrome import style_browser_splitter
 from .formatters import format_duration_human, format_size
 from .gridHeaderBar import GridHeaderBar
-from .photoTile import PhotoGridTile
+from .photoBrowser import PhotoGridView
 from .photoViewer import PhotoViewerPane
 
 from ArtworkDB_Writer.art_extractor import (
@@ -414,9 +413,10 @@ class PCTrackListView(QWidget):
         top_lay.setContentsMargins(12, 8, 12, 0)
         top_lay.setSpacing(0)
 
-        self._back_btn = QPushButton("\u2190 Back")
-        self._back_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._back_btn = QPushButton("\u2190")
+        self._back_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
         self._back_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._back_btn.setToolTip("Back")
         self._back_btn.clicked.connect(self.back_requested.emit)
         top_lay.addWidget(self._back_btn)
         top_lay.addStretch()
@@ -543,16 +543,7 @@ class PCTrackListView(QWidget):
             padding="5px 12px",
             radius=Metrics.BORDER_RADIUS_SM,
         )
-        _back_css = btn_css(
-            bg=glass_bg,
-            bg_hover=glass_hover,
-            bg_press=glass_press,
-            fg=Colors.TEXT_PRIMARY,
-            border=f"1px solid {glass_border}",
-            padding="4px 10px",
-            radius=Metrics.BORDER_RADIUS_SM,
-        )
-        self._back_btn.setStyleSheet(_back_css)
+        self._back_btn.setStyleSheet(back_btn_css())
         self._sel_btn.setStyleSheet(_overlay_css)
         self._desel_btn.setStyleSheet(_overlay_css)
 
@@ -577,8 +568,7 @@ class PCTrackListView(QWidget):
         self._subtitle_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent;")
         self._meta_label.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
         _default_btn = btn_css(padding="5px 12px", radius=Metrics.BORDER_RADIUS_SM)
-        _default_back = btn_css(padding="4px 10px", radius=Metrics.BORDER_RADIUS_SM)
-        self._back_btn.setStyleSheet(_default_back)
+        self._back_btn.setStyleSheet(back_btn_css())
         self._sel_btn.setStyleSheet(_default_btn)
         self._desel_btn.setStyleSheet(_default_btn)
 
@@ -756,7 +746,7 @@ class PCPhotoListView(QWidget):
         super().__init__(parent)
         self._photos: list[PCPhoto] = []
         self._selection: dict[str, bool] = {}
-        self._photo_lookup: dict[str, PCPhoto] = {}
+        self._visible_photos: list[PCPhoto] = []
         self._search_query = ""
         self._sort_key = "title"
         self._sort_reverse = False
@@ -779,37 +769,13 @@ class PCPhotoListView(QWidget):
         self._grid_header.search_changed.connect(self._on_search_changed)
         list_lay.addWidget(self._grid_header)
 
-        self._list = QListWidget()
-        self._list.setFrameShape(QFrame.Shape.NoFrame)
-        self._list.setViewMode(QListWidget.ViewMode.IconMode)
-        self._list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self._list.setMovement(QListWidget.Movement.Static)
-        self._list.setSpacing(14)
-        self._list.setIconSize(QSize(132, 132))
-        self._list.setGridSize(QSize(196, 232))
-        self._list.setWordWrap(True)
-        self._list.setSelectionRectVisible(False)
-        self._list.setStyleSheet(f"""
-            QListWidget {{
-                background: transparent;
-                border: none;
-                color: {Colors.TEXT_PRIMARY};
-                padding: 0px;
-            }}
-            QListWidget::item {{
-                padding: 0px;
-                margin: 0px;
-                border: none;
-                background: transparent;
-            }}
-            QListWidget::item:selected {{
-                background: transparent;
-                border: none;
-            }}
-        """)
-        self._list.currentRowChanged.connect(self._on_current_photo_changed)
-        self._list.itemSelectionChanged.connect(self._sync_tile_states)
-        list_lay.addWidget(self._list, 1)
+        self._photo_scroll = make_scroll_area()
+        self._photo_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._photo_grid = PhotoGridView()
+        self._photo_grid.currentIndexChanged.connect(self._on_current_photo_changed)
+        self._photo_grid.checkedChanged.connect(self._on_photo_checked_changed)
+        self._photo_scroll.setWidget(self._photo_grid)
+        list_lay.addWidget(self._photo_scroll, 1)
         body_splitter.addWidget(list_panel)
 
         self._viewer = PhotoViewerPane(
@@ -824,7 +790,6 @@ class PCPhotoListView(QWidget):
     def setPhotos(self, photos: list[PCPhoto], selection: dict[str, bool]):
         self._photos = photos
         self._selection = selection
-        self._photo_lookup = {photo.source_path: photo for photo in photos}
         self._search_query = ""
         self._sort_key = "title"
         self._sort_reverse = False
@@ -867,38 +832,32 @@ class PCPhotoListView(QWidget):
         return self._photo_sort_label(photo), photo.size
 
     def _refresh_list(self) -> None:
-        current_item = self._list.currentItem()
-        current_path = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        current_index = self._photo_grid.currentIndex()
+        current_path = (
+            self._visible_photos[current_index].source_path
+            if 0 <= current_index < len(self._visible_photos)
+            else None
+        )
 
-        self._list.blockSignals(True)
-        self._list.clear()
-        visible_photos = self._sort_photos([photo for photo in self._photos if self._matches_search(photo)])
-        target_row = -1
-        for row, photo in enumerate(visible_photos):
+        self._photo_grid.clearGrid()
+        self._visible_photos = self._sort_photos(
+            [photo for photo in self._photos if self._matches_search(photo)]
+        )
+        target_index = -1
+        for index, photo in enumerate(self._visible_photos):
             title = photo.display_name or photo.source_path
             checked = self._selection.get(photo.source_path, True)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(Metrics.GRID_ITEM_W, Metrics.GRID_ITEM_H))
-            item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-            )
-            item.setData(Qt.ItemDataRole.UserRole, photo.source_path)
-            item.setData(Qt.ItemDataRole.UserRole + 1, checked)
             pixmap = QPixmap(photo.source_path)
-            self._list.addItem(item)
-            tile = PhotoGridTile(title, checkable=True)
-            tile.setPixmap(pixmap)
-            tile.setChecked(checked)
-            tile.clicked.connect(lambda _=False, row_item=item: self._list.setCurrentItem(row_item))
-            tile.checked_changed.connect(lambda checked, row_item=item: self._set_photo_item_checked(row_item, checked))
-            self._list.setItemWidget(item, tile)
             if current_path and photo.source_path == current_path:
-                target_row = row
-        self._list.blockSignals(False)
-        if self._list.count():
-            self._list.setCurrentRow(target_row if target_row >= 0 else 0)
-            self._sync_tile_states()
+                target_index = index
+            self._photo_grid.addPhoto(
+                title,
+                pixmap,
+                checkable=True,
+                checked=checked,
+            )
+        if self._photo_grid.count():
+            self._photo_grid.setCurrentIndex(target_index if target_index >= 0 else 0)
         else:
             self._viewer.clearPreview(
                 title="No photos found",
@@ -915,28 +874,18 @@ class PCPhotoListView(QWidget):
         self._refresh_list()
 
     def setAllChecked(self, checked: bool):
-        for index in range(self._list.count()):
-            item = self._list.item(index)
-            if item is not None:
-                self._set_photo_item_checked(item, checked, emit_signal=False)
-        self._sync_tile_states()
+        for index, photo in enumerate(self._visible_photos):
+            self._selection[photo.source_path] = checked
+            self._photo_grid.setTileChecked(index, checked)
 
     def _on_current_photo_changed(self, row: int):
         if row < 0:
             self._viewer.clearPreview()
-            self._sync_tile_states()
             return
-        item = self._list.item(row)
-        if item is None:
+        if row >= len(self._visible_photos):
             self._viewer.clearPreview()
-            self._sync_tile_states()
             return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        photo = self._photo_lookup.get(path or "")
-        if photo is None:
-            self._viewer.clearPreview()
-            self._sync_tile_states()
-            return
+        photo = self._visible_photos[row]
 
         pixmap = QPixmap(photo.source_path)
         album_names = sorted(name for name in photo.album_names if name)
@@ -950,36 +899,15 @@ class PCPhotoListView(QWidget):
             summary=" · ".join(part for part in summary_parts if part),
             meta_lines=meta_lines,
         )
-        self._sync_tile_states()
 
-    def _is_photo_item_checked(self, item: QListWidgetItem) -> bool:
-        return bool(item.data(Qt.ItemDataRole.UserRole + 1))
-
-    def _set_photo_item_checked(
-        self,
-        item: QListWidgetItem,
-        checked: bool,
-        emit_signal: bool = True,
-    ):
-        prior = self._is_photo_item_checked(item)
-        item.setData(Qt.ItemDataRole.UserRole + 1, checked)
-        tile = self._list.itemWidget(item)
-        if isinstance(tile, PhotoGridTile):
-            tile.setChecked(checked)
-        if emit_signal and prior != checked:
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if path:
-                self.toggled.emit(path, checked)
-
-    def _sync_tile_states(self):
-        for index in range(self._list.count()):
-            item = self._list.item(index)
-            if item is None:
-                continue
-            tile = self._list.itemWidget(item)
-            if isinstance(tile, PhotoGridTile):
-                tile.setSelected(item.isSelected())
-                tile.setChecked(self._is_photo_item_checked(item))
+    def _on_photo_checked_changed(self, index: int, checked: bool) -> None:
+        if index < 0 or index >= len(self._visible_photos):
+            return
+        photo = self._visible_photos[index]
+        prior = self._selection.get(photo.source_path, True)
+        self._selection[photo.source_path] = checked
+        if prior != checked:
+            self.toggled.emit(photo.source_path, checked)
 
 
 # ── Main browser widget ─────────────────────────────────────────────────────
@@ -1048,9 +976,9 @@ class SelectiveSyncBrowser(QWidget):
 
         self._back_btn = QPushButton("\u2190")
         self._back_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
-        self._back_btn.setStyleSheet(btn_css(padding="4px 8px", radius=Metrics.BORDER_RADIUS_SM))
+        self._back_btn.setStyleSheet(back_btn_css())
         self._back_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._back_btn.setToolTip("Cancel and return")
+        self._back_btn.setToolTip("Back")
         self._back_btn.clicked.connect(self._on_cancel)
         hdr_lay.addWidget(self._back_btn)
 

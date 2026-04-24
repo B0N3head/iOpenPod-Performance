@@ -3,7 +3,14 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtWidgets import QLabel, QFrame, QVBoxLayout
 from PyQt6.QtGui import QFont, QPixmap, QCursor, QImage
 from ..hidpi import scale_pixmap_for_display
-from ..styles import Colors, FONT_FAMILY, Metrics
+from ..styles import (
+    Colors,
+    FONT_FAMILY,
+    Metrics,
+    current_accent_rgb,
+    display_accent_rgb,
+    text_rgb_for_background,
+)
 from ..glyphs import glyph_pixmap
 from .scrollingLabel import ScrollingLabel
 
@@ -75,6 +82,13 @@ class MusicBrowserGridItem(QFrame):
 
     def _setPlaceholderImage(self):
         """Set a placeholder when no artwork is available."""
+        r, g, b = display_accent_rgb(
+            current_accent_rgb(),
+            background=Colors.BG_DARK,
+            target_ratio=Colors.GRID_ART_CONTRAST_TARGET,
+        )
+        bg = f"rgba({r}, {g}, {b}, 14)"
+
         px = glyph_pixmap("music", Metrics.FONT_ICON_LG, Colors.TEXT_TERTIARY)
         if px:
             self.img_label.setPixmap(px)
@@ -83,7 +97,7 @@ class MusicBrowserGridItem(QFrame):
             self.img_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_LG))
         self.img_label.setStyleSheet(f"""
             border: none;
-            background: {Colors.ACCENT_MUTED};
+            background: {bg};
             border-radius: {Metrics.BORDER_RADIUS}px;
             color: {Colors.TEXT_TERTIARY};
         """)
@@ -115,13 +129,32 @@ class MusicBrowserGridItem(QFrame):
                 border-radius: {Metrics.BORDER_RADIUS}px;
             """)
 
+            display_color = None
             if dcol:
+                display_color = display_accent_rgb(
+                    dcol,
+                    background=Colors.BG_DARK,
+                    target_ratio=Colors.GRID_ART_CONTRAST_TARGET,
+                )
                 self.item_data["dominant_color"] = dcol
+                self.item_data["display_dominant_color"] = display_color
             if album_colors:
                 self.item_data["album_colors"] = album_colors
+                if display_color:
+                    text = text_rgb_for_background(display_color)
+                    secondary = (
+                        (225, 230, 238)
+                        if text == (255, 255, 255)
+                        else (45, 50, 60)
+                    )
+                    rendered_album_colors = dict(album_colors)
+                    rendered_album_colors["bg"] = display_color
+                    rendered_album_colors["text"] = text
+                    rendered_album_colors["text_secondary"] = secondary
+                    self.item_data["display_album_colors"] = rendered_album_colors
 
-            if dcol:
-                r, g, b = dcol
+            if display_color:
+                r, g, b = display_color
                 self.setStyleSheet(f"""
                     QFrame {{
                         background-color: rgba({r}, {g}, {b}, 30);

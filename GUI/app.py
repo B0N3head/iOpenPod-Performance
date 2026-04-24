@@ -11,11 +11,18 @@ from PyQt6.QtWidgets import (
 )
 from GUI.widgets.musicBrowser import MusicBrowser
 from GUI.widgets.sidebar import Sidebar
-from GUI.widgets.syncReview import SyncReviewWidget, SyncWorker, PCFolderDialog, SyncExecuteWorker, QuickPlaylistSyncWorker
+from GUI.widgets.syncReview import (
+    SyncReviewWidget,
+    SyncWorker,
+    BackSyncWorker,
+    PCFolderDialog,
+    SyncExecuteWorker,
+    QuickPlaylistSyncWorker,
+)
 from GUI.widgets.settingsPage import SettingsPage
 from GUI.widgets.backupBrowser import BackupBrowserWidget
 from GUI.widgets.dropOverlay import DropOverlayWidget
-from settings import get_settings
+from settings import get_global_settings, get_settings
 from GUI.notifications import Notifier
 from GUI.styles import Colors, FONT_FAMILY, Metrics, btn_css
 from GUI.glyphs import glyph_pixmap
@@ -31,7 +38,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("iOpenPod")
 
         # Load users settings
-        settings = get_settings()
+        settings = get_global_settings()
 
         # Restore remembered window size
         self.resize(settings.window_width, settings.window_height)
@@ -45,9 +52,14 @@ class MainWindow(QMainWindow):
 
         # Sync worker reference
         self._sync_worker = None
+        self._back_sync_worker = None
         self._sync_execute_worker = None
         self._plan = None
         self._last_pc_folder = settings.media_folder or ""
+        self._last_device_path = settings.last_device_path or ""
+        self._auto_restore_worker: _AutoRestoreDeviceWorker | None = None
+        self._auto_restore_cancelled = False
+        self._library_view_device_path: str | None = None
 
         # Eject worker (safe-unmount off the UI thread)
         self._eject_worker: _EjectWorker | None = None
@@ -86,7 +98,10 @@ class MainWindow(QMainWindow):
         self._drop_overlay = DropOverlayWidget(self)
 
         # Connect device manager to reload data when device changes
-        DeviceManager.get_instance().device_changed.connect(self.onDeviceChanged)
+        device_manager = DeviceManager.get_instance()
+        device_manager.device_changed.connect(self.onDeviceChanged)
+        device_manager.device_settings_loaded.connect(self.onDeviceSettingsLoaded)
+        device_manager.device_settings_failed.connect(self.onDeviceSettingsFailed)
 
         # Connect cache ready signal to refresh UI
         iTunesDBCache.get_instance().data_ready.connect(self.onDataReady)
@@ -98,32 +113,66 @@ class MainWindow(QMainWindow):
         # Instant playlist sync whenever playlists are added/edited via context menu
         iTunesDBCache.get_instance().playlist_quick_sync.connect(self._quick_sync_playlists)
 
-        # Restore last device path if it still looks like a real iPod
-        if settings.last_device_path:
-            device_manager = DeviceManager.get_instance()
-            if device_manager.is_valid_ipod_root(settings.last_device_path):
-                # Run a quick scan so discovered_ipod is populated
-                # (needed for FireWire GUID, model info, etc.)
-                try:
-                    from ipod_device import scan_for_ipods
-                    found_ipod = False
-                    for ipod in scan_for_ipods():
-                        if os.path.normpath(ipod.path) == os.path.normpath(settings.last_device_path):
-                            device_manager.discovered_ipod = ipod
-                            device_manager.device_path = settings.last_device_path
-                            found_ipod = True
-                            break
-                    if not found_ipod:
-                        logger.warning("Last device path '%s' not discovered during auto-restore scan", settings.last_device_path)
-                except Exception as e:
-                    logger.warning("Auto-restore scan failed: %s", e)
-
-            # Default to a no-device placeholder page until an iPod is selected.
-            self._show_default_page()
+        self._show_default_page()
+        QTimer.singleShot(100, self._start_auto_restore_last_device)
 
         # Auto-check for updates in the background (silent — no popup if up-to-date)
         self._startup_update_checker = None
         QTimer.singleShot(2000, self._auto_check_for_updates)
+
+    def _start_auto_restore_last_device(self):
+        """Restore the remembered iPod after first paint, without blocking startup."""
+        path = self._last_device_path
+        if not path:
+            return
+
+        device_manager = DeviceManager.get_instance()
+        if device_manager.device_path:
+            return
+
+        self._auto_restore_cancelled = False
+        worker = _AutoRestoreDeviceWorker(path)
+        self._auto_restore_worker = worker
+        worker.found.connect(self._on_auto_restore_found)
+        worker.not_found.connect(self._on_auto_restore_not_found)
+        worker.failed.connect(self._on_auto_restore_failed)
+        worker.finished.connect(self._on_auto_restore_finished)
+        worker.start()
+
+    def _cancel_auto_restore_last_device(self) -> None:
+        """Supersede fast resume when the user explicitly opens the picker."""
+        self._auto_restore_cancelled = True
+        worker = self._auto_restore_worker
+        if worker and worker.isRunning():
+            worker.requestInterruption()
+
+    @pyqtSlot(str, object)
+    def _on_auto_restore_found(self, path: str, ipod) -> None:
+        if self._auto_restore_cancelled:
+            return
+        device_manager = DeviceManager.get_instance()
+        if device_manager.device_path:
+            return
+        device_manager.discovered_ipod = ipod
+        device_manager.device_path = path
+
+    @pyqtSlot(str)
+    def _on_auto_restore_not_found(self, path: str) -> None:
+        if self._auto_restore_cancelled:
+            return
+        logger.info("Fast resume skipped: remembered device is unavailable (%s)", path)
+
+    @pyqtSlot(str, str)
+    def _on_auto_restore_failed(self, path: str, error: str) -> None:
+        if self._auto_restore_cancelled:
+            return
+        logger.warning("Fast resume identification failed for '%s': %s", path, error)
+
+    @pyqtSlot()
+    def _on_auto_restore_finished(self) -> None:
+        if self._auto_restore_worker is not None:
+            self._auto_restore_worker.deleteLater()
+        self._auto_restore_worker = None
 
     def _auto_check_for_updates(self):
         """Silently check for updates at startup. Only shows UI if an update is found."""
@@ -246,11 +295,36 @@ class MainWindow(QMainWindow):
         self.mainContentStack.addWidget(self.musicBrowser)   # Index 0
         self.mainContentStack.addWidget(self.noDeviceWidget)  # Index 1
 
+        self.loadingDeviceWidget = QWidget()
+        loading_layout = QVBoxLayout(self.loadingDeviceWidget)
+        loading_layout.setContentsMargins((36), (36), (36), (36))
+        loading_layout.setSpacing((12))
+        loading_layout.addStretch(1)
+
+        loading_title = QLabel("Loading iPod...")
+        loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_title.setFont(QFont(FONT_FAMILY, Metrics.FONT_XXL, QFont.Weight.DemiBold))
+        loading_title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent;")
+        loading_layout.addWidget(loading_title)
+
+        loading_subtitle = QLabel("Reading library and device settings.")
+        loading_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_subtitle.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        loading_subtitle.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
+        loading_layout.addWidget(loading_subtitle)
+        loading_layout.addStretch(2)
+
+        self.mainContentStack.addWidget(self.loadingDeviceWidget)  # Index 2
+
     def _show_default_page(self):
         """Show main page and switch content area by device selection state."""
         has_device = bool(DeviceManager.get_instance().device_path)
         self.sidebar.setLibraryTabsVisible(has_device)
-        self.mainContentStack.setCurrentIndex(0 if has_device else 1)
+        if has_device:
+            ready = iTunesDBCache.get_instance().is_ready()
+            self.mainContentStack.setCurrentIndex(0 if ready else 2)
+        else:
+            self.mainContentStack.setCurrentIndex(1)
         self.centralStack.setCurrentIndex(0)
 
     def _rebuild_themed_ui(self, restore_page: int | None = None):
@@ -298,25 +372,53 @@ class MainWindow(QMainWindow):
         finally:
             self.setUpdatesEnabled(True)
 
+    def _reset_library_category_for_new_device(self, path: str) -> None:
+        """Start each newly selected device on Albums without affecting refreshes."""
+        if not path:
+            self._library_view_device_path = None
+            return
+        if DeviceManager._same_device_path(path, self._library_view_device_path):
+            return
+        self._library_view_device_path = path
+        self.sidebar.resetLibraryCategory()
+
     def _on_theme_changed(self):
         """Rebuild the entire UI after a live theme switch (from settings)."""
+        settings_scope = getattr(self.settingsPage, "_settings_scope", "global")
         self._rebuild_themed_ui(restore_page=2)
+        if settings_scope == "device" and hasattr(self.settingsPage, "set_settings_scope"):
+            self.settingsPage.set_settings_scope("device")
 
     def selectDevice(self):
         """Open device picker dialog to scan and select an iPod."""
         from GUI.widgets.devicePicker import DevicePickerDialog
 
+        self._cancel_auto_restore_last_device()
         dialog = DevicePickerDialog(self)
         if dialog.exec() and dialog.selected_path:
             folder = dialog.selected_path
             device_manager = DeviceManager.get_instance()
             if device_manager.is_valid_ipod_root(folder):
-                device_manager.discovered_ipod = dialog.selected_ipod
+                selected_ipod = dialog.selected_ipod
+                if selected_ipod is None:
+                    from ipod_device import identify_ipod_at_path
+
+                    selected_ipod = identify_ipod_at_path(folder)
+                    if selected_ipod is None:
+                        QMessageBox.warning(
+                            self,
+                            "Invalid iPod Folder",
+                            "The selected folder could not be identified as an iPod.",
+                        )
+                        return
+                    folder = selected_ipod.path or folder
+
+                device_manager.discovered_ipod = selected_ipod
                 device_manager.device_path = folder
                 # Persist selection
-                settings = get_settings()
-                settings.last_device_path = folder
-                settings.save()
+                global_settings = get_global_settings()
+                global_settings.last_device_path = folder
+                global_settings.save()
             else:
                 QMessageBox.warning(
                     self,
@@ -342,16 +444,48 @@ class MainWindow(QMainWindow):
         from .imgMaker import clear_artworkdb_cache
         clear_artworkdb_cache()
 
+        if self._apply_effective_theme():
+            self._schedule_themed_rebuild(restore_page=0)
+
         self.musicBrowser.reloadData()
         self.sidebar.clearDeviceInfo()
 
         if path:
+            self._reset_library_category_for_new_device(path)
             self._show_default_page()
             # Start loading data (will emit data_ready when done)
             iTunesDBCache.get_instance().start_loading()
         else:
+            self._reset_library_category_for_new_device("")
             self.sidebar.clearDeviceInfo()
             self._show_default_page()
+
+    def onDeviceSettingsLoaded(self, path: str):
+        """Apply UI updates after on-iPod settings finish loading."""
+        if not DeviceManager._same_device_path(path, DeviceManager.get_instance().device_path):
+            return
+
+        try:
+            self.settingsPage._sync_scope_availability()
+        except Exception:
+            logger.debug("Failed to refresh settings scope availability", exc_info=True)
+
+        if self._apply_effective_theme():
+            self._schedule_themed_rebuild(restore_page=self.centralStack.currentIndex())
+        elif getattr(self.settingsPage, "_settings_scope", "global") == "device":
+            self.settingsPage.load_from_settings()
+
+    def onDeviceSettingsFailed(self, path: str, error: str):
+        """Keep the UI on global settings if per-device settings cannot load."""
+        if not DeviceManager._same_device_path(path, DeviceManager.get_instance().device_path):
+            return
+        logger.warning("Using global settings; device settings failed: %s", error)
+        try:
+            self.settingsPage._sync_scope_availability()
+        except Exception:
+            logger.debug("Failed to refresh settings scope availability", exc_info=True)
+        if getattr(self.settingsPage, "_settings_scope", "global") == "device":
+            self.settingsPage.load_from_settings()
 
     def resyncDevice(self):
         """Rebuild the cache from the current device."""
@@ -364,6 +498,7 @@ class MainWindow(QMainWindow):
     def onDataReady(self):
         """Called when iTunesDB data is loaded and ready."""
         cache = iTunesDBCache.get_instance()
+        self._show_default_page()
 
         tracks = cache.get_tracks()
         albums = cache.get_albums()
@@ -394,7 +529,7 @@ class MainWindow(QMainWindow):
 
         db_version_hex = db_data.get('VersionHex', '') if db_data else ''
         db_version_name = get_version_name(db_version_hex) if db_version_hex else ''
-        db_id = db_data.get('DatabaseID', 0) if db_data else 0
+        database_id = db_data.get('DatabaseID', 0) if db_data else 0
 
         self.sidebar.updateDeviceInfo(
             name=device_name,
@@ -405,7 +540,7 @@ class MainWindow(QMainWindow):
             duration_ms=sum(t.get("length", 0) for t in tracks),
             db_version_hex=db_version_hex,
             db_version_name=db_version_name,
-            db_id=db_id,
+            db_id=database_id,
             videos=len(classified["video"]),
             podcasts=len(classified["podcast"]),
             audiobooks=len(classified["audiobook"]),
@@ -427,6 +562,38 @@ class MainWindow(QMainWindow):
         """Execute a previously scheduled themed rebuild."""
         self._pending_theme_rebuild = False
         self._rebuild_themed_ui(restore_page=self._theme_rebuild_restore_page)
+
+    def _apply_effective_theme(self, dev=None) -> bool:
+        """Apply the currently effective theme/accent and report visual changes."""
+        from settings import get_settings
+        from GUI.styles import resolve_accent_color, Colors, Metrics
+
+        s = get_settings()
+        if dev is None:
+            try:
+                from ipod_device import get_current_device
+                dev = get_current_device()
+            except Exception:
+                dev = None
+
+        img = ""
+        if s.accent_color == "match-ipod":
+            try:
+                from ipod_device import resolve_image_filename, image_for_model
+                if dev and dev.model_number:
+                    img = image_for_model(dev.model_number) or ""
+                if not img and dev and dev.model_family and dev.generation:
+                    img = resolve_image_filename(
+                        dev.model_family, dev.generation, dev.color or "",
+                    )
+            except Exception:
+                img = ""
+
+        old_accent = Colors.ACCENT
+        accent_hex = resolve_accent_color(s.accent_color, img)
+        Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
+        Metrics.apply_font_scale(s.font_scale)
+        return Colors.ACCENT != old_accent
 
     def _apply_match_ipod_accent(self, dev=None):
         """Re-apply accent color when 'match-ipod' is active and device is known.
@@ -556,6 +723,98 @@ class MainWindow(QMainWindow):
 
     # ── Eject ──────────────────────────────────────────────────────────
 
+    def _flush_quick_writes_for_eject(self) -> bool:
+        """Finish any queued quick database writes before ejecting."""
+        cache = iTunesDBCache.get_instance()
+
+        self._quick_meta_timer.stop()
+        self._quick_pl_timer.stop()
+        QApplication.processEvents()
+
+        if self._quick_meta_worker is not None and self._quick_meta_worker.isRunning():
+            if not self._wait_for_quick_write_before_eject(
+                self._quick_meta_worker,
+                "track changes",
+            ):
+                return False
+
+        if cache.has_pending_track_edits():
+            self._start_quick_meta_write()
+            if not self._wait_for_quick_write_before_eject(
+                self._quick_meta_worker,
+                "track changes",
+            ):
+                return False
+
+        had_playlist_worker = (
+            self._quick_pl_worker is not None and self._quick_pl_worker.isRunning()
+        )
+        if had_playlist_worker:
+            if not self._wait_for_quick_write_before_eject(
+                self._quick_pl_worker,
+                "playlist changes",
+            ):
+                return False
+
+        if cache.has_pending_playlists() and not had_playlist_worker:
+            self._start_quick_playlist_sync()
+            if not self._wait_for_quick_write_before_eject(
+                self._quick_pl_worker,
+                "playlist changes",
+            ):
+                return False
+
+        return self._settle_background_device_reads_for_eject()
+
+    def _settle_background_device_reads_for_eject(self) -> bool:
+        """Stop best-effort UI/background reads that can keep the drive open."""
+        try:
+            self.musicBrowser.reloadData()
+        except Exception:
+            logger.debug("Failed to clear music browser before eject", exc_info=True)
+
+        try:
+            from .imgMaker import clear_artworkdb_cache
+            clear_artworkdb_cache()
+        except Exception:
+            logger.debug("Failed to clear artwork cache before eject", exc_info=True)
+
+        DeviceManager.get_instance().cancel_all_operations()
+        pool = ThreadPoolSingleton.get_instance()
+        pool.clear()
+        if not pool.waitForDone(5000):
+            QMessageBox.warning(
+                self,
+                "Still Reading iPod",
+                "iOpenPod is still finishing background reads from the iPod. "
+                "Try ejecting again in a moment.",
+            )
+            return False
+
+        QApplication.processEvents()
+        return True
+
+    def _wait_for_quick_write_before_eject(
+        self,
+        worker: QThread | None,
+        label: str,
+    ) -> bool:
+        if worker is None or not worker.isRunning():
+            return True
+
+        logger.info("Waiting for pending %s before ejecting", label)
+        if worker.wait(30000):
+            QApplication.processEvents()
+            return True
+
+        QMessageBox.warning(
+            self,
+            "Save In Progress",
+            f"iOpenPod is still saving {label} to the iPod. "
+            "Try ejecting again when the save finishes.",
+        )
+        return False
+
     def _onEjectDevice(self):
         """Safely eject the current iPod from the OS."""
         device = DeviceManager.get_instance()
@@ -571,9 +830,8 @@ class MainWindow(QMainWindow):
             return
 
         # Flush any pending in-memory edits before pulling the volume out.
-        if self._quick_meta_timer.isActive():
-            self._quick_meta_timer.stop()
-            self._start_quick_meta_write()
+        if not self._flush_quick_writes_for_eject():
+            return
 
         self.sidebar.device_card.eject_button.setEnabled(False)
 
@@ -591,7 +849,7 @@ class MainWindow(QMainWindow):
         DeviceManager.get_instance().device_path = None
         # Forget the restored device so it doesn't auto-reconnect next launch.
         try:
-            s = get_settings()
+            s = get_global_settings()
             s.last_device_path = ""
             s.save()
         except Exception:
@@ -605,6 +863,11 @@ class MainWindow(QMainWindow):
         # Re-enable the button so the user can retry.
         has_device = bool(DeviceManager.get_instance().device_path)
         self.sidebar.device_card.eject_button.setEnabled(has_device)
+        try:
+            if iTunesDBCache.get_instance().is_ready():
+                self.onDataReady()
+        except Exception:
+            logger.debug("Failed to restore UI after eject failure", exc_info=True)
         QMessageBox.critical(
             self, "Eject Failed",
             f"Failed to eject the iPod:\n{error_msg}"
@@ -615,6 +878,7 @@ class MainWindow(QMainWindow):
     def _is_sync_running(self) -> bool:
         return (
             (self._sync_worker is not None and self._sync_worker.isRunning())
+            or (self._back_sync_worker is not None and self._back_sync_worker.isRunning())
             or (self._sync_execute_worker is not None and self._sync_execute_worker.isRunning())
         )
 
@@ -739,14 +1003,38 @@ class MainWindow(QMainWindow):
 
         self._last_pc_folder = dialog.selected_folder
         # Persist the folder choice
+        global_settings = get_global_settings()
+        global_settings.media_folder = dialog.selected_folder
+        global_settings.save()
         settings = get_settings()
-        settings.media_folder = dialog.selected_folder
-        settings.save()
 
         # Branch: selective sync opens the PC library browser first
         if dialog.sync_mode == "selective":
             self.centralStack.setCurrentIndex(4)
             self.selectiveSyncBrowser.load(self._last_pc_folder)
+            return
+
+        # Branch: Back Sync runs outside the regular sync-plan flow.
+        if dialog.sync_mode == "back_sync":
+            self.centralStack.setCurrentIndex(1)
+            self.syncReview.show_back_sync_loading()
+
+            cache = iTunesDBCache.get_instance()
+            ipod_tracks = cache.get_tracks()
+
+            device_manager = DeviceManager.get_instance()
+            self._back_sync_worker = BackSyncWorker(
+                pc_folder=self._last_pc_folder,
+                ipod_tracks=ipod_tracks,
+                ipod_path=device_manager.device_path or "",
+            )
+            self._back_sync_worker.progress.connect(self.syncReview.update_progress)
+            self._back_sync_worker.finished.connect(self._onBackSyncComplete)
+            self._back_sync_worker.error.connect(self._onSyncError)
+            # Ensure worker reference is cleared on finish/error
+            self._back_sync_worker.finished.connect(lambda _: setattr(self, '_back_sync_worker', None))
+            self._back_sync_worker.error.connect(lambda _: setattr(self, '_back_sync_worker', None))
+            self._back_sync_worker.start()
             return
 
         # Switch to sync review view
@@ -849,13 +1137,13 @@ class MainWindow(QMainWindow):
         to_remove = []
         bytes_to_remove = 0
         for t in tracks:
-            db_id = t.get("db_id")
+            db_track_id = t.get("db_track_id", t.get("db_id"))
             title = t.get("Title", "Unknown")
             artist = t.get("Artist", "")
-            size = t.get("Size", 0)
+            size = t.get("size", t.get("Size", 0))
             to_remove.append(SyncItem(
                 action=SyncAction.REMOVE_FROM_IPOD,
-                db_id=db_id,
+                db_track_id=db_track_id,
                 ipod_track=t,
                 description=f"Remove: {artist} – {title}" if artist else f"Remove: {title}",
             ))
@@ -991,6 +1279,21 @@ class MainWindow(QMainWindow):
         """Called when sync diff fails."""
         self.syncReview.show_error(error_msg)
 
+    def _onBackSyncComplete(self, result: dict):
+        """Called when Back Sync export completes."""
+        self._back_sync_worker = None
+
+        exported = int(result.get("exported", 0) or 0)
+        missing = int(result.get("missing_on_pc", 0) or 0)
+        self.syncReview.show_back_sync_result(result)
+
+        if not self.isActiveWindow():
+            if missing:
+                message = f"{exported:,} of {missing:,} missing track{'s' if missing != 1 else ''} exported"
+            else:
+                message = "No iPod-only tracks were found"
+            self._notifier.notify("Back Sync Complete", message)
+
     def _onSelectiveSyncDone(self, folder: str, selected_paths):
         """User finished picking tracks in selective sync; run diff on selection."""
         self._last_pc_folder = folder
@@ -1015,7 +1318,8 @@ class MainWindow(QMainWindow):
         photo_edits = None
         if selected_photo_imports:
             from SyncEngine.photos import PhotoEditState
-            photo_edits = PhotoEditState(imported_files=list(selected_photo_imports))
+            photo_edits = PhotoEditState()
+            photo_edits.imported_files.extend(selected_photo_imports)
         settings = get_settings()
         try:
             sync_workers = settings.sync_workers
@@ -1052,6 +1356,10 @@ class MainWindow(QMainWindow):
         During sync execution we only request cancellation and keep the page
         visible so partial-save confirmation (save vs discard) can be shown.
         """
+        if self._back_sync_worker is not None and self._back_sync_worker.isRunning():
+            self._back_sync_worker.requestInterruption()
+            return
+
         if self._sync_execute_worker is not None and self._sync_execute_worker.isRunning():
             self._sync_execute_worker.requestInterruption()
             return
@@ -1061,6 +1369,8 @@ class MainWindow(QMainWindow):
         """Return to the main browsing view, stopping any background work."""
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self._sync_worker.requestInterruption()
+        if self._back_sync_worker is not None and self._back_sync_worker.isRunning():
+            self._back_sync_worker.requestInterruption()
         self._cleanup_sync_execute_worker()
         self._show_default_page()
 
@@ -1094,7 +1404,7 @@ class MainWindow(QMainWindow):
     def hideSettings(self):
         """Return from settings to the main browsing view."""
         # Re-read persisted settings to pick up changes
-        settings = get_settings()
+        settings = get_global_settings()
         self._last_pc_folder = settings.media_folder or self._last_pc_folder
         self._show_default_page()
 
@@ -1490,8 +1800,8 @@ class MainWindow(QMainWindow):
         """Ensure all threads are stopped when the window is closed."""
         # Persist window dimensions
         try:
-            from settings import get_settings as _get_settings
-            _s = _get_settings()
+            from settings import get_global_settings as _get_global_settings
+            _s = _get_global_settings()
             _s.window_width = self.width()
             _s.window_height = self.height()
             _s.save()
@@ -1502,6 +1812,9 @@ class MainWindow(QMainWindow):
         Notifier.shutdown()
 
         # Request graceful stop for sync workers
+        if self._auto_restore_worker and self._auto_restore_worker.isRunning():
+            self._auto_restore_worker.requestInterruption()
+            self._auto_restore_worker.wait(3000)
         if self._sync_worker and self._sync_worker.isRunning():
             self._sync_worker.requestInterruption()
             self._sync_worker.wait(3000)
@@ -1813,6 +2126,79 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int)
 
 
+class _DeviceSettingsLoader(QThread):
+    """Load per-device settings from the iPod without blocking Qt."""
+
+    loaded = pyqtSignal(int, str, str, object)
+    failed = pyqtSignal(int, str, str, str)
+
+    def __init__(self, token: int, ipod_root: str, device_key: str):
+        super().__init__()
+        self._token = token
+        self._ipod_root = ipod_root
+        self._device_key = device_key
+
+    def run(self):
+        try:
+            from settings import get_global_settings, load_device_settings
+
+            state = load_device_settings(
+                self._ipod_root,
+                self._device_key,
+                get_global_settings(),
+            )
+            if not self.isInterruptionRequested():
+                self.loaded.emit(
+                    self._token,
+                    self._ipod_root,
+                    self._device_key,
+                    state,
+                )
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self.failed.emit(
+                    self._token,
+                    self._ipod_root,
+                    self._device_key,
+                    str(exc),
+                )
+
+
+class _AutoRestoreDeviceWorker(QThread):
+    """Identify the remembered iPod off the UI thread during startup."""
+
+    found = pyqtSignal(str, object)
+    not_found = pyqtSignal(str)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, remembered_path: str):
+        super().__init__()
+        self._remembered_path = remembered_path
+
+    def run(self):
+        path = self._remembered_path
+        try:
+            ipod_control = os.path.join(path, "iPod_Control")
+            itunes_folder = os.path.join(ipod_control, "iTunes")
+            if not os.path.isdir(ipod_control) or not os.path.isdir(itunes_folder):
+                self.not_found.emit(path)
+                return
+
+            from ipod_device import identify_ipod_at_path
+
+            ipod = identify_ipod_at_path(path)
+            if self.isInterruptionRequested():
+                return
+            if ipod is None:
+                self.not_found.emit(path)
+                return
+            self.found.emit(ipod.path or path, ipod)
+        except Exception as exc:
+            if self.isInterruptionRequested():
+                return
+            self.failed.emit(path, str(exc))
+
+
 # ============================================================================
 # State Management
 # ============================================================================
@@ -1821,6 +2207,8 @@ class DeviceManager(QObject):
     """Manages the currently selected iPod device path."""
     device_changed = pyqtSignal(str)  # Emits the new device path
     device_changing = pyqtSignal()  # Emitted before device change to trigger cleanup
+    device_settings_loaded = pyqtSignal(str)  # Emits device path after settings activation
+    device_settings_failed = pyqtSignal(str, str)  # Emits device path and error text
 
     _instance = None
 
@@ -1829,6 +2217,9 @@ class DeviceManager(QObject):
         self._device_path = None
         self._discovered_ipod = None  # cached DeviceInfo from last scan
         self._cancellation_token = CancellationToken()
+        self._settings_load_token = 0
+        self._device_settings_loading = False
+        self._device_settings_workers: list[_DeviceSettingsLoader] = []
 
     @classmethod
     def get_instance(cls):
@@ -1839,6 +2230,10 @@ class DeviceManager(QObject):
     @property
     def cancellation_token(self) -> CancellationToken:
         return self._cancellation_token
+
+    @property
+    def device_settings_loading(self) -> bool:
+        return self._device_settings_loading
 
     def cancel_all_operations(self):
         """Cancel all ongoing operations and create a new token."""
@@ -1860,6 +2255,60 @@ class DeviceManager(QObject):
         # Store in the centralised device info store
         self._sync_device_info(ipod)
 
+    @staticmethod
+    def _same_device_path(left: str | None, right: str | None) -> bool:
+        if not left or not right:
+            return not left and not right
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+    def _cancel_device_settings_loads(self) -> None:
+        self._settings_load_token += 1
+        self._device_settings_loading = False
+        for worker in list(self._device_settings_workers):
+            worker.requestInterruption()
+
+    def _forget_device_settings_worker(self, worker: _DeviceSettingsLoader) -> None:
+        try:
+            self._device_settings_workers.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
+
+    def _start_device_settings_load(self, path: str, key: str) -> None:
+        self._settings_load_token += 1
+        token = self._settings_load_token
+        self._device_settings_loading = True
+        worker = _DeviceSettingsLoader(token, path, key)
+        self._device_settings_workers.append(worker)
+        worker.loaded.connect(self._on_device_settings_loaded)
+        worker.failed.connect(self._on_device_settings_failed)
+        worker.finished.connect(lambda w=worker: self._forget_device_settings_worker(w))
+        worker.start()
+
+    @pyqtSlot(int, str, str, object)
+    def _on_device_settings_loaded(self, token: int, path: str, key: str, state) -> None:
+        if token != self._settings_load_token or not self._same_device_path(path, self._device_path):
+            return
+        try:
+            from settings import apply_loaded_device_settings
+
+            apply_loaded_device_settings(path, key, state)
+            self._device_settings_loading = False
+            logger.info("Device settings loaded for %s", path)
+            self.device_settings_loaded.emit(path)
+        except Exception:
+            logger.warning("Failed to activate loaded device settings", exc_info=True)
+            self._device_settings_loading = False
+            self.device_settings_failed.emit(path, "Failed to activate device settings")
+
+    @pyqtSlot(int, str, str, str)
+    def _on_device_settings_failed(self, token: int, path: str, _key: str, error: str) -> None:
+        if token != self._settings_load_token or not self._same_device_path(path, self._device_path):
+            return
+        self._device_settings_loading = False
+        logger.warning("Failed to load device settings for %s: %s", path, error)
+        self.device_settings_failed.emit(path, error)
+
     @device_path.setter
     def device_path(self, path: str | None):
         # Signal that device is changing (for cleanup)
@@ -1868,12 +2317,24 @@ class DeviceManager(QObject):
         self.cancel_all_operations()
         # Clear the iTunesDB cache
         iTunesDBCache.get_instance().clear()
+        self._cancel_device_settings_loads()
         self._device_path = path
         if path is None:
             self._discovered_ipod = None
             # Clear centralized device store
             from ipod_device import clear_current_device
             clear_current_device()
+        try:
+            from settings import clear_device_settings, device_settings_key
+            clear_device_settings()
+            if path:
+                self._start_device_settings_load(
+                    path,
+                    device_settings_key(path, self._discovered_ipod),
+                )
+        except Exception:
+            self._device_settings_loading = False
+            logger.warning("Failed to start device settings load", exc_info=True)
         self.device_changed.emit(path or "")
 
     @property
@@ -1942,7 +2403,7 @@ class iTunesDBCache(QObject):
         self._photo_db = None
         # User-created/edited playlists (persisted in memory until sync)
         self._user_playlists: list[dict] = []
-        # Pending track flag edits: db_id -> { field: (original, new), ... }
+        # Pending track flag edits: db_track_id -> { field: (original, new), ... }
         # Originals are captured on first edit so the diff engine can
         # revert in-memory track dicts before comparing.
         self._track_edits: dict[int, dict[str, tuple]] = {}
@@ -2201,10 +2662,10 @@ class iTunesDBCache(QObject):
         """
         with self._lock:
             for track in tracks:
-                db_id = track.get("db_id", 0)
-                if not db_id:
+                db_track_id = track.get("db_track_id", track.get("db_id", 0))
+                if not db_track_id:
                     continue
-                edits = self._track_edits.setdefault(db_id, {})
+                edits = self._track_edits.setdefault(db_track_id, {})
                 for key, value in changes.items():
                     if key in edits:
                         # Already edited — keep the *original* value, update new
@@ -2222,7 +2683,7 @@ class iTunesDBCache(QObject):
         self.tracks_changed.emit()
 
     def get_track_edits(self) -> dict[int, dict[str, tuple]]:
-        """Get all pending track flag edits: db_id → {field: (original, new)}."""
+        """Get all pending track flag edits: db_track_id → {field: (original, new)}."""
         with self._lock:
             return dict(self._track_edits)
 
@@ -2665,7 +3126,7 @@ class _QuickMetadataWorker(QThread):
     """Write pending track-flag edits directly to the iPod, bypassing full sync.
 
     Reads the existing iTunesDB, applies the supplied ``track_edits`` snapshot
-    (db_id → {field: (orig, new)}), and writes the database back.  The worker
+    (db_track_id → {field: (orig, new)}), and writes the database back.  The worker
     operates entirely on the snapshot passed at construction time; any edits
     made after construction are not included and remain pending in the cache.
     """
@@ -2676,7 +3137,7 @@ class _QuickMetadataWorker(QThread):
     def __init__(self, ipod_path: str, track_edits: "dict[int, dict[str, tuple]]"):
         super().__init__()
         self._ipod_path = ipod_path
-        self._track_edits = track_edits  # snapshot: db_id → {field: (orig, new)}
+        self._track_edits = track_edits  # snapshot: db_track_id → {field: (orig, new)}
 
     def run(self):
         try:
@@ -2691,9 +3152,9 @@ class _QuickMetadataWorker(QThread):
 
             # Apply edits to the raw track dicts before converting to TrackInfo
             for t in existing_tracks_data:
-                db_id = t.get("db_id", 0)
-                if db_id in self._track_edits:
-                    for field, (_, new_val) in self._track_edits[db_id].items():
+                db_track_id = t.get("db_track_id", t.get("db_id", 0))
+                if db_track_id in self._track_edits:
+                    for field, (_, new_val) in self._track_edits[db_track_id].items():
                         t[field] = new_val
 
             all_tracks = [

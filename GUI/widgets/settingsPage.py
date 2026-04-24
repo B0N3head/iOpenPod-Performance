@@ -18,7 +18,7 @@ from pathlib import Path
 from ..styles import (
     Colors, FONT_FAMILY, Metrics, btn_css, danger_btn_css,
     sidebar_nav_css, sidebar_nav_selected_css,
-    input_css, combo_css, link_btn_css, make_scroll_area,
+    back_btn_css, input_css, combo_css, link_btn_css, make_scroll_area,
     resolve_accent_color,
 )
 
@@ -846,10 +846,14 @@ class SettingsPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._pending_lb_result: tuple[str, str] = ("", "")
+        self._pending_lb_result: tuple[str, str, str, str, str, bool] = ("", "", "global", "", "", False)
         self._update_checker: object | None = None
         self._update_downloader: object | None = None
         self._update_progress: QProgressDialog | None = None
+        self._settings_scope = "global"
+        self._loading_settings = False
+        self._device_settings_pending = False
+        self._section_labels: dict[tuple[str, str], QLabel] = {}
 
         main = QHBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
@@ -890,19 +894,11 @@ class SettingsPage(QWidget):
         layout.setSpacing((4))
 
         # Back button
-        back_btn = QPushButton("← Back")
+        back_btn = QPushButton("←")
         back_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
         back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        back_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                color: {Colors.ACCENT};
-                padding: {(4)}px 0;
-                text-align: left;
-            }}
-            QPushButton:hover {{ color: {Colors.ACCENT_LIGHT}; }}
-        """)
+        back_btn.setToolTip("Back")
+        back_btn.setStyleSheet(back_btn_css())
         back_btn.clicked.connect(self._on_close)
         layout.addWidget(back_btn)
 
@@ -913,6 +909,8 @@ class SettingsPage(QWidget):
             f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;"
         )
         layout.addWidget(title)
+        layout.addSpacing((8))
+        layout.addWidget(self._build_scope_switch())
         layout.addSpacing((12))
 
         # Navigation items
@@ -932,8 +930,65 @@ class SettingsPage(QWidget):
         layout.addStretch()
         return sidebar
 
+    def _build_scope_switch(self) -> QFrame:
+        """Build the Global / Device segmented settings scope control."""
+        frame = QFrame()
+        frame.setObjectName("settingsScopeSwitch")
+        frame.setFixedHeight(34)
+        frame.setStyleSheet(f"""
+            QFrame#settingsScopeSwitch {{
+                background: {Colors.SURFACE_ALT};
+                border: 1px solid {Colors.BORDER_SUBTLE};
+                border-radius: {Metrics.BORDER_RADIUS_SM}px;
+            }}
+        """)
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(3)
+
+        self._scope_global_btn = QPushButton("Global")
+        self._scope_device_btn = QPushButton("Device")
+        for btn in (self._scope_global_btn, self._scope_device_btn):
+            btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(26)
+            lay.addWidget(btn, stretch=1)
+
+        self._scope_global_btn.clicked.connect(lambda: self.set_settings_scope("global"))
+        self._scope_device_btn.clicked.connect(lambda: self.set_settings_scope("device"))
+        self._update_scope_switch_style()
+        return frame
+
+    def _update_scope_switch_style(self) -> None:
+        if not hasattr(self, "_scope_global_btn"):
+            return
+        for scope, btn in (("global", self._scope_global_btn), ("device", self._scope_device_btn)):
+            selected = self._settings_scope == scope
+            btn.setStyleSheet(btn_css(
+                bg=Colors.ACCENT if selected else "transparent",
+                bg_hover=Colors.ACCENT_LIGHT if selected else Colors.SURFACE_ACTIVE,
+                bg_press=Colors.ACCENT if selected else Colors.SURFACE_ALT,
+                fg=Colors.TEXT_ON_ACCENT if selected else Colors.TEXT_SECONDARY,
+                border="none",
+                padding="4px 8px",
+            ))
+
+    def set_settings_scope(self, scope: str) -> None:
+        """Switch between PC/global settings and the selected iPod settings."""
+        scope = "device" if scope == "device" else "global"
+        if scope == "device" and not self._current_device_context():
+            scope = "global"
+        if self._settings_scope == scope:
+            self.load_from_settings()
+            return
+        self._settings_scope = scope
+        self._update_scope_switch_style()
+        self.load_from_settings()
+
     def _select_page(self, index: int):
         """Switch visible page and update sidebar highlight."""
+        if 0 <= index < len(self._nav_buttons) and self._nav_buttons[index].isHidden():
+            index = 0
         for i, btn in enumerate(self._nav_buttons):
             btn.setStyleSheet(sidebar_nav_selected_css() if i == index else sidebar_nav_css())
         self._stack.setCurrentIndex(index)
@@ -974,6 +1029,7 @@ class SettingsPage(QWidget):
                     f"color: {Colors.TEXT_TERTIARY}; background: transparent;"
                     f" border: none; padding-left: {(4)}px;"
                 )
+                self._section_labels[(title, item)] = lbl
                 layout.addWidget(lbl)
                 layout.addSpacing((8))
             else:
@@ -987,6 +1043,19 @@ class SettingsPage(QWidget):
     # ── Page builders ───────────────────────────────────────────────────────
 
     def _build_general_page(self) -> QScrollArea:
+        self.use_global_settings = ToggleRow(
+            "Use Global Settings",
+            "Ignore this iPod's settings file and use the PC settings "
+            "while this iPod is selected.",
+            checked=False,
+        )
+        self.reset_device_settings = ActionRow(
+            "Reset Device Settings",
+            "Copy the current global values into this iPod's settings file.",
+            button_text="Reset",
+        )
+        self.reset_device_settings.clicked.connect(self._reset_device_settings_to_global)
+
         self.theme_combo = ComboRow(
             "Theme",
             "Choose the color scheme for the interface. "
@@ -1067,12 +1136,31 @@ class SettingsPage(QWidget):
             )
         )
 
+        self._manage_card = _SettingsCard(
+            self.use_global_settings,
+            self.reset_device_settings,
+        )
+        self._appearance_card = _SettingsCard(
+            self.theme_combo,
+            self.high_contrast,
+            self.accent_color,
+            self.font_scale,
+            self.show_art,
+        )
+        self._about_card = _SettingsCard(
+            self.version_row,
+            self.bug_report_row,
+            self.kofi_row,
+        )
+
         return self._make_page(
             "General",
+            "Manage",
+            self._manage_card,
             "Appearance",
-            _SettingsCard(self.theme_combo, self.high_contrast, self.accent_color, self.font_scale, self.show_art),
+            self._appearance_card,
             "About",
-            _SettingsCard(self.version_row, self.bug_report_row, self.kofi_row),
+            self._about_card,
         )
 
     def _build_sync_page(self) -> QScrollArea:
@@ -1114,16 +1202,18 @@ class SettingsPage(QWidget):
             current="iPod Wins",
         )
 
+        self._sync_card = _SettingsCard(
+            self.media_folder,
+            self.write_back,
+            self.compute_sound_check,
+            self.rotate_tall_photos,
+            self.fit_photo_thumbnails,
+            self.rating_strategy,
+        )
+
         return self._make_page(
             "Sync",
-            _SettingsCard(
-                self.media_folder,
-                self.write_back,
-                self.compute_sound_check,
-                self.rotate_tall_photos,
-                self.fit_photo_thumbnails,
-                self.rating_strategy,
-            ),
+            self._sync_card,
         )
 
     def _build_transcoding_page(self) -> QScrollArea:
@@ -1384,21 +1474,145 @@ class SettingsPage(QWidget):
             current="10",
         )
 
+        self._backups_card = _SettingsCard(
+            self.backup_dir,
+            self.backup_before_sync,
+            self.max_backups,
+        )
+
         return self._make_page(
             "Backups",
-            _SettingsCard(
-                self.backup_dir,
-                self.backup_before_sync,
-                self.max_backups,
-            ),
+            self._backups_card,
         )
+
+    def _current_device_context(self) -> tuple[str, str] | None:
+        """Return (iPod root, settings key) for the selected device."""
+        try:
+            from ..app import DeviceManager
+            from settings import device_settings_key
+            device = DeviceManager.get_instance()
+            root = device.device_path or ""
+            if not root:
+                return None
+            return root, device_settings_key(root, device.discovered_ipod)
+        except Exception:
+            return None
+
+    def _sync_scope_availability(self) -> None:
+        has_device = self._current_device_context() is not None
+        loading_device_settings = False
+        if has_device:
+            try:
+                from ..app import DeviceManager
+                loading_device_settings = DeviceManager.get_instance().device_settings_loading
+            except Exception:
+                loading_device_settings = False
+        if hasattr(self, "_scope_device_btn"):
+            self._scope_device_btn.setEnabled(has_device)
+            self._scope_device_btn.setText("Device..." if loading_device_settings else "Device")
+            self._scope_device_btn.setToolTip(
+                "Loading device settings..."
+                if loading_device_settings
+                else ("" if has_device else "Select an iPod to edit device settings")
+            )
+        if not has_device and self._settings_scope == "device":
+            self._settings_scope = "global"
+        self._update_scope_switch_style()
+
+    def _set_section_visible(self, page_title: str, section: str, visible: bool) -> None:
+        label = self._section_labels.get((page_title, section))
+        if label is not None:
+            label.setVisible(visible)
+
+    def _set_device_rows_enabled(self, enabled: bool) -> None:
+        rows = [
+            self.accent_color,
+            self.show_art,
+            self.write_back,
+            self.compute_sound_check,
+            self.rotate_tall_photos,
+            self.fit_photo_thumbnails,
+            self.rating_strategy,
+            self.aac_encoder,
+            self.aac_quality_simple,
+            self.aac_mode,
+            self.aac_quality_value,
+            self.aac_spoken_bitrate,
+            self.prefer_lossy,
+            self.mono_for_spoken,
+            self.smart_quality_by_type,
+            self.normalize_sample_rate,
+            self.video_crf,
+            self.video_preset,
+            self.sync_workers,
+            self.scrobble_on_sync,
+            self.listenbrainz_token_row,
+            self.backup_before_sync,
+        ]
+        for row in rows:
+            row.setEnabled(enabled)
+
+    def _apply_scope_visibility(self) -> None:
+        """Show the settings that belong to the active Global/Device scope."""
+        self._sync_scope_availability()
+        device_scope = self._settings_scope == "device"
+
+        self._manage_card.setVisible(device_scope)
+        self._set_section_visible("General", "Manage", device_scope)
+        self._appearance_card.set_row_visible(self.theme_combo, not device_scope)
+        self._appearance_card.set_row_visible(self.high_contrast, not device_scope)
+        self._appearance_card.set_row_visible(self.font_scale, not device_scope)
+        self._about_card.setVisible(not device_scope)
+        self._set_section_visible("General", "About", not device_scope)
+
+        self._sync_card.set_row_visible(self.media_folder, not device_scope)
+        self._backups_card.set_row_visible(self.backup_dir, not device_scope)
+        self._backups_card.set_row_visible(self.max_backups, not device_scope)
+
+        hidden_pages = {3, 5} if device_scope else set()
+        for i, btn in enumerate(self._nav_buttons):
+            btn.setVisible(i not in hidden_pages)
+        if self._stack.currentIndex() in hidden_pages:
+            self._select_page(0)
+        else:
+            self._select_page(self._stack.currentIndex())
+
+        ignored = device_scope and self.use_global_settings.value
+        self._set_device_rows_enabled(not ignored)
+        self.use_global_settings.setEnabled(True)
+        self.reset_device_settings.setEnabled(device_scope)
+        if self._device_settings_pending:
+            self._set_device_rows_enabled(False)
+            self.use_global_settings.setEnabled(False)
+            self.reset_device_settings.setEnabled(False)
 
     # ── Settings I/O ────────────────────────────────────────────────────────
 
     def load_from_settings(self):
         """Populate UI controls from the current AppSettings."""
-        from settings import get_settings
-        s = get_settings()
+        from settings import get_device_settings_for_edit, get_global_settings
+
+        self._sync_scope_availability()
+        self._device_settings_pending = False
+        state = None
+        ctx = self._current_device_context() if self._settings_scope == "device" else None
+        if ctx:
+            root, key = ctx
+            try:
+                from ..app import DeviceManager
+                self._device_settings_pending = DeviceManager.get_instance().device_settings_loading
+            except Exception:
+                self._device_settings_pending = False
+            if self._device_settings_pending:
+                s = get_global_settings()
+            else:
+                state = get_device_settings_for_edit(root, key)
+                s = state.settings
+        else:
+            self._settings_scope = "global"
+            s = get_global_settings()
+        self._loading_settings = True
+        self.use_global_settings.value = bool(state.use_global_settings) if state else False
 
         self.media_folder.value = s.media_folder
         self.write_back.value = s.write_back_to_pc
@@ -1562,9 +1776,12 @@ class SettingsPage(QWidget):
         if idx >= 0:
             self.sync_workers.combo.setCurrentIndex(idx)
 
+        self._apply_scope_visibility()
+
         # Connect signals to auto-save (only once)
         if not hasattr(self, '_signals_connected'):
             self._signals_connected = True
+            self.use_global_settings.changed.connect(self._save)
             self.media_folder.changed.connect(self._save)
             self.write_back.changed.connect(self._save)
             self.compute_sound_check.changed.connect(self._save)
@@ -1598,6 +1815,7 @@ class SettingsPage(QWidget):
             self.backup_before_sync.changed.connect(self._save)
             self.max_backups.changed.connect(self._save)
             self.scrobble_on_sync.changed.connect(self._save)
+        self._loading_settings = False
 
     # ── AAC encoder reactive helpers ─────────────────────────────────────────
 
@@ -1724,12 +1942,10 @@ class SettingsPage(QWidget):
 
     # ── Settings persistence ─────────────────────────────────────────────────
 
-    def _save(self, *_args):
-        """Read all controls back into AppSettings and persist."""
-        from settings import get_settings
-        s = get_settings()
-
-        s.media_folder = self.media_folder.value
+    def _read_controls_into_settings(self, s, include_global_only: bool) -> None:
+        """Copy visible control values into an AppSettings object."""
+        if include_global_only:
+            s.media_folder = self.media_folder.value
         s.write_back_to_pc = self.write_back.value
         s.compute_sound_check = self.compute_sound_check.value
         s.rotate_tall_photos_for_device = self.rotate_tall_photos.value
@@ -1746,20 +1962,20 @@ class SettingsPage(QWidget):
 
         s.show_art_in_tracklist = self.show_art.value
 
-        # Theme
-        theme_keys = {
-            "Dark": "dark", "Light": "light", "System": "system",
-            "Catppuccin Mocha": "catppuccin-mocha",
-            "Catppuccin Macchiato": "catppuccin-macchiato",
-            "Catppuccin Frappé": "catppuccin-frappe",
-            "Catppuccin Latte": "catppuccin-latte",
-        }
-        old_theme, old_hc, old_accent = s.theme, s.high_contrast, s.accent_color
-        s.theme = theme_keys.get(self.theme_combo.value, "dark")
+        if include_global_only:
+            # Theme
+            theme_keys = {
+                "Dark": "dark", "Light": "light", "System": "system",
+                "Catppuccin Mocha": "catppuccin-mocha",
+                "Catppuccin Macchiato": "catppuccin-macchiato",
+                "Catppuccin Frappé": "catppuccin-frappe",
+                "Catppuccin Latte": "catppuccin-latte",
+            }
+            s.theme = theme_keys.get(self.theme_combo.value, "dark")
 
-        # High contrast
-        hc_keys = {"Off": "off", "On": "on", "System": "system"}
-        s.high_contrast = hc_keys.get(self.high_contrast.value, "off")
+            # High contrast
+            hc_keys = {"Off": "off", "On": "on", "System": "system"}
+            s.high_contrast = hc_keys.get(self.high_contrast.value, "off")
 
         # Accent color
         accent_keys = {
@@ -1770,35 +1986,23 @@ class SettingsPage(QWidget):
         }
         s.accent_color = accent_keys.get(self.accent_color.value, "blue")
 
-        s.transcode_cache_dir = self.transcode_cache_dir.value
-        # Parse max cache size
-        _size_keys = {"Unlimited": 0.0, "1 GB": 1.0, "2 GB": 2.0, "5 GB": 5.0,
-                      "10 GB": 10.0, "20 GB": 20.0, "50 GB": 50.0}
-        new_max_gb = _size_keys.get(self.max_cache_size.value, 5.0)
-        limit_lowered = (s.max_cache_size_gb > 0
-                         and (new_max_gb == 0 or new_max_gb < s.max_cache_size_gb))
-        s.max_cache_size_gb = new_max_gb
-        # If limit was lowered, evict immediately so cache stays within bounds
-        if not limit_lowered:
-            pass
-        else:
-            try:
-                from SyncEngine.transcode_cache import TranscodeCache
-                cache_dir = Path(s.transcode_cache_dir) if s.transcode_cache_dir else None
-                TranscodeCache.get_instance(cache_dir).trim_to_limit()
-                self.cache_status.refresh()
-            except Exception:
-                pass
-        s.settings_dir = self.settings_dir.value
-        s.log_dir = self.log_dir.value
-        s.ffmpeg_path = self.ffmpeg_path.value
-        s.fpcalc_path = self.fpcalc_path.value
-        s.backup_dir = self.backup_dir.value
+        if include_global_only:
+            s.transcode_cache_dir = self.transcode_cache_dir.value
+            # Parse max cache size
+            _size_keys = {"Unlimited": 0.0, "1 GB": 1.0, "2 GB": 2.0, "5 GB": 5.0,
+                          "10 GB": 10.0, "20 GB": 20.0, "50 GB": 50.0}
+            s.max_cache_size_gb = _size_keys.get(self.max_cache_size.value, 5.0)
+            s.settings_dir = self.settings_dir.value
+            s.log_dir = self.log_dir.value
+            s.ffmpeg_path = self.ffmpeg_path.value
+            s.fpcalc_path = self.fpcalc_path.value
+            s.backup_dir = self.backup_dir.value
         s.backup_before_sync = self.backup_before_sync.value
 
-        # Parse max backups
-        mb_text = self.max_backups.value
-        s.max_backups = int(mb_text) if mb_text and mb_text != "Unlimited" else 0
+        if include_global_only:
+            # Parse max backups
+            mb_text = self.max_backups.value
+            s.max_backups = int(mb_text) if mb_text and mb_text != "Unlimited" else 0
 
         # AAC encoder / mode / bitrate
         enc_key_map = {"Auto": "auto", "libfdk_aac": "libfdk_aac",
@@ -1852,25 +2056,109 @@ class SettingsPage(QWidget):
         sw_text = self.sync_workers.value
         s.sync_workers = int(sw_text) if sw_text and sw_text != "Auto" else 0
 
-        # Font scale
-        scale_keys = {
-            "75%": "75%", "90%": "90%", "100%": "100%",
-            "110%": "110%", "125%": "125%", "150%": "150%",
-        }
-        old_scale = s.font_scale
-        s.font_scale = scale_keys.get(self.font_scale.value, "100%")
+        if include_global_only:
+            # Font scale
+            scale_keys = {
+                "75%": "75%", "90%": "90%", "100%": "100%",
+                "110%": "110%", "125%": "125%", "150%": "150%",
+            }
+            s.font_scale = scale_keys.get(self.font_scale.value, "100%")
 
-        s.save()
-
-        # If theme, contrast, accent, or font scale changed, apply immediately
-        if (s.theme != old_theme or s.high_contrast != old_hc
-                or s.font_scale != old_scale or s.accent_color != old_accent):
+    def _apply_theme_change_if_needed(self, before) -> None:
+        from settings import get_settings
+        s = get_settings()
+        after = (s.theme, s.high_contrast, s.accent_color, s.font_scale)
+        if after != before:
             accent_hex = resolve_accent_color(
                 s.accent_color, self._current_ipod_image(),
             )
             Colors.apply_theme(s.theme, s.high_contrast, accent_hex)
             Metrics.apply_font_scale(s.font_scale)
             self.theme_changed.emit()
+
+    def _reset_device_settings_to_global(self) -> None:
+        """Reset the selected iPod settings file from current global settings."""
+        if self._device_settings_pending:
+            return
+        ctx = self._current_device_context()
+        if not ctx:
+            return
+
+        from settings import get_settings, reset_device_settings_to_global
+
+        effective_before = get_settings()
+        theme_before = (
+            effective_before.theme,
+            effective_before.high_contrast,
+            effective_before.accent_color,
+            effective_before.font_scale,
+        )
+
+        root, key = ctx
+        reset_device_settings_to_global(
+            root,
+            key,
+            use_global_settings=self.use_global_settings.value,
+        )
+        self.load_from_settings()
+        self._apply_theme_change_if_needed(theme_before)
+
+    def _save(self, *_args):
+        """Read controls back into the active settings scope and persist."""
+        if self._loading_settings or self._device_settings_pending:
+            return
+
+        from settings import (
+            get_device_settings_for_edit,
+            get_global_settings,
+            get_settings,
+            save_device_settings,
+        )
+
+        effective_before = get_settings()
+        theme_before = (
+            effective_before.theme,
+            effective_before.high_contrast,
+            effective_before.accent_color,
+            effective_before.font_scale,
+        )
+
+        ctx = self._current_device_context() if self._settings_scope == "device" else None
+        if ctx:
+            root, key = ctx
+            state = get_device_settings_for_edit(root, key)
+            s = state.settings
+            self._read_controls_into_settings(s, include_global_only=False)
+            save_device_settings(
+                root,
+                s,
+                use_global_settings=self.use_global_settings.value,
+                device_key=key,
+            )
+            self._apply_scope_visibility()
+            self._apply_theme_change_if_needed(theme_before)
+            return
+
+        s = get_global_settings()
+        old_cache_limit = s.max_cache_size_gb
+        self._read_controls_into_settings(s, include_global_only=True)
+        limit_lowered = (
+            old_cache_limit > 0
+            and (s.max_cache_size_gb == 0 or s.max_cache_size_gb < old_cache_limit)
+        )
+        s.save()
+
+        # If limit was lowered, evict immediately so cache stays within bounds.
+        if limit_lowered:
+            try:
+                from SyncEngine.transcode_cache import TranscodeCache
+                cache_dir = Path(s.transcode_cache_dir) if s.transcode_cache_dir else None
+                TranscodeCache.get_instance(cache_dir).trim_to_limit()
+                self.cache_status.refresh()
+            except Exception:
+                pass
+
+        self._apply_theme_change_if_needed(theme_before)
 
     @staticmethod
     def _current_ipod_image() -> str:
@@ -2131,17 +2419,63 @@ class SettingsPage(QWidget):
 
     # ── Scrobbling handlers ──────────────────────────────────────────────
 
+    def _save_listenbrainz_credentials(
+        self,
+        token: str,
+        username: str,
+        scope: str | None = None,
+        root: str | None = None,
+        key: str | None = None,
+        use_global: bool | None = None,
+    ) -> None:
+        from settings import (
+            get_device_settings_for_edit,
+            get_global_settings,
+            save_device_settings,
+        )
+
+        if scope is None:
+            ctx = self._current_device_context() if self._settings_scope == "device" else None
+            if ctx:
+                root, key = ctx
+                scope = "device"
+            else:
+                scope = "global"
+
+        if scope == "device" and root and key:
+            state = get_device_settings_for_edit(root, key)
+            s = state.settings
+            s.listenbrainz_token = token
+            s.listenbrainz_username = username
+            save_device_settings(
+                root,
+                s,
+                use_global_settings=self.use_global_settings.value if use_global is None else use_global,
+                device_key=key,
+            )
+            return
+
+        s = get_global_settings()
+        s.listenbrainz_token = token
+        s.listenbrainz_username = username
+        s.save()
+
     def _on_listenbrainz_token_changed(self, token: str):
         """Handle ListenBrainz token save/clear."""
-        from settings import get_settings
-        s = get_settings()
-
         if not token:
             # Disconnect
-            s.listenbrainz_token = ""
-            s.listenbrainz_username = ""
-            s.save()
+            self._save_listenbrainz_credentials("", "")
             return
+
+        ctx = self._current_device_context() if self._settings_scope == "device" else None
+        if ctx:
+            root, key = ctx
+            pending_scope = "device"
+            pending_use_global = self.use_global_settings.value
+        else:
+            root, key = "", ""
+            pending_scope = "global"
+            pending_use_global = False
 
         # Validate the token in a background thread
         self.listenbrainz_token_row.save_btn.setEnabled(False)
@@ -2153,7 +2487,14 @@ class SettingsPage(QWidget):
             from SyncEngine.scrobbler import listenbrainz_validate_token
             username = listenbrainz_validate_token(token)
             # Stash result so the slot can read it
-            self._pending_lb_result = (token, username or "")
+            self._pending_lb_result = (
+                token,
+                username or "",
+                pending_scope,
+                root,
+                key,
+                pending_use_global,
+            )
             from PyQt6.QtCore import QMetaObject, Qt as QtCore_Qt
             QMetaObject.invokeMethod(
                 self, "_on_listenbrainz_validate_result",
@@ -2165,7 +2506,8 @@ class SettingsPage(QWidget):
     @pyqtSlot()
     def _on_listenbrainz_validate_result(self):
         """Called on main thread after ListenBrainz token validation."""
-        token, username = self._pending_lb_result
+        pending = self._pending_lb_result
+        token, username, scope, root, key, use_global = pending
         self.listenbrainz_token_row.save_btn.setEnabled(True)
         self.listenbrainz_token_row.save_btn.setText("Connect")
 
@@ -2173,10 +2515,13 @@ class SettingsPage(QWidget):
             self.listenbrainz_token_row.set_error("Invalid token")
             return
 
-        from settings import get_settings
-        s = get_settings()
-        s.listenbrainz_token = token
-        s.listenbrainz_username = username
-        s.save()
+        self._save_listenbrainz_credentials(
+            token,
+            username,
+            scope=scope,
+            root=root,
+            key=key,
+            use_global=use_global,
+        )
 
         self.listenbrainz_token_row.set_connected(username)

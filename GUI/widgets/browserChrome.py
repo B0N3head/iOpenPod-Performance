@@ -4,7 +4,19 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
 
-from ..styles import Colors, FONT_FAMILY, Metrics
+from ..styles import Colors, FONT_FAMILY, Metrics, btn_css
+
+
+def chrome_action_btn_css() -> str:
+    """Shared style for action buttons hosted in BrowserHeroHeader."""
+    return btn_css(
+        bg=Colors.SURFACE_RAISED,
+        bg_hover=Colors.SURFACE_HOVER,
+        bg_press=Colors.SURFACE_ACTIVE,
+        fg=Colors.TEXT_PRIMARY,
+        border=f"1px solid {Colors.BORDER_SUBTLE}",
+        padding="6px 10px",
+    )
 
 
 class BrowserHeroHeader(QFrame):

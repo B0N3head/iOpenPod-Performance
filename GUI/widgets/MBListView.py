@@ -149,8 +149,8 @@ def format_rating(stars_x20: int) -> str:
     return "★" * stars + "☆" * (5 - stars)
 
 
-def format_db_id(val: int) -> str:
-    """Format 64-bit db_id as hex."""
+def format_db_track_id(val: int) -> str:
+    """Format 64-bit db_track_id as hex."""
     if not val:
         return ""
     return f"0x{val:016X}"
@@ -251,7 +251,7 @@ COLUMN_CONFIG: dict[str, tuple[str, Callable[[int], str] | None]] = {
     "artwork_id_ref": ("Artwork Ref", None),
     # ── Identifiers (diagnostic) ──
     "track_id": ("Track ID", None),
-    "db_id": ("db_id", format_db_id),
+    "db_track_id": ("db_track_id", format_db_track_id),
     "album_id": ("Album ID", None),
     "artist_id_ref": ("Artist Ref", None),
     "composer_id": ("Composer ID", None),
@@ -304,7 +304,7 @@ PREFERRED_COLUMN_ORDER = [
     # Artwork
     "artwork_count", "artwork_id_ref",
     # Identifiers
-    "track_id", "db_id", "album_id", "artist_id_ref", "composer_id",
+    "track_id", "db_track_id", "album_id", "artist_id_ref", "composer_id",
     # EQ
     "EQ Setting",
     # File path
@@ -376,7 +376,7 @@ SORTABLE_NUMERIC_KEYS = frozenset({
     "skip_when_shuffling", "remember_position", "lyrics_flag",
     # Artwork / IDs
     "artwork_count", "artwork_id_ref",
-    "track_id", "db_id", "album_id", "artist_id_ref", "composer_id",
+    "track_id", "db_track_id", "album_id", "artist_id_ref", "composer_id",
 })
 
 # Batch size for incremental population (rows per timer tick)
@@ -1823,7 +1823,7 @@ class MusicBrowserList(QFrame):
                     "artwork_count", "artwork_id_ref",
                 ]),
                 ("Identifiers", [
-                    "track_id", "db_id", "album_id",
+                    "track_id", "db_track_id", "album_id",
                     "artist_id_ref", "composer_id",
                 ]),
                 ("Other", [

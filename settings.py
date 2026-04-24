@@ -29,9 +29,51 @@ import json
 import threading
 import os
 import sys
+import base64
+import copy
+import hashlib
 from dataclasses import dataclass, asdict, field
 from importlib.metadata import version as _pkg_version
 from typing import Optional
+
+
+DEVICE_SETTINGS_RELATIVE = os.path.join("iPod_Control", "iOpenPod", "settings.json")
+DEVICE_SETTING_KEYS = (
+    "write_back_to_pc",
+    "compute_sound_check",
+    "rotate_tall_photos_for_device",
+    "fit_photo_thumbnails",
+    "rating_conflict_strategy",
+    "aac_encoder",
+    "aac_mode",
+    "aac_music_bitrate",
+    "aac_vbr_level",
+    "aac_spoken_bitrate",
+    "video_crf",
+    "video_preset",
+    "prefer_lossy",
+    "sync_workers",
+    "normalize_sample_rate",
+    "mono_for_spoken",
+    "smart_quality_by_type",
+    "show_art_in_tracklist",
+    "accent_color",
+    "scrobble_on_sync",
+    "listenbrainz_token",
+    "listenbrainz_username",
+    "backup_before_sync",
+)
+DEVICE_SECRET_KEYS = {"listenbrainz_token"}
+
+
+def _normalized_device_mount_key(ipod_root: str) -> str:
+    if not ipod_root:
+        return ""
+    return os.path.normcase(os.path.abspath(ipod_root))
+
+
+def _normalized_device_identity_value(value) -> str:
+    return str(value or "").replace(" ", "").strip().upper()
 
 
 def get_version() -> str:
@@ -339,6 +381,10 @@ class AppSettings:
             _clear_transcoder_caches()
         except Exception:
             pass
+        try:
+            refresh_effective_settings()
+        except Exception:
+            pass
 
     @staticmethod
     def _write_redirect(default_dir: str, custom_dir: str) -> None:
@@ -399,25 +445,481 @@ class AppSettings:
         return settings
 
 
+@dataclass
+class DeviceSettingsState:
+    """Loaded on-iPod settings plus metadata for the Settings page."""
+
+    settings: AppSettings
+    use_global_settings: bool = False
+    exists: bool = False
+    path: str = ""
+
+
+def _copy_settings(settings: AppSettings) -> AppSettings:
+    """Return a detached copy of settings, including mutable fields."""
+    return copy.deepcopy(settings)
+
+
+def _copy_device_settings_state(state: DeviceSettingsState) -> DeviceSettingsState:
+    """Return a detached copy of loaded device settings state."""
+    return DeviceSettingsState(
+        settings=_copy_settings(state.settings),
+        use_global_settings=bool(state.use_global_settings),
+        exists=bool(state.exists),
+        path=state.path,
+    )
+
+
+def _coerce_setting_value(current_value, value):
+    expected_type = type(current_value)
+    if expected_type is bool:
+        return value if isinstance(value, bool) else None
+    if expected_type is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return None
+    if expected_type is int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+    if expected_type is list:
+        return value if isinstance(value, list) else None
+    return value if isinstance(value, expected_type) else None
+
+
+def _apply_settings_values(settings: AppSettings, data: dict, allowed_keys) -> None:
+    for key in allowed_keys:
+        if key not in data or not hasattr(settings, key):
+            continue
+        coerced = _coerce_setting_value(getattr(settings, key), data[key])
+        if coerced is not None:
+            setattr(settings, key, coerced)
+
+
+def device_settings_path(ipod_root: str) -> str:
+    return os.path.join(ipod_root, DEVICE_SETTINGS_RELATIVE)
+
+
+def has_device_settings(ipod_root: str) -> bool:
+    return bool(ipod_root) and os.path.exists(device_settings_path(ipod_root))
+
+
+def device_settings_key(ipod_root: str = "", device_info=None) -> str:
+    """Build a stable-ish key for lightly obfuscating on-device secrets."""
+    candidates = []
+    if device_info is not None:
+        for attr in ("firewire_guid", "serial", "serial_number", "model_number"):
+            value = _normalized_device_identity_value(getattr(device_info, attr, ""))
+            if value:
+                candidates.append(value)
+    if candidates:
+        return "|".join(candidates)
+
+    mount_key = _normalized_device_mount_key(ipod_root)
+    if mount_key:
+        return mount_key
+    return "unknown-device"
+
+
+def _device_key_candidates(
+    device_key: str = "",
+    ipod_root: str = "",
+    stored_hint: str = "",
+) -> list[str]:
+    mount_key = _normalized_device_mount_key(ipod_root)
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    _add(stored_hint)
+    _add(device_key)
+
+    for candidate in tuple(candidates):
+        if mount_key and candidate not in {mount_key, "unknown-device"}:
+            # Backward compatibility for the earlier branch behavior that
+            # mixed stable device identity with the current mount path.
+            _add(f"{candidate}|{mount_key}")
+
+    _add(mount_key)
+    if not candidates:
+        _add("unknown-device")
+    return candidates
+
+
+def _secret_key(device_key: str, nonce: bytes = b"") -> bytes:
+    seed = f"iOpenPod device settings v1|{device_key or 'unknown-device'}".encode("utf-8")
+    return hashlib.sha256(seed + nonce).digest()
+
+
+def _xor_stream(key: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hashlib.sha256(key + counter.to_bytes(8, "big")).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def _encrypt_secret(value: str, device_key: str) -> str:
+    if not value:
+        return ""
+    raw = value.encode("utf-8")
+    nonce = os.urandom(16)
+    key = _secret_key(device_key, nonce)
+    stream = _xor_stream(key, len(raw))
+    cipher = bytes(a ^ b for a, b in zip(raw, stream))
+    return "xor1:{nonce}:{cipher}".format(
+        nonce=base64.urlsafe_b64encode(nonce).decode("ascii"),
+        cipher=base64.urlsafe_b64encode(cipher).decode("ascii"),
+    )
+
+
+def _decrypt_secret(value: str, device_key: str) -> str:
+    if not value or not isinstance(value, str):
+        return ""
+    if not value.startswith("xor1:"):
+        return value
+    try:
+        _prefix, nonce_b64, cipher_b64 = value.split(":", 2)
+        nonce = base64.urlsafe_b64decode(nonce_b64.encode("ascii"))
+        cipher = base64.urlsafe_b64decode(cipher_b64.encode("ascii"))
+        key = _secret_key(device_key, nonce)
+        stream = _xor_stream(key, len(cipher))
+        raw = bytes(a ^ b for a, b in zip(cipher, stream))
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _decrypt_secret_for_device(
+    value: str,
+    *,
+    device_key: str,
+    ipod_root: str = "",
+    stored_hint: str = "",
+) -> str:
+    if not value or not isinstance(value, str):
+        return ""
+    if not value.startswith("xor1:"):
+        return value
+
+    for candidate in _device_key_candidates(
+        device_key=device_key,
+        ipod_root=ipod_root,
+        stored_hint=stored_hint,
+    ):
+        decrypted = _decrypt_secret(value, candidate)
+        if decrypted:
+            return decrypted
+    return ""
+
+
+def _serialized_device_settings(settings: AppSettings, device_key: str) -> dict:
+    data = {}
+    for key in DEVICE_SETTING_KEYS:
+        value = getattr(settings, key)
+        if key in DEVICE_SECRET_KEYS:
+            value = _encrypt_secret(value, device_key)
+        data[key] = value
+    return data
+
+
+def _clear_transcoder_caches() -> None:
+    try:
+        from SyncEngine.transcoder import clear_caches as _clear_caches
+        _clear_caches()
+    except Exception:
+        pass
+
+
+def _load_device_settings_unlocked(
+    ipod_root: str,
+    device_key: str = "",
+    base_settings: AppSettings | None = None,
+) -> DeviceSettingsState:
+    base = _copy_settings(base_settings or _get_global_settings_unlocked())
+    path = device_settings_path(ipod_root)
+    if not ipod_root or not os.path.exists(path):
+        return DeviceSettingsState(settings=base, exists=False, path=path)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return DeviceSettingsState(settings=base, exists=True, path=path)
+
+    if not isinstance(raw, dict):
+        return DeviceSettingsState(settings=base, exists=True, path=path)
+
+    use_global = bool(raw.get("use_global_settings", False))
+    data = raw.get("settings", raw)
+    if not isinstance(data, dict):
+        data = {}
+    stored_key_hint = str(raw.get("device_key_hint", "") or "")
+
+    decoded = dict(data)
+    for key in DEVICE_SECRET_KEYS:
+        if key in decoded and isinstance(decoded[key], str):
+            decoded[key] = _decrypt_secret_for_device(
+                decoded[key],
+                device_key=device_key,
+                ipod_root=ipod_root,
+                stored_hint=stored_key_hint,
+            )
+
+    _apply_settings_values(base, decoded, DEVICE_SETTING_KEYS)
+    return DeviceSettingsState(
+        settings=base,
+        use_global_settings=use_global,
+        exists=True,
+        path=path,
+    )
+
+
+def load_device_settings(
+    ipod_root: str,
+    device_key: str = "",
+    base_settings: AppSettings | None = None,
+) -> DeviceSettingsState:
+    if base_settings is None:
+        with _settings_lock:
+            base_settings = _copy_settings(_get_global_settings_unlocked())
+    return _load_device_settings_unlocked(ipod_root, device_key, base_settings)
+
+
+def get_device_settings_for_edit(
+    ipod_root: str,
+    device_key: str = "",
+) -> DeviceSettingsState:
+    """Load device settings, or initialize an unsaved edit copy from globals."""
+    active_state = get_active_device_settings_state(ipod_root, device_key)
+    if active_state is not None:
+        return active_state
+    return load_device_settings(ipod_root, device_key, get_global_settings())
+
+
+def save_device_settings(
+    ipod_root: str,
+    settings: AppSettings,
+    use_global_settings: bool = False,
+    device_key: str = "",
+) -> None:
+    global _effective_instance, _active_device_state
+    global _active_device_root, _active_device_key, _active_device_use_global
+    path = device_settings_path(ipod_root)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    payload = {
+        "version": 1,
+        "use_global_settings": bool(use_global_settings),
+        "settings": _serialized_device_settings(settings, device_key),
+    }
+    if device_key and device_key != "unknown-device":
+        payload["device_key_hint"] = device_key
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+    _clear_transcoder_caches()
+    with _settings_lock:
+        if _active_device_root and os.path.normcase(os.path.abspath(_active_device_root)) == os.path.normcase(os.path.abspath(ipod_root)):
+            state = DeviceSettingsState(
+                settings=_copy_settings(settings),
+                use_global_settings=bool(use_global_settings),
+                exists=True,
+                path=path,
+            )
+            global_settings = _get_global_settings_unlocked()
+            _active_device_root = ipod_root or ""
+            _active_device_key = device_key or ""
+            _active_device_use_global = bool(use_global_settings)
+            _active_device_state = state
+            _effective_instance = (
+                global_settings if use_global_settings else state.settings
+            )
+
+
+def reset_device_settings_to_global(
+    ipod_root: str,
+    device_key: str = "",
+    use_global_settings: bool = False,
+) -> AppSettings:
+    """Replace the on-iPod settings file with current global device settings."""
+    settings = _copy_settings(get_global_settings())
+    save_device_settings(
+        ipod_root,
+        settings,
+        use_global_settings=use_global_settings,
+        device_key=device_key,
+    )
+    return settings
+
+
 # ── Singleton accessor ──────────────────────────────────────────────────────
 
-_instance: Optional[AppSettings] = None
-_settings_lock = threading.Lock()
+_global_instance: Optional[AppSettings] = None
+_effective_instance: Optional[AppSettings] = None
+_active_device_state: Optional[DeviceSettingsState] = None
+_active_device_root: str = ""
+_active_device_key: str = ""
+_active_device_use_global: bool = False
+_settings_lock = threading.RLock()
+
+
+def _get_global_settings_unlocked() -> AppSettings:
+    global _global_instance, _effective_instance
+    if _global_instance is None:
+        _global_instance = AppSettings.load()
+    if _effective_instance is None:
+        _effective_instance = _global_instance
+    return _global_instance
+
+
+def get_global_settings() -> AppSettings:
+    """Get the PC/global settings instance."""
+    with _settings_lock:
+        return _get_global_settings_unlocked()
+
+
+def _activate_device_settings_unlocked(
+    ipod_root: str,
+    device_key: str = "",
+) -> DeviceSettingsState:
+    global _effective_instance, _active_device_state
+    global _active_device_root, _active_device_key, _active_device_use_global
+    global_settings = _get_global_settings_unlocked()
+    state = _load_device_settings_unlocked(ipod_root, device_key, global_settings)
+    _active_device_root = ipod_root or ""
+    _active_device_key = device_key or ""
+    _active_device_use_global = bool(state.use_global_settings)
+    _active_device_state = _copy_device_settings_state(state)
+    _effective_instance = global_settings if (not state.exists or state.use_global_settings) else state.settings
+    return state
+
+
+def apply_loaded_device_settings(
+    ipod_root: str,
+    device_key: str,
+    state: DeviceSettingsState,
+) -> AppSettings:
+    """Activate a device-settings state that was loaded off the UI thread."""
+    global _effective_instance, _active_device_state
+    global _active_device_root, _active_device_key, _active_device_use_global
+    with _settings_lock:
+        global_settings = _get_global_settings_unlocked()
+        state_copy = _copy_device_settings_state(state)
+        _active_device_root = ipod_root or ""
+        _active_device_key = device_key or ""
+        _active_device_use_global = bool(state_copy.use_global_settings)
+        _active_device_state = state_copy
+        _effective_instance = (
+            global_settings
+            if (not state_copy.exists or state_copy.use_global_settings)
+            else state_copy.settings
+        )
+        return _effective_instance
+
+
+def activate_device_settings(ipod_root: str, device_key: str = "") -> DeviceSettingsState:
+    """Activate on-device settings for the selected iPod, if present."""
+    with _settings_lock:
+        return _activate_device_settings_unlocked(ipod_root, device_key)
+
+
+def clear_device_settings() -> AppSettings:
+    """Return to the global settings profile."""
+    global _effective_instance, _active_device_state
+    global _active_device_root, _active_device_key, _active_device_use_global
+    with _settings_lock:
+        _active_device_root = ""
+        _active_device_key = ""
+        _active_device_use_global = False
+        _active_device_state = None
+        _effective_instance = _get_global_settings_unlocked()
+        return _effective_instance
+
+
+def get_active_device_settings_state(
+    ipod_root: str = "",
+    device_key: str = "",
+) -> DeviceSettingsState | None:
+    """Return the active device settings state without reading the iPod."""
+    with _settings_lock:
+        if _active_device_state is None or not _active_device_root:
+            return None
+        if ipod_root:
+            active_root = os.path.normcase(os.path.abspath(_active_device_root))
+            requested_root = os.path.normcase(os.path.abspath(ipod_root))
+            if active_root != requested_root:
+                return None
+        if device_key and device_key != _active_device_key:
+            return None
+        return _copy_device_settings_state(_active_device_state)
+
+
+def refresh_effective_settings() -> AppSettings:
+    """Rebuild the effective settings after global settings were saved."""
+    global _effective_instance, _active_device_state
+    with _settings_lock:
+        global_settings = _get_global_settings_unlocked()
+        if _active_device_root:
+            state = _active_device_state
+            if state is not None and state.exists and not state.use_global_settings:
+                refreshed = _copy_settings(global_settings)
+                for key in DEVICE_SETTING_KEYS:
+                    if hasattr(refreshed, key) and hasattr(state.settings, key):
+                        setattr(refreshed, key, getattr(state.settings, key))
+                _active_device_state = DeviceSettingsState(
+                    settings=refreshed,
+                    use_global_settings=state.use_global_settings,
+                    exists=state.exists,
+                    path=state.path,
+                )
+                _effective_instance = refreshed
+                effective = refreshed
+            else:
+                _effective_instance = global_settings
+                effective = global_settings
+        else:
+            _effective_instance = global_settings
+            effective = global_settings
+        assert effective is not None
+        return effective
 
 
 def get_settings() -> AppSettings:
-    """Get the global settings instance (loaded once on first access)."""
-    global _instance
-    if _instance is None:
-        with _settings_lock:
-            if _instance is None:
-                _instance = AppSettings.load()
-    return _instance
+    """Get settings currently effective for the selected device."""
+    global _effective_instance
+    with _settings_lock:
+        if _effective_instance is None:
+            _effective_instance = _get_global_settings_unlocked()
+        return _effective_instance
 
 
 def reload_settings() -> AppSettings:
-    """Force reload from disk."""
-    global _instance
+    """Force reload from disk, preserving the active device overlay."""
+    global _global_instance, _effective_instance
     with _settings_lock:
-        _instance = AppSettings.load()
-    return _instance
+        _global_instance = AppSettings.load()
+        if _active_device_root:
+            _activate_device_settings_unlocked(_active_device_root, _active_device_key)
+            effective = _effective_instance
+        else:
+            effective = _global_instance
+            _effective_instance = effective
+    assert effective is not None
+    return effective

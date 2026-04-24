@@ -23,7 +23,12 @@ from ..styles import (
     make_detail_row, make_separator, make_section_header,
 )
 from ..glyphs import glyph_icon, glyph_pixmap
-from .browserChrome import BrowserHeroHeader, BrowserPane, style_browser_splitter
+from .browserChrome import (
+    BrowserHeroHeader,
+    BrowserPane,
+    chrome_action_btn_css,
+    style_browser_splitter,
+)
 from .formatters import (
     format_duration_human,
     format_mhsd5_type,
@@ -283,9 +288,9 @@ class PlaylistInfoCard(QFrame):
         if pl_id_copy:
             self._add_detail_row("Playlist ID Copy", f"0x{pl_id_copy:016X}")
 
-        db_id = playlist.get("db_id_2", 0)
-        if db_id:
-            self._add_detail_row("Database ID", f"0x{db_id:016X}")
+        database_id_2 = playlist.get("db_id_2", 0)
+        if database_id_2:
+            self._add_detail_row("Database ID", f"0x{database_id_2:016X}")
 
         flag1 = playlist.get("flag1", 0)
         flag2 = playlist.get("flag2", 0)
@@ -302,9 +307,9 @@ class PlaylistInfoCard(QFrame):
         string_mhod_count = playlist.get("string_mhod_child_count", 0)
         self._add_detail_row("String MHODs", str(string_mhod_count))
 
-        db_id_2 = playlist.get("db_id_2", 0)
-        if db_id_2:
-            self._add_detail_row("DB ID 2", f"0x{db_id_2:016X}")
+        database_id_2 = playlist.get("db_id_2", 0)
+        if database_id_2:
+            self._add_detail_row("DB ID 2", f"0x{database_id_2:016X}")
 
         lib_indices = playlist.get("library_indices", [])
         if lib_indices:
@@ -689,28 +694,14 @@ class PlaylistBrowser(QFrame):
         self._new_playlist_btn = QPushButton("New Playlist")
         self._new_playlist_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.Bold))
         self._new_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._new_playlist_btn.setStyleSheet(btn_css(
-            bg=Colors.ACCENT_DIM,
-            bg_hover=Colors.ACCENT_HOVER,
-            bg_press=Colors.ACCENT_PRESS,
-            fg=Colors.ACCENT,
-            border=f"1px solid {Colors.ACCENT_BORDER}",
-            padding="6px 10px",
-        ))
+        self._new_playlist_btn.setStyleSheet(chrome_action_btn_css())
         self._new_playlist_btn.clicked.connect(self._onNewPlaylistButton)
         self._header.actions_layout.addWidget(self._new_playlist_btn)
 
         self._import_playlist_btn = QPushButton("Import Playlist")
         self._import_playlist_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self._import_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._import_playlist_btn.setStyleSheet(btn_css(
-            bg=Colors.SURFACE_RAISED,
-            bg_hover=Colors.SURFACE_HOVER,
-            bg_press=Colors.SURFACE_ACTIVE,
-            fg=Colors.TEXT_PRIMARY,
-            border=f"1px solid {Colors.BORDER_SUBTLE}",
-            padding="6px 10px",
-        ))
+        self._import_playlist_btn.setStyleSheet(chrome_action_btn_css())
         self._import_playlist_btn.clicked.connect(self._onImportPlaylist)
         self._header.actions_layout.addWidget(self._import_playlist_btn)
         self._header.actions_layout.addStretch()
@@ -1756,12 +1747,12 @@ class _PlaylistImportWorker(QThread):
             cache = iTunesDBCache.get_instance()
             track_id_index = cache.get_track_id_index()
 
-            loc_to_dbid: dict[str, int] = {}
+            loc_to_db_track_id: dict[str, int] = {}
             for track in track_id_index.values():
                 loc = track.get("Location", "")
-                db_id = track.get("db_id")
-                if loc and db_id:
-                    loc_to_dbid[loc.lower()] = db_id
+                db_track_id = track.get("db_track_id", track.get("db_id"))
+                if loc and db_track_id:
+                    loc_to_db_track_id[loc.lower()] = db_track_id
 
             def _path_to_location(p: Path) -> str:
                 try:
@@ -1770,7 +1761,7 @@ class _PlaylistImportWorker(QThread):
                     return ""
                 return ":" + str(rel).replace("\\", ":").replace("/", ":")
 
-            playlist_db_ids: list[int] = []
+            playlist_db_track_ids: list[int] = []
             needs_fingerprint: list[str] = []
             already_present_fps: list[str] = []
             fast_path_count = 0
@@ -1779,9 +1770,9 @@ class _PlaylistImportWorker(QThread):
                 fname = Path(p).name
                 loc = _path_to_location(Path(p))
                 if loc:
-                    db_id = loc_to_dbid.get(loc.lower())
-                    if db_id is not None:
-                        playlist_db_ids.append(db_id)
+                    db_track_id = loc_to_db_track_id.get(loc.lower())
+                    if db_track_id is not None:
+                        playlist_db_track_ids.append(db_track_id)
                         fast_path_count += 1
                         self.progress.emit(i + 1, total, f"On iPod: {fname}")
                         continue
@@ -1862,7 +1853,7 @@ class _PlaylistImportWorker(QThread):
                     self.failed.emit(f"Sync failed: {err}")
                     return
 
-            # ── 6. Resolve db_ids for fingerprint-matched tracks ────────────
+            # ── 6. Resolve db_track_ids for fingerprint-matched tracks ──────
             if already_present_fps or to_add:
                 self.progress.emit(0, 0, "Resolving track IDs…")
                 final_mapping = MappingManager(self._ipod_path).load()
@@ -1870,26 +1861,26 @@ class _PlaylistImportWorker(QThread):
                 for fp in already_present_fps:
                     entries = final_mapping.get_entries(fp)
                     if entries:
-                        playlist_db_ids.append(entries[0].db_id)
+                        playlist_db_track_ids.append(entries[0].db_track_id)
 
                 for item in to_add:
                     if item.fingerprint is None:
                         continue
                     entries = final_mapping.get_entries(item.fingerprint)
                     if entries:
-                        playlist_db_ids.append(entries[0].db_id)
+                        playlist_db_track_ids.append(entries[0].db_track_id)
 
-            if not playlist_db_ids:
+            if not playlist_db_track_ids:
                 self.failed.emit("No tracks could be matched to iPod database IDs.")
                 return
 
             # ── 7. Write playlist ───────────────────────────────────────────
             self.progress.emit(0, 0, f"Writing playlist '{playlist_name}'…")
 
-            # Read DB first so we can build the db_id → tid map.
+            # Read DB first so we can build the db_track_id → tid map.
             # _build_regular_playlists expects playlist items to use the
-            # internal track_id (tid), NOT the db_id — it then converts
-            # tid → db_id via old_tid_to_db_id.  Using db_ids directly
+            # internal track_id (tid), NOT the db_track_id — it then converts
+            # tid → db_track_id via old_tid_to_db_track_id.  Using db_track_ids directly
             # causes every item to be silently dropped (empty playlist).
             executor2 = SyncExecutor(self._ipod_path)
             existing_db = executor2._read_existing_database()
@@ -1897,16 +1888,16 @@ class _PlaylistImportWorker(QThread):
             existing_playlists_raw = list(existing_db["playlists"])
             existing_smart_raw = list(existing_db["smart_playlists"])
 
-            db_id_to_tid: dict[int, int] = {}
+            db_track_id_to_tid: dict[int, int] = {}
             for t in existing_tracks_data:
                 tid = t.get("track_id", 0)
-                db_id = t.get("db_id", 0)
-                if tid and db_id:
-                    db_id_to_tid[db_id] = tid
+                db_track_id = t.get("db_track_id", t.get("db_id", 0))
+                if tid and db_track_id:
+                    db_track_id_to_tid[db_track_id] = tid
 
             playlist_items = []
-            for db_id in playlist_db_ids:
-                tid = db_id_to_tid.get(db_id)
+            for db_track_id in playlist_db_track_ids:
+                tid = db_track_id_to_tid.get(db_track_id)
                 if tid:
                     playlist_items.append({"track_id": tid})
                 # If tid not found the track isn't in the DB — skip silently

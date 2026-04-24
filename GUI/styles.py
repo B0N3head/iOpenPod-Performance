@@ -7,6 +7,8 @@ every widget draws from a single visual language.
 
 from __future__ import annotations
 
+import colorsys
+import re
 import sys
 from typing import TYPE_CHECKING
 
@@ -416,6 +418,12 @@ class Colors:
     SYNC_MAGENTA = _DARK_PALETTE["SYNC_MAGENTA"]
     SYNC_ORANGE = _DARK_PALETTE["SYNC_ORANGE"]
 
+    # Accent colors are normalized toward this contrast against the app
+    # background so red, blue, gold, and artwork-derived colors read with
+    # similar visual strength across themes.
+    ACCENT_CONTRAST_TARGET = 3.35
+    GRID_ART_CONTRAST_TARGET = 3.35
+
     # ── Semantic playlist / category color tuples (r, g, b) ──
     PLAYLIST_SMART: tuple[int, int, int] = (128, 90, 213)
     PLAYLIST_PODCAST: tuple[int, int, int] = (46, 160, 67)
@@ -519,6 +527,15 @@ class Colors:
             if rgb is not None:
                 resolved.update(_accent_overrides(*rgb, is_dark))
 
+        # Normalize every app accent, including theme defaults and iPod-matched
+        # accents, so the chosen hue has a consistent contrast from the window.
+        accent_rgb = _css_rgb_tuple(resolved.get("ACCENT", ""))
+        bg_rgb = _css_rgb_tuple(resolved.get("BG_DARK", ""))
+        if accent_rgb is not None and bg_rgb is not None:
+            target = 4.5 if hc else cls.ACCENT_CONTRAST_TARGET
+            accent_rgb = _normalize_rgb_for_contrast(accent_rgb, bg_rgb, target)
+            resolved.update(_accent_overrides(*accent_rgb, is_dark))
+
         # Apply all palette values to class attributes
         for key, value in resolved.items():
             setattr(cls, key, value)
@@ -533,7 +550,7 @@ class Colors:
         # If a custom accent color was applied, use it for PLAYLIST_REGULAR
         # so the default track title bar color matches the user's accent choice.
         if accent_color and accent_color not in ("blue", "match-ipod"):
-            rgb = _parse_accent_hex(accent_color)
+            rgb = _css_rgb_tuple(cls.ACCENT)
             if rgb is not None:
                 cls.PLAYLIST_REGULAR = rgb
 
@@ -596,6 +613,122 @@ def _parse_accent_hex(hex_str: str) -> tuple[int, int, int] | None:
         except ValueError:
             return None
     return None
+
+
+def _clamp_byte(value: float) -> int:
+    return max(0, min(255, int(round(value))))
+
+
+def _css_rgb_tuple(css: str) -> tuple[int, int, int] | None:
+    """Parse a CSS-ish color into an RGB tuple."""
+    color = QColor(css)
+    if color.isValid():
+        return color.red(), color.green(), color.blue()
+
+    match = re.match(
+        r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)",
+        str(css).strip(),
+    )
+    if match:
+        return (
+            _clamp_byte(int(match.group(1))),
+            _clamp_byte(int(match.group(2))),
+            _clamp_byte(int(match.group(3))),
+        )
+    return None
+
+
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
+    """WCAG relative luminance for an RGB tuple."""
+    def _linear(channel: int) -> float:
+        value = channel / 255.0
+        if value <= 0.03928:
+            return value / 12.92
+        return ((value + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (_linear(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast_ratio(
+    a: tuple[int, int, int],
+    b: tuple[int, int, int],
+) -> float:
+    la = _relative_luminance(a)
+    lb = _relative_luminance(b)
+    lighter = max(la, lb)
+    darker = min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _normalize_rgb_for_contrast(
+    rgb: tuple[int, int, int],
+    background: tuple[int, int, int],
+    target_ratio: float,
+) -> tuple[int, int, int]:
+    """Preserve hue/saturation while moving lightness toward target contrast."""
+    target_ratio = max(1.0, float(target_ratio))
+    h, lightness, saturation = colorsys.rgb_to_hls(
+        rgb[0] / 255.0,
+        rgb[1] / 255.0,
+        rgb[2] / 255.0,
+    )
+
+    best_rgb = rgb
+    best_score = (float("inf"), float("inf"))
+    # Sampling is intentionally used instead of assuming perfect monotonicity:
+    # HLS-to-RGB clipping and gamma contrast make edge cases a bit lumpy.
+    for step in range(256):
+        candidate_l = step / 255.0
+        cr, cg, cb = colorsys.hls_to_rgb(h, candidate_l, saturation)
+        candidate = (
+            _clamp_byte(cr * 255),
+            _clamp_byte(cg * 255),
+            _clamp_byte(cb * 255),
+        )
+        ratio = _contrast_ratio(candidate, background)
+        score = (abs(ratio - target_ratio), abs(candidate_l - lightness))
+        if score < best_score:
+            best_score = score
+            best_rgb = candidate
+
+    return best_rgb
+
+
+def display_accent_rgb(
+    rgb: tuple[int, int, int],
+    background: str | tuple[int, int, int] | None = None,
+    target_ratio: float | None = None,
+) -> tuple[int, int, int]:
+    """Normalize an accent/artwork RGB color for current app background."""
+    if background is None:
+        bg_rgb = _css_rgb_tuple(Colors.BG_DARK)
+    elif isinstance(background, tuple):
+        bg_rgb = background
+    else:
+        bg_rgb = _css_rgb_tuple(background)
+
+    if bg_rgb is None:
+        bg_rgb = (26, 26, 46) if Colors._active_mode == "dark" else (240, 240, 245)
+
+    target = target_ratio
+    if target is None:
+        target = Colors.GRID_ART_CONTRAST_TARGET
+    if Colors._active_hc:
+        target = max(float(target), 4.5)
+    return _normalize_rgb_for_contrast(rgb, bg_rgb, float(target))
+
+
+def current_accent_rgb() -> tuple[int, int, int]:
+    """Return the currently active app accent as an RGB tuple."""
+    return _css_rgb_tuple(Colors.ACCENT) or Colors.PLAYLIST_REGULAR
+
+
+def text_rgb_for_background(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Pick black or white text, whichever contrasts more with ``rgb``."""
+    white = (255, 255, 255)
+    black = (18, 18, 24)
+    return white if _contrast_ratio(white, rgb) >= _contrast_ratio(black, rgb) else black
 
 
 def _accent_overrides(r: int, g: int, b: int, is_dark: bool) -> dict[str, str]:
@@ -1134,6 +1267,19 @@ def danger_btn_css() -> str:
         border=f"1px solid {Colors.DANGER_BORDER}",
         bg_disabled=Colors.SURFACE,
         fg_disabled=Colors.TEXT_DISABLED,
+    )
+
+
+def back_btn_css() -> str:
+    """Compact arrow-only back button used by full-page app chrome."""
+    size = 28
+    return btn_css(
+        padding="0px",
+        radius=Metrics.BORDER_RADIUS_SM,
+        extra=(
+            f"min-width: {size}px; max-width: {size}px; "
+            f"min-height: {size}px; max-height: {size}px;"
+        ),
     )
 
 

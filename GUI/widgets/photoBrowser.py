@@ -36,12 +36,16 @@ from ..styles import (
     Colors,
     FONT_FAMILY,
     Metrics,
-    btn_css,
     make_scroll_area,
     sidebar_nav_css,
     sidebar_nav_selected_css,
 )
-from .browserChrome import BrowserHeroHeader, BrowserPane, style_browser_splitter
+from .browserChrome import (
+    BrowserHeroHeader,
+    BrowserPane,
+    chrome_action_btn_css,
+    style_browser_splitter,
+)
 from .formatters import format_size
 from .gridHeaderBar import GridHeaderBar
 from .MBGridView import _FlowLayout
@@ -51,6 +55,7 @@ from .photoViewer import PhotoViewerPane, pil_to_pixmap
 
 class PhotoGridView(QFrame):
     currentIndexChanged = pyqtSignal(int)
+    checkedChanged = pyqtSignal(int, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -72,10 +77,22 @@ class PhotoGridView(QFrame):
         self._tiles.clear()
         self.setMinimumHeight(0)
 
-    def addPhoto(self, title: str, pixmap: QPixmap | None) -> None:
+    def addPhoto(
+        self,
+        title: str,
+        pixmap: QPixmap | None,
+        *,
+        checkable: bool = False,
+        checked: bool = False,
+    ) -> None:
         index = len(self._tiles)
-        tile = PhotoGridTile(title, parent=self)
+        tile = PhotoGridTile(title, checkable=checkable, parent=self)
         tile.setPixmap(pixmap)
+        if checkable:
+            tile.setChecked(checked)
+            tile.checked_changed.connect(
+                lambda state, idx=index: self.checkedChanged.emit(idx, state)
+            )
         tile.clicked.connect(lambda idx=index: self.setCurrentIndex(idx))
         self._tiles.append(tile)
         self._flow.addWidget(tile)
@@ -84,6 +101,11 @@ class PhotoGridView(QFrame):
         if index < 0 or index >= len(self._tiles):
             return
         self._tiles[index].setPixmap(pixmap)
+
+    def setTileChecked(self, index: int, checked: bool) -> None:
+        if index < 0 or index >= len(self._tiles):
+            return
+        self._tiles[index].setChecked(checked)
 
     def count(self) -> int:
         return len(self._tiles)
@@ -285,14 +307,7 @@ class PhotoBrowserWidget(QFrame):
         ):
             btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            btn.setStyleSheet(btn_css(
-                bg=Colors.SURFACE_RAISED,
-                bg_hover=Colors.SURFACE_HOVER,
-                bg_press=Colors.SURFACE_ACTIVE,
-                fg=Colors.TEXT_PRIMARY,
-                border=f"1px solid {Colors.BORDER_SUBTLE}",
-                padding="6px 10px",
-            ))
+            btn.setStyleSheet(chrome_action_btn_css())
             header.actions_layout.addWidget(btn)
         header.actions_layout.addStretch()
 

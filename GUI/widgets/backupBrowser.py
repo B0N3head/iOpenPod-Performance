@@ -4,10 +4,9 @@ Backup Browser Widget — full-page view for managing iPod device backups.
 Displays a list of backup snapshots with summary stats, allowing the user
 to create new backups, restore a specific snapshot, or delete old ones.
 Accessed via the sidebar "Backups" button (centralStack index 3).
-Supports multi-device: when no device is connected (or the user clicks
-"All Devices"), shows a device picker listing every device that has
-backups on this PC.  Restore is only enabled when the connected iPod
-matches the backup's device."""
+Supports multi-device: known backup devices are listed in the page sidebar,
+and selecting one shows its snapshot history. Restore is only enabled when
+the connected iPod matches the selected backup device."""
 
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtWidgets import (
@@ -17,8 +16,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 
-from ..styles import Colors, FONT_FAMILY, MONO_FONT_FAMILY, Metrics, btn_css, accent_btn_css, danger_btn_css, make_scroll_area
+from ..styles import (
+    Colors, FONT_FAMILY, MONO_FONT_FAMILY, Metrics,
+    accent_btn_css, back_btn_css, btn_css, danger_btn_css, make_scroll_area,
+)
 from ..glyphs import glyph_pixmap
+from .browserChrome import chrome_action_btn_css
 from .formatters import format_size
 from SyncEngine.eta import ETATracker
 
@@ -26,6 +29,37 @@ import logging
 import time
 
 logger = logging.getLogger(__name__)
+
+
+def _ipod_pixmap_from_meta(meta: dict | None, size: int):
+    """Return the best iPod product image for stored backup metadata."""
+    from ..ipod_images import get_ipod_image
+
+    meta = meta or {}
+    family = meta.get("family") or meta.get("model_family") or ""
+    pixmap = get_ipod_image(
+        family,
+        meta.get("generation", "") or "",
+        size=size,
+        color=meta.get("color", "") or "",
+    )
+    if pixmap and not pixmap.isNull():
+        return pixmap
+    return None
+
+
+def _ipod_color_from_meta(meta: dict | None) -> tuple[int, int, int] | None:
+    """Return the stored accent color for the resolved iPod product image."""
+    from ipod_device import color_for_image, resolve_image_filename
+
+    meta = meta or {}
+    family = meta.get("family") or meta.get("model_family") or ""
+    filename = resolve_image_filename(
+        family,
+        meta.get("generation", "") or "",
+        meta.get("color", "") or "",
+    )
+    return color_for_image(filename)
 
 
 # ── Background workers ──────────────────────────────────────────────────────
@@ -122,86 +156,87 @@ class RestoreWorker(QThread):
             self.error.emit(str(e))
 
 
-# ── Device card widget (for multi-device picker) ───────────────────────────
+class BackupDeviceNavItem(QFrame):
+    """Sidebar row representing a device with backup history."""
 
-class DeviceCard(QFrame):
-    """A clickable card representing a device that has backups."""
+    clicked = pyqtSignal(str)
 
-    clicked = pyqtSignal(str)  # device_id
-
-    def __init__(self, device_info: dict):
+    def __init__(self, device_info: dict, *, connected: bool = False):
         super().__init__()
         self._device_id = device_info["device_id"]
+        self._selected = False
+        self._connected = connected
 
-        self.setStyleSheet(f"""
-            QFrame {{
-                background: {Colors.SURFACE_ALT};
-                border: 1px solid {Colors.BORDER_SUBTLE};
-                border-radius: {Metrics.BORDER_RADIUS_LG}px;
-            }}
-            QFrame:hover {{
-                border: 1px solid {Colors.ACCENT};
-                background: {Colors.SURFACE_ACTIVE};
-            }}
-        """)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight((64))
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins((16), (16), (16), (16))
-        layout.setSpacing((12))
+        layout.setContentsMargins((8), (8), (10), (8))
+        layout.setSpacing((8))
 
-        # Device photo from manifest metadata, or fallback emoji
-        meta = device_info.get("device_meta", {})
-        icon = QLabel()
-        icon.setStyleSheet("background: transparent; border: none;")
-        icon.setFixedWidth((48))
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        if meta.get("family") and meta.get("generation"):
-            from ..ipod_images import get_ipod_image
-            pixmap = get_ipod_image(
-                meta["family"], meta["generation"],
-                size=(44), color=meta.get("color", ""),
-            )
-            if not pixmap.isNull():
-                icon.setPixmap(pixmap)
-            else:
-                icon.setText("\U0001F4F1")
-                icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_MD))
+        self._icon = QLabel()
+        self._icon.setFixedSize((38), (44))
+        self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon.setStyleSheet("background: transparent; border: none;")
+        px = _ipod_pixmap_from_meta(device_info.get("device_meta", {}), 38)
+        if px:
+            self._icon.setPixmap(px)
         else:
-            icon.setText("\U0001F4F1")
-            icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_MD))
-        layout.addWidget(icon)
+            self._icon.setText("iPod")
+            self._icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_XS))
+        layout.addWidget(self._icon)
 
-        # Info column
-        info = QVBoxLayout()
-        info.setSpacing((2))
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing((1))
 
-        name = QLabel(device_info["device_name"])
-        name.setFont(QFont(FONT_FAMILY, Metrics.FONT_XL, QFont.Weight.DemiBold))
-        name.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;")
-        info.addWidget(name)
+        self._name = QLabel(device_info.get("device_name") or self._device_id)
+        self._name.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
+        self._name.setStyleSheet("background: transparent; border: none;")
+        text_col.addWidget(self._name)
 
-        # Model subtitle (e.g. "iPod Classic · 6th Gen")
-        model_display = meta.get("display_name", "")
-        if model_display and model_display != device_info["device_name"]:
-            model_lbl = QLabel(model_display)
-            model_lbl.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-            model_lbl.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent; border: none;")
-            info.addWidget(model_lbl)
+        count = int(device_info.get("snapshot_count", 0) or 0)
+        suffix = "backup" if count == 1 else "backups"
+        sub_text = f"{count} {suffix}"
+        if connected:
+            sub_text += " · Connected"
+        self._sub = QLabel(sub_text)
+        self._sub.setFont(QFont(FONT_FAMILY, Metrics.FONT_XS))
+        self._sub.setStyleSheet("background: transparent; border: none;")
+        text_col.addWidget(self._sub)
 
-        count = device_info["snapshot_count"]
-        sub = QLabel(f"{count} backup{'s' if count != 1 else ''}")
-        sub.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        sub.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
-        info.addWidget(sub)
+        layout.addLayout(text_col, 1)
+        self._apply_style()
 
-        layout.addLayout(info, stretch=1)
+    def setSelected(self, selected: bool) -> None:
+        if self._selected == selected:
+            return
+        self._selected = selected
+        self._apply_style()
 
-        # Arrow
-        arrow = QLabel("\u203A")
-        arrow.setFont(QFont(FONT_FAMILY, Metrics.FONT_HERO))
-        arrow.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent; border: none;")
-        layout.addWidget(arrow)
+    def _apply_style(self) -> None:
+        bg = Colors.ACCENT_MUTED if self._selected else "transparent"
+        hover = Colors.ACCENT_DIM if self._selected else Colors.SURFACE_ACTIVE
+        border = Colors.ACCENT_BORDER if self._selected else "transparent"
+        name_color = Colors.ACCENT if self._selected else Colors.TEXT_PRIMARY
+        sub_color = Colors.SUCCESS if self._connected else Colors.TEXT_TERTIARY
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {bg};
+                border: 1px solid {border};
+                border-radius: {Metrics.BORDER_RADIUS_SM}px;
+            }}
+            QFrame:hover {{
+                background: {hover};
+                border: 1px solid {Colors.ACCENT_BORDER};
+            }}
+        """)
+        self._name.setStyleSheet(
+            f"color: {name_color}; background: transparent; border: none;"
+        )
+        self._sub.setStyleSheet(
+            f"color: {sub_color}; background: transparent; border: none;"
+        )
 
     def mousePressEvent(self, a0):
         if a0 and a0.button() == Qt.MouseButton.LeftButton:
@@ -345,71 +380,139 @@ class BackupBrowserWidget(QWidget):
         self._device_connected: bool = False
         self._backup_no_changes: bool = False
         self._viewing_device_name: str = ""     # display name of the viewed device
+        self._devices: list[dict] = []
+        self._device_nav_items: dict[str, BackupDeviceNavItem] = {}
+        self._current_device_info: dict = {}
 
-        outer = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # ── Title bar ───────────────────────────────────────────────────
-        title_bar = QWidget()
-        title_bar.setStyleSheet("background: transparent;")
-        tb_layout = QHBoxLayout(title_bar)
-        tb_layout.setContentsMargins((24), (16), (24), (8))
+        # ── Sidebar: back + device navigation ───────────────────────────
+        self._sidebar = QFrame()
+        self._sidebar.setObjectName("backupSidebar")
+        self._sidebar.setFixedWidth(Metrics.SIDEBAR_WIDTH)
+        self._sidebar.setStyleSheet(f"""
+            QFrame#backupSidebar {{
+                background: {Colors.SURFACE};
+                border-right: 1px solid {Colors.BORDER_SUBTLE};
+            }}
+        """)
+        sidebar_layout = QVBoxLayout(self._sidebar)
+        sidebar_layout.setContentsMargins((12), (14), (12), (12))
+        sidebar_layout.setSpacing((8))
 
-        back_btn = QPushButton("← Back")
+        back_btn = QPushButton("←")
         back_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
-        back_btn.setStyleSheet(btn_css(
-            bg="transparent",
-            bg_hover=Colors.SURFACE_ACTIVE,
-            bg_press=Colors.SURFACE_ALT,
-            fg=Colors.ACCENT,
-        ))
+        back_btn.setToolTip("Back")
+        back_btn.setStyleSheet(back_btn_css())
         back_btn.clicked.connect(self._on_close)
         self._back_btn = back_btn
-        tb_layout.addWidget(back_btn)
+        sidebar_layout.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
-        title = QLabel("Device Backups")
-        title.setFont(QFont(FONT_FAMILY, Metrics.FONT_HERO, QFont.Weight.Bold))
-        title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_label = title
-        tb_layout.addWidget(title, stretch=1)
+        nav_title = QLabel("Backups")
+        nav_title.setFont(QFont(FONT_FAMILY, Metrics.FONT_HERO, QFont.Weight.Bold))
+        nav_title.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;"
+        )
+        sidebar_layout.addWidget(nav_title)
 
-        # "All Devices" button — visible when viewing a single device's backups
-        self._all_devices_btn = QPushButton("All Devices ›")
-        self._all_devices_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
-        self._all_devices_btn.setStyleSheet(btn_css(
-            bg="transparent",
-            bg_hover=Colors.SURFACE_ACTIVE,
-            bg_press=Colors.SURFACE_ALT,
-            fg=Colors.ACCENT,
-        ))
-        self._all_devices_btn.clicked.connect(self._show_device_picker)
-        self._all_devices_btn.setVisible(False)
-        tb_layout.addWidget(self._all_devices_btn)
+        self._devices_subtitle = QLabel("")
+        self._devices_subtitle.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._devices_subtitle.setStyleSheet(
+            f"color: {Colors.TEXT_TERTIARY}; background: transparent; border: none;"
+        )
+        sidebar_layout.addWidget(self._devices_subtitle)
+
+        dev_scroll = make_scroll_area()
+        self._devices_scroll_content = QWidget()
+        self._devices_scroll_content.setStyleSheet("background: transparent;")
+        self._devices_scroll_layout = QVBoxLayout(self._devices_scroll_content)
+        self._devices_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self._devices_scroll_layout.setSpacing((4))
+        self._devices_scroll_layout.addStretch()
+        dev_scroll.setWidget(self._devices_scroll_content)
+        sidebar_layout.addWidget(dev_scroll, 1)
+        outer.addWidget(self._sidebar)
+
+        # ── Main pane: device hero + stacked content ────────────────────
+        main = QWidget()
+        main.setStyleSheet("background: transparent;")
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        self._device_hero = QFrame()
+        self._device_hero.setObjectName("backupDeviceHero")
+        self._device_hero.setStyleSheet(f"""
+            QFrame#backupDeviceHero {{
+                background: {Colors.BG_DARK};
+                border-bottom: 1px solid {Colors.BORDER_SUBTLE};
+            }}
+        """)
+        hero_layout = QHBoxLayout(self._device_hero)
+        hero_layout.setContentsMargins((24), (18), (24), (18))
+        hero_layout.setSpacing((18))
+
+        self._device_art = QLabel()
+        self._device_art.setFixedSize((112), (112))
+        self._device_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._device_art.setStyleSheet("background: transparent; border: none;")
+        hero_layout.addWidget(self._device_art, 0, Qt.AlignmentFlag.AlignTop)
+
+        hero_text = QVBoxLayout()
+        hero_text.setContentsMargins(0, 2, 0, 0)
+        hero_text.setSpacing((4))
+
+        self._title_label = QLabel("Device Backups")
+        self._title_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_PAGE_TITLE, QFont.Weight.Bold))
+        self._title_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; background: transparent;")
+        self._title_label.setWordWrap(True)
+        hero_text.addWidget(self._title_label)
+
+        self._device_model_label = QLabel("")
+        self._device_model_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        self._device_model_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent;")
+        self._device_model_label.setWordWrap(True)
+        hero_text.addWidget(self._device_model_label)
+
+        self._size_label = QLabel("")
+        self._size_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._size_label.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
+        self._size_label.setWordWrap(True)
+        hero_text.addWidget(self._size_label)
+
+        self._restore_status_label = QLabel("")
+        self._restore_status_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._restore_status_label.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
+        hero_text.addWidget(self._restore_status_label)
+
+        hero_actions = QHBoxLayout()
+        hero_actions.setSpacing((8))
 
         self._open_folder_btn = QPushButton("Open")
-        self._open_folder_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        self._open_folder_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self._open_folder_btn.setToolTip("Open backup folder")
-        self._open_folder_btn.setStyleSheet(btn_css(
-            bg="transparent",
-            bg_hover=Colors.SURFACE_ALT,
-            bg_press=Colors.SURFACE,
-            border=f"1px solid {Colors.BORDER_SUBTLE}",
-        ))
+        self._open_folder_btn.setStyleSheet(chrome_action_btn_css())
         self._open_folder_btn.clicked.connect(self._on_open_folder)
-        tb_layout.addWidget(self._open_folder_btn)
+        hero_actions.addWidget(self._open_folder_btn)
 
         self.backup_now_btn = QPushButton("Backup Now")
-        self.backup_now_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD, QFont.Weight.DemiBold))
-        self.backup_now_btn.setStyleSheet(accent_btn_css())
+        self.backup_now_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
+        self.backup_now_btn.setStyleSheet(chrome_action_btn_css())
         self.backup_now_btn.clicked.connect(self._on_backup_now)
-        tb_layout.addWidget(self.backup_now_btn)
+        hero_actions.addWidget(self.backup_now_btn)
+        hero_actions.addStretch()
+        hero_text.addSpacing((6))
+        hero_text.addLayout(hero_actions)
+        hero_text.addStretch()
 
-        outer.addWidget(title_bar)
+        hero_layout.addLayout(hero_text, 1)
+        main_layout.addWidget(self._device_hero)
 
-        # ── Stacked content (list / progress) ───────────────────────────
         self._stack = QStackedWidget()
-        outer.addWidget(self._stack)
+        main_layout.addWidget(self._stack, 1)
+        outer.addWidget(main, 1)
 
         # Page 0: Snapshot list
         self._list_page = QWidget()
@@ -417,14 +520,6 @@ class BackupBrowserWidget(QWidget):
         list_layout = QVBoxLayout(self._list_page)
         list_layout.setContentsMargins((24), (8), (24), (24))
         list_layout.setSpacing(0)
-
-        # Backup size info
-        self._size_label = QLabel("")
-        self._size_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self._size_label.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
-        list_layout.addWidget(self._size_label)
-
-        list_layout.addSpacing((8))
 
         scroll = make_scroll_area()
 
@@ -544,88 +639,76 @@ class BackupBrowserWidget(QWidget):
 
         self._stack.addWidget(self._empty_page)  # Index 2
 
-        # Page 3: Device picker (multi-device)
-        self._devices_page = QWidget()
-        self._devices_page.setStyleSheet("background: transparent;")
-        dev_layout = QVBoxLayout(self._devices_page)
-        dev_layout.setContentsMargins((24), (8), (24), (24))
-        dev_layout.setSpacing(0)
-
-        self._devices_subtitle = QLabel("")
-        self._devices_subtitle.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
-        self._devices_subtitle.setStyleSheet(
-            f"color: {Colors.TEXT_SECONDARY}; background: transparent;"
-        )
-        dev_layout.addWidget(self._devices_subtitle)
-
-        dev_layout.addSpacing((12))
-
-        dev_scroll = make_scroll_area()
-
-        self._devices_scroll_content = QWidget()
-        self._devices_scroll_content.setStyleSheet("background: transparent;")
-        self._devices_scroll_layout = QVBoxLayout(self._devices_scroll_content)
-        self._devices_scroll_layout.setContentsMargins(0, 0, 0, 0)
-        self._devices_scroll_layout.setSpacing((8))
-        self._devices_scroll_layout.addStretch()
-
-        dev_scroll.setWidget(self._devices_scroll_content)
-        dev_layout.addWidget(dev_scroll)
-
-        self._stack.addWidget(self._devices_page)  # Index 3
-
     # ── Public API ──────────────────────────────────────────────────────
 
     def refresh(self):
         """Reload the backup browser.
 
-        - Device connected → show that device's snapshots immediately.
-        - No device → show device picker if multiple devices have backups,
-          or the single device's snapshots, or the empty state.
+        The sidebar always lists known devices.  A connected iPod is included
+        even before its first backup so the user can create one immediately.
         """
         from ..app import DeviceManager
         from settings import get_settings
-        from SyncEngine.backup_manager import BackupManager, get_device_identifier
+        from SyncEngine.backup_manager import (
+            BackupManager,
+            get_device_display_name,
+            get_device_identifier,
+        )
 
         settings = get_settings()
         device = DeviceManager.get_instance()
+        devices_by_id = {
+            d["device_id"]: dict(d)
+            for d in BackupManager.list_all_devices(settings.backup_dir)
+        }
 
         # Determine connected device ID (sanitized for folder-name matching)
         if device.device_path:
             self._device_connected = True
             raw_id = get_device_identifier(device.device_path, device.discovered_ipod)
             self._connected_device_id = BackupManager._sanitize_id(raw_id)
+            connected_meta = self._device_meta_from_ipod(device.discovered_ipod)
+            connected_info = devices_by_id.get(self._connected_device_id, {})
+            connected_info.update({
+                "device_id": self._connected_device_id,
+                "device_name": get_device_display_name(device.discovered_ipod),
+                "snapshot_count": int(connected_info.get("snapshot_count", 0) or 0),
+                "device_meta": connected_meta or connected_info.get("device_meta", {}),
+            })
+            devices_by_id[self._connected_device_id] = connected_info
         else:
             self._device_connected = False
             self._connected_device_id = ""
 
-        # "Backup Now" only when a device is plugged in
-        self.backup_now_btn.setVisible(self._device_connected)
+        self._devices = sorted(
+            devices_by_id.values(),
+            key=lambda d: (
+                0 if d.get("device_id") == self._connected_device_id else 1,
+                str(d.get("device_name") or d.get("device_id") or "").lower(),
+            ),
+        )
+        self._populate_device_sidebar()
 
-        if self._device_connected:
-            # Online → jump straight to connected device's backups
-            self._show_device_backups(self._connected_device_id)
-            return
-
-        # Offline → check all devices
-        devices = BackupManager.list_all_devices(settings.backup_dir)
-
-        if not devices:
-            self._all_devices_btn.setVisible(False)
+        if not self._devices:
+            self._current_device_id = ""
+            self._current_device_info = {}
             self._show_empty(
                 "No backups found.\n\n"
                 "Connect an iPod and click 'Backup Now' to create\n"
-                "your first full device backup."
+                "your first full device backup.",
+                hide_hero=True,
             )
             return
 
-        if len(devices) == 1:
-            # Only one device — skip the picker, show its backups directly
-            self._show_device_backups(devices[0]["device_id"])
-            return
+        known_ids = {d["device_id"] for d in self._devices}
+        if self._device_connected:
+            target_id = self._connected_device_id
+        elif self._current_device_id in known_ids:
+            target_id = self._current_device_id
+        else:
+            target_id = self._devices[0]["device_id"]
 
-        # Multiple devices — show the picker
-        self._show_device_picker()
+        self._show_device_backups(target_id)
 
     def _show_device_backups(self, device_id: str):
         """Show snapshots for a specific device.
@@ -638,18 +721,15 @@ class BackupBrowserWidget(QWidget):
         settings = get_settings()
         self._current_device_id = device_id
 
-        # Determine if the "All Devices" button should be visible.
-        # Show it whenever there is more than one device with backups.
-        all_devices = BackupManager.list_all_devices(settings.backup_dir)
-        has_multiple = len(all_devices) > 1
-        self._all_devices_btn.setVisible(has_multiple)
-
         # Find device name for the title
         self._viewing_device_name = device_id
-        for d in all_devices:
+        self._current_device_info = {"device_id": device_id, "device_name": device_id}
+        for d in self._devices:
             if d["device_id"] == device_id:
                 self._viewing_device_name = d["device_name"]
+                self._current_device_info = d
                 break
+        self._set_sidebar_selection(device_id)
 
         # Can restore only if connected device matches this device's backups
         can_restore = self._device_connected and self._connected_device_id == device_id
@@ -659,6 +739,13 @@ class BackupBrowserWidget(QWidget):
         )
 
         snapshots = manager.list_snapshots()
+        total_backup_size = manager.get_backup_size()
+        self._update_device_hero(
+            self._current_device_info,
+            snapshots,
+            total_backup_size,
+            can_restore,
+        )
 
         if not snapshots:
             if self._device_connected and self._connected_device_id == device_id:
@@ -675,24 +762,8 @@ class BackupBrowserWidget(QWidget):
                 )
             return
 
-        # Update title
-        self._title_label.setText(f"{self._viewing_device_name}")
-
         # Show list page
         self._stack.setCurrentIndex(0)
-
-        # Update size label
-        total_backup_size = manager.get_backup_size()
-        mode_note = ""
-        if not can_restore:
-            if self._device_connected:
-                mode_note = "  (different device connected — restore disabled)"
-            else:
-                mode_note = "  (connect this device to restore)"
-        self._size_label.setText(
-            f"{len(snapshots)} backup{'s' if len(snapshots) != 1 else ''} · "
-            f"{format_size(total_backup_size)} total on disk{mode_note}"
-        )
 
         # Clear old cards
         while self._scroll_layout.count() > 1:  # Keep the stretch
@@ -715,52 +786,183 @@ class BackupBrowserWidget(QWidget):
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, card)
 
     def _show_device_picker(self):
-        """Show the multi-device picker page."""
-        from settings import get_settings
-        from SyncEngine.backup_manager import BackupManager
+        """Legacy entry point: focus the first sidebar device."""
+        if self._devices:
+            self._show_device_backups(self._devices[0]["device_id"])
+        else:
+            self.refresh()
 
-        settings = get_settings()
-        devices = BackupManager.list_all_devices(settings.backup_dir)
-
-        if not devices:
-            self._show_empty(
-                "No backups found.\n\n"
-                "Connect an iPod and click 'Backup Now' to create\n"
-                "your first full device backup."
-            )
-            return
-
-        self._title_label.setText("Device Backups")
-        self._all_devices_btn.setVisible(False)  # Already on the picker page
-
-        # Subtitle
-        self._devices_subtitle.setText(
-            f"{len(devices)} device{'s' if len(devices) != 1 else ''} with backups on this PC"
-        )
-
-        # Clear old device cards
+    def _populate_device_sidebar(self) -> None:
+        """Rebuild the sidebar device navigation."""
         while self._devices_scroll_layout.count() > 1:
             item = self._devices_scroll_layout.takeAt(0)
             w = item.widget() if item else None
             if w:
                 w.deleteLater()
+        self._device_nav_items.clear()
 
-        # Populate device cards
-        for dev in devices:
-            card = DeviceCard(dev)
+        count = len(self._devices)
+        if count:
+            self._devices_subtitle.setText(
+                f"{count} device{'s' if count != 1 else ''}"
+            )
+        else:
+            self._devices_subtitle.setText("No devices yet")
+
+        for dev in self._devices:
+            connected = dev.get("device_id") == self._connected_device_id
+            card = BackupDeviceNavItem(dev, connected=connected)
             card.clicked.connect(self._show_device_backups)
+            self._device_nav_items[dev["device_id"]] = card
             self._devices_scroll_layout.insertWidget(
                 self._devices_scroll_layout.count() - 1, card
             )
 
-        self._stack.setCurrentIndex(3)
+    def _set_sidebar_selection(self, device_id: str) -> None:
+        for did, item in self._device_nav_items.items():
+            item.setSelected(did == device_id)
 
-    def _show_empty(self, text: str = ""):
+    def _show_empty(self, text: str = "", *, hide_hero: bool = False):
         """Show the empty state page with optional custom text."""
-        self._title_label.setText("Device Backups")
+        self._device_hero.setVisible(not hide_hero)
+        self.backup_now_btn.setVisible(
+            bool(self._current_device_id)
+            and self._device_connected
+            and self._connected_device_id == self._current_device_id
+        )
         if text:
             self._empty_text.setText(text)
         self._stack.setCurrentIndex(2)
+
+    def _update_device_hero(
+        self,
+        device_info: dict,
+        snapshots: list,
+        total_backup_size: int,
+        can_restore: bool,
+    ) -> None:
+        """Update the device summary hero above the snapshot list."""
+        self._device_hero.show()
+        name = device_info.get("device_name") or device_info.get("device_id") or "iPod"
+        meta = device_info.get("device_meta", {}) or {}
+        self._title_label.setText(str(name))
+
+        display_name = str(meta.get("display_name") or "")
+        if display_name and display_name != name:
+            model_text = display_name
+        else:
+            model_parts = [
+                str(meta.get("family") or meta.get("model_family") or ""),
+                str(meta.get("generation") or ""),
+                str(meta.get("color") or ""),
+            ]
+            model_text = " · ".join(part for part in model_parts if part)
+        self._device_model_label.setText(model_text or "iPod backup archive")
+
+        snapshot_count = len(snapshots)
+        latest_text = snapshots[0].display_date if snapshots else "No snapshots yet"
+        self._size_label.setText(
+            f"{snapshot_count} backup{'s' if snapshot_count != 1 else ''} · "
+            f"{format_size(total_backup_size)} on disk · Latest: {latest_text}"
+        )
+
+        if can_restore:
+            status = "Connected — backup and restore available"
+            status_color = Colors.SUCCESS
+        elif self._device_connected:
+            status = "Different iPod connected — restore disabled"
+            status_color = Colors.WARNING
+        else:
+            status = "Connect this iPod to restore snapshots"
+            status_color = Colors.TEXT_TERTIARY
+        self._restore_status_label.setText(status)
+        self._restore_status_label.setStyleSheet(
+            f"color: {status_color}; background: transparent;"
+        )
+
+        self.backup_now_btn.setVisible(can_restore)
+        self._open_folder_btn.setVisible(bool(device_info.get("device_id")))
+        self._apply_device_hero_style(meta)
+        self._set_device_art(meta)
+
+    def _apply_device_hero_style(self, meta: dict) -> None:
+        """Tint the backup hero with the selected iPod's product color."""
+        color = _ipod_color_from_meta(meta)
+        self._device_art.setStyleSheet("background: transparent; border: none;")
+
+        if not color:
+            self._device_hero.setStyleSheet(f"""
+                QFrame#backupDeviceHero {{
+                    background: {Colors.BG_DARK};
+                    border-bottom: 1px solid {Colors.BORDER_SUBTLE};
+                }}
+            """)
+            self._open_folder_btn.setStyleSheet(chrome_action_btn_css())
+            self.backup_now_btn.setStyleSheet(chrome_action_btn_css())
+            return
+
+        r, g, b = color
+        if Colors._active_mode == "light":
+            glass_bg = "rgba(0, 0, 0, 20)"
+            glass_hover = "rgba(0, 0, 0, 28)"
+            glass_press = "rgba(0, 0, 0, 14)"
+            glass_border = "rgba(0, 0, 0, 24)"
+        else:
+            glass_bg = "rgba(255, 255, 255, 18)"
+            glass_hover = "rgba(255, 255, 255, 35)"
+            glass_press = "rgba(255, 255, 255, 12)"
+            glass_border = "rgba(255, 255, 255, 15)"
+
+        self._device_hero.setStyleSheet(f"""
+            QFrame#backupDeviceHero {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba({r}, {g}, {b}, 80),
+                    stop:1 {Colors.BG_DARK}
+                );
+                border-bottom: 1px solid rgba({r}, {g}, {b}, 40);
+            }}
+        """)
+        overlay_css = btn_css(
+            bg=glass_bg,
+            bg_hover=glass_hover,
+            bg_press=glass_press,
+            fg=Colors.TEXT_PRIMARY,
+            border=f"1px solid {glass_border}",
+            padding="6px 10px",
+            radius=Metrics.BORDER_RADIUS_SM,
+        )
+        self._open_folder_btn.setStyleSheet(overlay_css)
+        self.backup_now_btn.setStyleSheet(overlay_css)
+
+    def _set_device_art(self, meta: dict) -> None:
+        """Set the hero artwork from backup metadata."""
+        pixmap = _ipod_pixmap_from_meta(meta, 108)
+
+        if pixmap is not None and not pixmap.isNull():
+            self._device_art.setPixmap(pixmap)
+            self._device_art.setText("")
+            return
+
+        px = glyph_pixmap("archive", Metrics.FONT_ICON_XL, Colors.TEXT_TERTIARY)
+        if px:
+            self._device_art.setPixmap(px)
+            self._device_art.setText("")
+        else:
+            self._device_art.clear()
+            self._device_art.setText("Backups")
+            self._device_art.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+
+    @staticmethod
+    def _device_meta_from_ipod(ipod) -> dict:
+        if not ipod:
+            return {}
+        return {
+            "family": getattr(ipod, "model_family", "") or "",
+            "generation": getattr(ipod, "generation", "") or "",
+            "color": getattr(ipod, "color", "") or "",
+            "display_name": getattr(ipod, "display_name", "") or "",
+        }
 
     # ── Open backup folder ──────────────────────────────────────────────
 

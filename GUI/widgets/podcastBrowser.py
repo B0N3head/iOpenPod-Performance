@@ -57,7 +57,12 @@ from ..styles import (
     LABEL_SECONDARY,
 )
 from ..glyphs import glyph_icon, glyph_pixmap
-from .browserChrome import BrowserHeroHeader, BrowserPane, style_browser_splitter
+from .browserChrome import (
+    BrowserHeroHeader,
+    BrowserPane,
+    chrome_action_btn_css,
+    style_browser_splitter,
+)
 from .formatters import format_size
 
 log = logging.getLogger(__name__)
@@ -329,8 +334,8 @@ class PodcastBrowser(QFrame):
 
         self._add_btn = QPushButton("Add Podcast")
         self._add_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
-        self._add_btn.setStyleSheet(accent_btn_css())
-        _add_ic = glyph_icon("plus", (14), Colors.TEXT_ON_ACCENT)
+        self._add_btn.setStyleSheet(chrome_action_btn_css())
+        _add_ic = glyph_icon("plus", (14), Colors.TEXT_PRIMARY)
         if _add_ic:
             self._add_btn.setIcon(_add_ic)
             self._add_btn.setIconSize(QSize((14), (14)))
@@ -339,7 +344,7 @@ class PodcastBrowser(QFrame):
 
         self._refresh_btn = QPushButton("Refresh All")
         self._refresh_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
-        self._refresh_btn.setStyleSheet(btn_css())
+        self._refresh_btn.setStyleSheet(chrome_action_btn_css())
         _refresh_ic = glyph_icon("refresh", (14), Colors.TEXT_PRIMARY)
         if _refresh_ic:
             self._refresh_btn.setIcon(_refresh_ic)
@@ -349,7 +354,7 @@ class PodcastBrowser(QFrame):
 
         self._sync_btn = QPushButton("Sync Podcasts")
         self._sync_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
-        self._sync_btn.setStyleSheet(btn_css())
+        self._sync_btn.setStyleSheet(chrome_action_btn_css())
         _sync_ic = glyph_icon("refresh", (14), Colors.TEXT_PRIMARY)
         if _sync_ic:
             self._sync_btn.setIcon(_sync_ic)
@@ -867,7 +872,7 @@ class PodcastBrowser(QFrame):
 
         can_add = [ep for _, ep in selected if ep.status not in (STATUS_ON_IPOD, STATUS_DOWNLOADING)]
         can_remove_dl = [ep for _, ep in selected if ep.status in (STATUS_DOWNLOADED,) and ep.downloaded_path]
-        can_remove_ipod = [ep for _, ep in selected if ep.status == STATUS_ON_IPOD and ep.ipod_db_id]
+        can_remove_ipod = [ep for _, ep in selected if ep.status == STATUS_ON_IPOD and ep.ipod_db_track_id]
 
         if not can_add and not can_remove_dl and not can_remove_ipod:
             return
@@ -1456,16 +1461,21 @@ class PodcastBrowser(QFrame):
         except Exception:
             pass
 
-        tracks_by_db_id = {t.get("db_id", 0): t for t in ipod_tracks if t.get("db_id")}
+        tracks_by_db_track_id = {
+            t.get("db_track_id", t.get("db_id", 0)): t
+            for t in ipod_tracks
+            if t.get("db_track_id", t.get("db_id", 0))
+        }
 
         to_remove: list[SyncItem] = []
         bytes_to_remove = 0
         for ep in episodes:
-            ipod_track = tracks_by_db_id.get(ep.ipod_db_id)
+            ipod_track = tracks_by_db_track_id.get(ep.ipod_db_track_id)
             if not ipod_track:
                 continue
             to_remove.append(SyncItem(
                 action=SyncAction.REMOVE_FROM_IPOD,
+                db_track_id=ep.ipod_db_track_id,
                 ipod_track=ipod_track,
                 description=f"\U0001f399 {self._selected_feed.title} \u2014 {ep.title}",
             ))

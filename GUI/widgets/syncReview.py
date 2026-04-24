@@ -18,6 +18,9 @@ from PyQt6.QtGui import QFont, QColor, QPainter
 from pathlib import Path
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+import re
 
 from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction, FingerprintDiffEngine
 from SyncEngine.pc_library import PCLibrary
@@ -98,6 +101,456 @@ class SyncWorker(QThread):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+
+
+class BackSyncWorker(QThread):
+    """Background worker for Back Sync (iPod → PC for missing tracks)."""
+
+    progress = pyqtSignal(str, int, int, str)  # stage, current, total, message
+    finished = pyqtSignal(object)  # dict result
+    error = pyqtSignal(str)
+
+    def __init__(self, pc_folder: str, ipod_tracks: list, ipod_path: str):
+        super().__init__()
+        self.pc_folder = pc_folder
+        self.ipod_tracks = ipod_tracks
+        self.ipod_path = ipod_path
+
+    @staticmethod
+    def _short_label(value: str, limit: int = 72) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        keep = max(limit - 3, 8)
+        return text[:keep] + "..."
+
+    def run(self):
+        try:
+            from SyncEngine._formats import MEDIA_EXTENSIONS
+            from SyncEngine.audio_fingerprint import get_or_compute_fingerprint
+
+            # 1) Scan PC library and fingerprint all tracks.
+            self.progress.emit(
+                "backsync_scan_pc",
+                0,
+                0,
+                "Looking through your PC library for tracks that are already here.",
+            )
+            pc_library = PCLibrary(self.pc_folder)
+            pc_tracks = list(pc_library.scan(include_video=True))
+            total_pc = len(pc_tracks)
+
+            self.progress.emit(
+                "backsync_pc_fingerprint",
+                0,
+                total_pc,
+                f"Building fingerprints for {total_pc:,} PC track{'s' if total_pc != 1 else ''}.",
+            )
+            pc_fps: set[str] = set()
+            pc_fingerprint_errors: list[str] = []
+            workers = min(os.cpu_count() or 4, 8)
+
+            def _fp_pc(path: str) -> str | None:
+                return get_or_compute_fingerprint(path, write_to_file=False)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_fp_pc, t.path): t for t in pc_tracks}
+                done = 0
+                for fut in as_completed(futures):
+                    if self.isInterruptionRequested():
+                        for f in futures:
+                            f.cancel()
+                        return
+                    done += 1
+                    pc_track = futures[fut]
+                    try:
+                        fp = fut.result()
+                    except Exception as exc:
+                        fp = None
+                        pc_fingerprint_errors.append(f"{pc_track.filename}: {exc}")
+                    if fp:
+                        pc_fps.add(fp)
+                    if done == total_pc or done % 25 == 0:
+                        self.progress.emit(
+                            "backsync_pc_fingerprint",
+                            done,
+                            total_pc,
+                            (
+                                f"{done:,}/{total_pc:,} checked · "
+                                f"{len(pc_fps):,} usable fingerprints · "
+                                f"{self._short_label(pc_track.filename)}"
+                            ),
+                        )
+
+            # 2) Fingerprint iPod tracks and find tracks not present on PC.
+            ipod_candidates: list[tuple[dict, Path]] = []
+            unresolved_ipod_tracks = 0
+            unsupported_ipod_tracks = 0
+            for track in self.ipod_tracks:
+                location = track.get("Location")
+                if not location:
+                    unresolved_ipod_tracks += 1
+                    continue
+                ipod_file = self._resolve_location_to_path(location)
+                if ipod_file is None:
+                    unresolved_ipod_tracks += 1
+                    continue
+                if ipod_file.suffix.lower() not in MEDIA_EXTENSIONS:
+                    unsupported_ipod_tracks += 1
+                    continue
+                ipod_candidates.append((track, ipod_file))
+
+            total_ipod = len(ipod_candidates)
+            self.progress.emit(
+                "backsync_ipod_fingerprint",
+                0,
+                total_ipod,
+                (
+                    f"Comparing {total_ipod:,} iPod media file"
+                    f"{'s' if total_ipod != 1 else ''} against your PC library."
+                ),
+            )
+
+            to_export: list[tuple[dict, Path]] = []
+            ipod_fingerprint_errors: list[str] = []
+            for idx, (track, ipod_file) in enumerate(ipod_candidates, start=1):
+                if self.isInterruptionRequested():
+                    return
+                title = track.get("Title") or ipod_file.name
+                try:
+                    fp = get_or_compute_fingerprint(ipod_file, write_to_file=False)
+                except Exception as exc:
+                    fp = None
+                    ipod_fingerprint_errors.append(f"{title}: {exc}")
+                if fp and fp not in pc_fps:
+                    to_export.append((track, ipod_file))
+                self.progress.emit(
+                    "backsync_ipod_fingerprint",
+                    idx,
+                    total_ipod,
+                    (
+                        f"{idx:,}/{total_ipod:,} checked · "
+                        f"{len(to_export):,} missing so far · "
+                        f"{self._short_label(title)}"
+                    ),
+                )
+
+            # 3) Export iPod-only tracks to "iOpenPod Back Sync".
+            output_root = Path(self.pc_folder) / "iOpenPod Back Sync"
+            output_root.mkdir(parents=True, exist_ok=True)
+
+            artwork_ctx = self._load_artwork_context()
+
+            exported = 0
+            metadata_hydrated = 0
+            artwork_hydrated = 0
+            errors: list[str] = []
+            total_export = len(to_export)
+
+            self.progress.emit(
+                "backsync_copy",
+                0,
+                total_export,
+                (
+                    f"Exporting {total_export:,} missing track"
+                    f"{'s' if total_export != 1 else ''} to iOpenPod Back Sync."
+                ),
+            )
+
+            for idx, (track, src_path) in enumerate(to_export, start=1):
+                if self.isInterruptionRequested():
+                    return
+                try:
+                    dest_path = self._build_destination_path(output_root, track, src_path)
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_path, dest_path)
+
+                    art_bytes = self._extract_artwork_bytes(track, artwork_ctx)
+                    wrote_meta, wrote_art = self._hydrate_file_metadata(dest_path, track, art_bytes)
+                    if wrote_meta:
+                        metadata_hydrated += 1
+                    if wrote_art:
+                        artwork_hydrated += 1
+
+                    exported += 1
+                    self.progress.emit(
+                        "backsync_copy",
+                        idx,
+                        total_export,
+                        (
+                            f"{idx:,}/{total_export:,} exported · "
+                            f"{metadata_hydrated:,} tagged · "
+                            f"{artwork_hydrated:,} with artwork · "
+                            f"{self._short_label(dest_path.name)}"
+                        ),
+                    )
+                except Exception as exc:
+                    errors.append(f"{src_path.name}: {exc}")
+                    self.progress.emit(
+                        "backsync_copy",
+                        idx,
+                        total_export,
+                        (
+                            f"{idx:,}/{total_export:,} processed · "
+                            f"{exported:,} exported · "
+                            f"{len(errors):,} warning"
+                            f"{'s' if len(errors) != 1 else ''} · "
+                            f"{self._short_label(src_path.name)}"
+                        ),
+                    )
+
+            self.finished.emit({
+                "pc_scanned": total_pc,
+                "pc_fingerprint_count": len(pc_fps),
+                "pc_fingerprint_errors": pc_fingerprint_errors,
+                "ipod_scanned": total_ipod,
+                "unresolved_ipod_tracks": unresolved_ipod_tracks,
+                "unsupported_ipod_tracks": unsupported_ipod_tracks,
+                "ipod_fingerprint_errors": ipod_fingerprint_errors,
+                "missing_on_pc": total_export,
+                "exported": exported,
+                "metadata_hydrated": metadata_hydrated,
+                "artwork_hydrated": artwork_hydrated,
+                "output_folder": str(output_root),
+                "errors": errors,
+            })
+        except Exception as e:
+            if self.isInterruptionRequested():
+                return
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    def _resolve_location_to_path(self, location: str) -> Path | None:
+        """Resolve iPod Location field to an on-disk file path."""
+        if not location:
+            return None
+
+        loc = str(location).strip()
+        direct = Path(loc)
+        if direct.exists() and direct.is_file():
+            return direct
+
+        unified = loc.replace("\\", "/")
+        marker = "ipod_control"
+        marker_idx = unified.lower().find(marker)
+        if marker_idx >= 0:
+            rel = unified[marker_idx:].lstrip("/")
+            candidate = Path(self.ipod_path) / rel
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+        is_windows_abs = len(loc) >= 3 and loc[1] == ":" and loc[2] in ("\\", "/")
+        if not is_windows_abs and ":" in loc:
+            rel = loc.replace(":", "/").lstrip("/")
+            candidate = Path(self.ipod_path) / rel
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+        fallback = Path(self.ipod_path) / unified.lstrip("/")
+        if fallback.exists() and fallback.is_file():
+            return fallback
+        return None
+
+    @staticmethod
+    def _safe_component(value: str, fallback: str) -> str:
+        text = (value or "").strip() or fallback
+        text = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", text)
+        text = text.strip(" .")
+        return (text or fallback)[:120]
+
+    def _build_destination_path(self, output_root: Path, track: dict, src_path: Path) -> Path:
+        artist = self._safe_component(track.get("Artist", "Unknown Artist"), "Unknown Artist")
+        album = self._safe_component(track.get("Album", "Unknown Album"), "Unknown Album")
+        title = self._safe_component(track.get("Title", src_path.stem), src_path.stem)
+
+        track_num = track.get("track_number", 0) or 0
+        if track_num > 0:
+            base_name = f"{track_num:02d} - {title}"
+        else:
+            base_name = title
+
+        ext = src_path.suffix.lower()
+        dest_dir = output_root / artist / album
+        dest = dest_dir / f"{base_name}{ext}"
+
+        if not dest.exists():
+            return dest
+
+        i = 2
+        while True:
+            alt = dest_dir / f"{base_name} ({i}){ext}"
+            if not alt.exists():
+                return alt
+            i += 1
+
+    def _load_artwork_context(self):
+        """Load ArtworkDB context once for album-art extraction."""
+        try:
+            artworkdb_path = Path(self.ipod_path) / "iPod_Control" / "Artwork" / "ArtworkDB"
+            artwork_folder = Path(self.ipod_path) / "iPod_Control" / "Artwork"
+            if not artworkdb_path.exists() or not artwork_folder.exists():
+                return None
+
+            from GUI.imgMaker import get_artworkdb_cached
+
+            db, idx = get_artworkdb_cached(str(artworkdb_path))
+            return (db, idx, str(artwork_folder))
+        except Exception:
+            return None
+
+    def _extract_artwork_bytes(self, track: dict, artwork_ctx) -> bytes | None:
+        if not artwork_ctx:
+            return None
+
+        img_id = (
+            track.get("artwork_id_ref")
+            or track.get("mhii_link")
+            or track.get("mhiiLink")
+            or 0
+        )
+        if not img_id:
+            return None
+
+        db, idx, artwork_folder = artwork_ctx
+        try:
+            from GUI.imgMaker import find_image_by_img_id
+
+            result = find_image_by_img_id(db, artwork_folder, int(img_id), img_id_index=idx)
+            if not result:
+                return None
+            img = result[0].convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def _hydrate_file_metadata(self, file_path: Path, track: dict, art_bytes: bytes | None) -> tuple[bool, bool]:
+        """Apply iPod metadata + artwork tags to copied file.
+
+        Returns: (metadata_written, artwork_written)
+        """
+        ext = file_path.suffix.lower()
+        wrote_meta = False
+        wrote_art = False
+
+        title = track.get("Title")
+        artist = track.get("Artist")
+        album = track.get("Album")
+        album_artist = track.get("Album Artist")
+        genre = track.get("Genre")
+        composer = track.get("Composer")
+        comment = track.get("Comment")
+        year = track.get("year", 0) or 0
+        track_number = track.get("track_number", 0) or 0
+        total_tracks = track.get("total_tracks", 0) or 0
+        disc_number = track.get("disc_number", 0) or 0
+        total_discs = track.get("total_discs", 0) or 0
+
+        try:
+            if ext in (".mp3", ".aif", ".aiff", ".wav"):
+                from mutagen.id3 import ID3
+                from mutagen.id3._frames import (
+                    APIC,
+                    COMM,
+                    TALB,
+                    TCOM,
+                    TCON,
+                    TDRC,
+                    TIT2,
+                    TPE1,
+                    TPE2,
+                    TPOS,
+                    TRCK,
+                )
+                from mutagen.id3._util import ID3NoHeaderError
+
+                try:
+                    tags = ID3(str(file_path))
+                except ID3NoHeaderError:
+                    tags = ID3()
+
+                def _set_text(fid: str, frame):
+                    tags.delall(fid)
+                    tags.add(frame)
+
+                if title:
+                    _set_text("TIT2", TIT2(encoding=3, text=[str(title)]))
+                if artist:
+                    _set_text("TPE1", TPE1(encoding=3, text=[str(artist)]))
+                if album:
+                    _set_text("TALB", TALB(encoding=3, text=[str(album)]))
+                if album_artist:
+                    _set_text("TPE2", TPE2(encoding=3, text=[str(album_artist)]))
+                if genre:
+                    _set_text("TCON", TCON(encoding=3, text=[str(genre)]))
+                if composer:
+                    _set_text("TCOM", TCOM(encoding=3, text=[str(composer)]))
+                if year:
+                    _set_text("TDRC", TDRC(encoding=3, text=[str(year)]))
+                if track_number:
+                    trk = f"{track_number}/{total_tracks}" if total_tracks else str(track_number)
+                    _set_text("TRCK", TRCK(encoding=3, text=[trk]))
+                if disc_number:
+                    dsk = f"{disc_number}/{total_discs}" if total_discs else str(disc_number)
+                    _set_text("TPOS", TPOS(encoding=3, text=[dsk]))
+                if comment:
+                    tags.delall("COMM")
+                    tags.add(COMM(encoding=3, lang="eng", desc="", text=[str(comment)]))
+
+                if art_bytes:
+                    tags.delall("APIC")
+                    tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=art_bytes))
+                    wrote_art = True
+
+                tags.save(str(file_path))
+                wrote_meta = True
+
+            elif ext in (".m4a", ".m4p", ".aac", ".m4b", ".mp4", ".m4v", ".mov"):
+                from mutagen.mp4 import MP4, MP4Cover
+
+                audio = MP4(str(file_path))
+                tags = audio.tags
+                if tags is None:
+                    audio.add_tags()
+                    tags = audio.tags
+                if tags is None:
+                    return False, False
+
+                if title:
+                    tags["\xa9nam"] = [str(title)]
+                if artist:
+                    tags["\xa9ART"] = [str(artist)]
+                if album:
+                    tags["\xa9alb"] = [str(album)]
+                if album_artist:
+                    tags["aART"] = [str(album_artist)]
+                if genre:
+                    tags["\xa9gen"] = [str(genre)]
+                if composer:
+                    tags["\xa9wrt"] = [str(composer)]
+                if comment:
+                    tags["\xa9cmt"] = [str(comment)]
+                if year:
+                    tags["\xa9day"] = [str(year)]
+
+                if track_number:
+                    tags["trkn"] = [(int(track_number), int(total_tracks or 0))]
+                if disc_number:
+                    tags["disk"] = [(int(disc_number), int(total_discs or 0))]
+
+                if art_bytes:
+                    tags["covr"] = [MP4Cover(art_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                    wrote_art = True
+
+                audio.save()
+                wrote_meta = True
+
+        except Exception:
+            return False, False
+
+        return wrote_meta, wrote_art
 
 
 class SyncExecuteWorker(QThread):
@@ -638,7 +1091,7 @@ class SyncTrackRow(QFrame):
                 self.badge_label.setText(_format_duration(ipod.get("length", 0)))
             else:
                 self.title_label.setText(item.description or "Unknown track")
-                self.detail_label.setText(f"Orphaned mapping (db_id={item.db_id})")
+                self.detail_label.setText(f"Orphaned mapping (db_track_id={item.db_track_id})")
 
         elif item.action == SyncAction.UPDATE_FILE and track:
             self.title_label.setText(track.title or track.filename)
@@ -1560,6 +2013,10 @@ class SyncReviewWidget(QWidget):
         "scan_photos": "Scanning photos",
         "photo_prepare": "Preparing photos",
         "photo_write": "Writing photo database",
+        "backsync_scan_pc": "Back Sync: checking PC library",
+        "backsync_pc_fingerprint": "Back Sync: identifying PC tracks",
+        "backsync_ipod_fingerprint": "Back Sync: finding missing iPod tracks",
+        "backsync_copy": "Back Sync: exporting tracks",
     }
 
     def _friendly_stage(self, stage: str) -> str:
@@ -1603,7 +2060,26 @@ class SyncReviewWidget(QWidget):
         self.loading_label.setText("Scanning library...")
         self.progress_bar.setRange(0, 0)  # Indeterminate
         self.eta_label.setText("")
+        self.progress_detail.setText("")
         self._eta_tracker.start()
+        self._backup_hint.setVisible(False)
+        self.summary_label.setText("")
+        self._set_footer_for_state("loading")
+
+    def show_back_sync_loading(self):
+        """Show the Back Sync progress state."""
+        self._cancelled = False
+        self.stack.setCurrentIndex(0)
+        self.loading_label.setText("Preparing Back Sync")
+        self.progress_bar.setRange(0, 0)
+        self.eta_label.setText("")
+        self.progress_detail.setText(
+            "Finding iPod tracks that are missing from your PC library."
+        )
+        self.progress_detail.setTextFormat(Qt.TextFormat.PlainText)
+        self._eta_tracker.start()
+        self._backup_hint.setVisible(False)
+        self.summary_label.setText("Back Sync")
         self._set_footer_for_state("loading")
 
     def update_progress(self, stage: str, current: int, total: int, message: str):
@@ -1612,6 +2088,11 @@ class SyncReviewWidget(QWidget):
         self.loading_label.setText(friendly)
         self.progress_detail.setText(message)
         self.progress_detail.setTextFormat(Qt.TextFormat.PlainText)
+        if stage.startswith("backsync_"):
+            if total > 0:
+                self.summary_label.setText(f"{current:,} of {total:,}")
+            else:
+                self.summary_label.setText("Back Sync")
 
         if total > 0:
             self.progress_bar.setRange(0, total)
@@ -1755,8 +2236,8 @@ class SyncReviewWidget(QWidget):
             for t in ir.missing_files:
                 card.add_info_row(t.get("Title", "Unknown"),
                                   f"{t.get('Artist', 'Unknown')} · File missing from iPod")
-            for fp, db_id in ir.stale_mappings:
-                card.add_info_row(f"Stale mapping (db_id={db_id})", "Removed from mapping")
+            for fp, db_track_id in ir.stale_mappings:
+                card.add_info_row(f"Stale mapping (db_track_id={db_track_id})", "Removed from mapping")
             for orphan in ir.orphan_files[:20]:
                 card.add_info_row(orphan.name, "Orphan file deleted")
             if len(ir.orphan_files) > 20:
@@ -2336,6 +2817,7 @@ class SyncReviewWidget(QWidget):
         """Show sync completion results in a styled view."""
         self.stack.setCurrentIndex(3)  # Results view
         self._set_footer_for_state("results")
+        self.result_details.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
 
         success = getattr(result, 'success', True)
         errors = getattr(result, 'errors', [])
@@ -2477,6 +2959,135 @@ class SyncReviewWidget(QWidget):
             self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} saved (partial sync)")
         else:
             self.summary_label.setText(f"{total_actions} action{'s' if total_actions != 1 else ''} completed")
+
+    def show_back_sync_result(self, result: dict):
+        """Show Back Sync completion results in the normal in-app results view."""
+        self.stack.setCurrentIndex(3)
+        self._set_footer_for_state("results")
+
+        exported = int(result.get("exported", 0) or 0)
+        missing = int(result.get("missing_on_pc", 0) or 0)
+        pc_scanned = int(result.get("pc_scanned", 0) or 0)
+        pc_fps = int(result.get("pc_fingerprint_count", 0) or 0)
+        ipod_scanned = int(result.get("ipod_scanned", 0) or 0)
+        meta_count = int(result.get("metadata_hydrated", 0) or 0)
+        art_count = int(result.get("artwork_hydrated", 0) or 0)
+        unresolved = int(result.get("unresolved_ipod_tracks", 0) or 0)
+        unsupported = int(result.get("unsupported_ipod_tracks", 0) or 0)
+        output_folder = str(result.get("output_folder", "") or "")
+        copy_errors = list(result.get("errors", []) or [])
+        pc_fp_errors = list(result.get("pc_fingerprint_errors", []) or [])
+        ipod_fp_errors = list(result.get("ipod_fingerprint_errors", []) or [])
+        warning_count = len(copy_errors) + len(pc_fp_errors) + len(ipod_fp_errors)
+
+        def _set_result(glyph_name: str, fallback: str, color: str, title: str) -> None:
+            px = glyph_pixmap(glyph_name, Metrics.FONT_ICON_XL, color)
+            if px:
+                self.result_icon.setPixmap(px)
+                self.result_icon.setText("")
+            else:
+                self.result_icon.clear()
+                self.result_icon.setText(fallback)
+            self.result_icon.setStyleSheet(f"color: {color}; background: transparent;")
+            self.result_title.setText(title)
+            self.result_title.setStyleSheet(f"color: {color};")
+
+        if missing == 0 and warning_count == 0:
+            _set_result("check-circle", "✓", Colors.SUCCESS, "Everything Already on PC")
+        elif exported == missing and warning_count == 0:
+            _set_result("check-circle", "✓", Colors.SUCCESS, "Back Sync Complete")
+        elif exported > 0:
+            _set_result("warning-triangle", "△", Colors.WARNING, "Back Sync Completed with Warnings")
+        elif warning_count:
+            _set_result("warning-triangle", "△", Colors.WARNING, "Back Sync Completed with Warnings")
+        else:
+            _set_result("close-circle", "✕", Colors.DANGER, "Back Sync Could Not Export")
+
+        lines: list[str] = []
+        if missing:
+            color = Colors.SUCCESS if exported == missing else Colors.WARNING
+            lines.append(
+                f"<span style='color: {color};'>"
+                f"Exported {exported:,} of {missing:,} missing track"
+                f"{'s' if missing != 1 else ''}</span>"
+            )
+        else:
+            lines.append(
+                f"<span style='color: {Colors.SUCCESS};'>"
+                "No iPod-only tracks were found.</span>"
+            )
+
+        lines.append(
+            f"Compared {pc_scanned:,} PC track{'s' if pc_scanned != 1 else ''} "
+            f"and {ipod_scanned:,} iPod media file{'s' if ipod_scanned != 1 else ''} by fingerprint."
+        )
+        if pc_scanned:
+            lines.append(
+                f"{pc_fps:,} usable PC fingerprint{'s' if pc_fps != 1 else ''}."
+            )
+        if meta_count or art_count:
+            lines.append(
+                f"Applied metadata to {meta_count:,} file{'s' if meta_count != 1 else ''}; "
+                f"embedded artwork in {art_count:,}."
+            )
+        if output_folder:
+            lines.append("")
+            lines.append(
+                f"<span style='color: {Colors.TEXT_TERTIARY};'>Output folder</span><br>"
+                f"<span style='font-family: Consolas, monospace;'>"
+                f"{html.escape(output_folder)}</span>"
+            )
+
+        skipped_parts = []
+        if unresolved:
+            skipped_parts.append(f"{unresolved:,} missing file path{'s' if unresolved != 1 else ''}")
+        if unsupported:
+            skipped_parts.append(f"{unsupported:,} unsupported file type{'s' if unsupported != 1 else ''}")
+        if skipped_parts:
+            lines.append("")
+            lines.append(
+                f"<span style='color: {Colors.TEXT_TERTIARY};'>Skipped "
+                + " and ".join(skipped_parts)
+                + ".</span>"
+            )
+
+        if warning_count:
+            lines.append("")
+            lines.append(
+                f"<span style='color: {Colors.WARNING};'><b>{warning_count:,} warning"
+                f"{'s' if warning_count != 1 else ''}</b></span>"
+            )
+            warning_lines = (
+                [f"Copy/tag: {e}" for e in copy_errors[:5]]
+                + [f"PC fingerprint: {e}" for e in pc_fp_errors[:3]]
+                + [f"iPod fingerprint: {e}" for e in ipod_fp_errors[:3]]
+            )
+            for entry in warning_lines[:10]:
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'>"
+                    f"{html.escape(str(entry))}</span>"
+                )
+            remaining = warning_count - len(warning_lines[:10])
+            if remaining > 0:
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'>"
+                    f"...and {remaining:,} more</span>"
+                )
+
+        lines.append("")
+        lines.append(
+            f"<span style='color: {Colors.TEXT_TERTIARY};'>"
+            "Back Sync only copied files from the iPod; it did not modify the iPod.</span>"
+        )
+
+        self.result_details.setText("<br>".join(lines))
+        self.result_details.setTextFormat(Qt.TextFormat.RichText)
+        self.result_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        if missing:
+            self.summary_label.setText(f"{exported:,} of {missing:,} exported")
+        else:
+            self.summary_label.setText("No missing tracks")
 
     def show_error(self, message: str):
         """Show error message."""
@@ -2826,7 +3437,7 @@ class PCFolderDialog(QDialog):
         self.setWindowTitle("Select Media Folder")
         self.setMinimumWidth((440))
         self.selected_folder = ""
-        self.sync_mode = ""  # "full" or "selective"
+        self.sync_mode = ""  # "full" | "selective" | "back_sync"
         self.last_folder = last_folder
 
         # Dark theme stylesheet
@@ -2924,6 +3535,10 @@ class PCFolderDialog(QDialog):
         selective_btn.clicked.connect(self._accept_selective)
         btn_row.addWidget(selective_btn)
 
+        back_sync_btn = QPushButton("Back Sync", self)
+        back_sync_btn.clicked.connect(self._accept_back_sync)
+        btn_row.addWidget(back_sync_btn)
+
         full_btn = QPushButton("Full Sync", self)
         full_btn.setStyleSheet(f"""
             QPushButton {{
@@ -2974,4 +3589,10 @@ class PCFolderDialog(QDialog):
         if not self._validate_folder():
             return
         self.sync_mode = "selective"
+        self.accept()
+
+    def _accept_back_sync(self):
+        if not self._validate_folder():
+            return
+        self.sync_mode = "back_sync"
         self.accept()

@@ -1,7 +1,7 @@
 from PyQt6.QtCore import pyqtSignal, Qt, QRegularExpression, QSize, QTimer
 from PyQt6.QtWidgets import (
     QFrame, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLabel, QWidget, QProgressBar, QLineEdit
+    QLabel, QWidget, QProgressBar, QLineEdit, QSizePolicy
 )
 from PyQt6.QtGui import QFont, QCursor, QFontMetrics, QRegularExpressionValidator
 from .formatters import format_size, format_duration_human as format_duration
@@ -20,6 +20,36 @@ from ..styles import (
 # so only printable Unicode is allowed (no control characters).
 _MAX_IPOD_NAME_LEN = 63
 _IPOD_NAME_RE = QRegularExpression(r"^[^\x00-\x1f\x7f]*$")
+
+
+def _dash(value) -> str:
+    return str(value) if value not in (None, "", 0, False, {}, []) else "—"
+
+
+def _yes_no(value) -> str:
+    return "Yes" if bool(value) else "No"
+
+
+def _hex_id(value: int, width: int = 4) -> str:
+    try:
+        return f"0x{int(value):0{width}X}" if int(value) else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _compact_middle(value: str, *, max_chars: int = 34) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text or "—"
+    head = max_chars // 2 - 1
+    tail = max_chars - head - 3
+    return f"{text[:head]}...{text[-tail:]}"
+
+
+def _format_format_ids(formats: dict[int, tuple[int, int]]) -> str:
+    if not formats:
+        return "—"
+    return ", ".join(str(fid) for fid in sorted(formats))
 
 
 class _RenameLineEdit(QLineEdit):
@@ -81,19 +111,31 @@ class TechInfoRow(QWidget):
         self.label_widget = QLabel(label)
         self.label_widget.setFont(QFont(FONT_FAMILY, Metrics.FONT_XS))
         self.label_widget.setStyleSheet(LABEL_TERTIARY())
+        self.label_widget.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Preferred,
+        )
         layout.addWidget(self.label_widget)
-
-        layout.addStretch()
 
         self.value_widget = QLabel(value)
         self.value_widget.setFont(QFont(MONO_FONT_FAMILY, Metrics.FONT_XS))
         self.value_widget.setStyleSheet(LABEL_SECONDARY())
         self.value_widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.value_widget)
+        self.value_widget.setMinimumWidth(0)
+        self.value_widget.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.value_widget.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout.addWidget(self.value_widget, 1)
 
-    def setValue(self, value: str):
+    def setValue(self, value: str, tooltip: str | None = None):
         """Update the value text."""
-        self.value_widget.setText(value)
+        text = value or "—"
+        self.value_widget.setText(text)
+        self.value_widget.setToolTip(tooltip if tooltip is not None else text)
 
 
 class DeviceInfoCard(QFrame):
@@ -248,11 +290,16 @@ class DeviceInfoCard(QFrame):
         self.tech_toggle.clicked.connect(self._toggle_tech_details)
         layout.addWidget(self.tech_toggle)
 
-        # Technical details container
-        self.tech_container = QWidget()
-        self.tech_container.setStyleSheet("background: transparent; border: none;")
+        # Technical details container.  The content is intentionally scrollable:
+        # the diagnostic rows can be long, but expanding them should not resize
+        # the whole app window.
+        self.tech_container = make_scroll_area(vertical="as_needed")
+        self.tech_container.setMaximumHeight(260)
         self.tech_container.hide()  # Hidden by default
-        tech_layout = QVBoxLayout(self.tech_container)
+        self.tech_content = QWidget()
+        self.tech_content.setStyleSheet("background: transparent; border: none;")
+        self.tech_container.setWidget(self.tech_content)
+        tech_layout = QVBoxLayout(self.tech_content)
         tech_layout.setContentsMargins(0, (4), 0, 0)
         tech_layout.setSpacing(0)
 
@@ -261,35 +308,80 @@ class DeviceInfoCard(QFrame):
         self.serial_row = TechInfoRow("Serial:", "—")
         self.firmware_row = TechInfoRow("Firmware:", "—")
         self.board_row = TechInfoRow("Board:", "—")
+        self.family_id_row = TechInfoRow("Family ID:", "—")
+        self.updater_family_id_row = TechInfoRow("Updater ID:", "—")
+        self.product_type_row = TechInfoRow("Product:", "—")
         self.fw_guid_row = TechInfoRow("FW GUID:", "—")
+        self.conflicts_row = TechInfoRow("Conflicts:", "—")
+
+        # Technical info rows — USB / SCSI
+        self.usb_vid_row = TechInfoRow("USB VID:", "—")
         self.usb_pid_row = TechInfoRow("USB PID:", "—")
+        self.usb_serial_row = TechInfoRow("USB Serial:", "—")
+        self.scsi_row = TechInfoRow("SCSI:", "—")
+        self.bus_format_row = TechInfoRow("Bus/Format:", "—")
+        self.usbstor_row = TechInfoRow("USBSTOR:", "—")
+        self.usb_parent_row = TechInfoRow("USB Parent:", "—")
         self.id_method_row = TechInfoRow("ID Method:", "—")
 
         # Technical info rows — database / security
         self.db_version_row = TechInfoRow("Database:", "—")
+        self.device_db_version_row = TechInfoRow("Device DB:", "—")
+        self.shadow_db_version_row = TechInfoRow("Shadow DB:", "—")
+        self.sqlite_row = TechInfoRow("SQLite:", "—")
         self.db_id_row = TechInfoRow("DB ID:", "—")
         self.checksum_row = TechInfoRow("Checksum:", "—")
         self.hash_scheme_row = TechInfoRow("Hash Scheme:", "—")
+
+        # Technical info rows — capabilities
+        self.podcast_support_row = TechInfoRow("Podcasts:", "—")
+        self.voice_memo_row = TechInfoRow("Voice Memos:", "—")
+        self.sparse_art_row = TechInfoRow("Sparse Art:", "—")
+        self.max_transfer_row = TechInfoRow("Max Transfer:", "—")
+        self.max_file_row = TechInfoRow("Max File:", "—")
+        self.audio_codecs_row = TechInfoRow("Audio:", "—")
 
         # Technical info rows — storage & artwork
         self.disk_size_row = TechInfoRow("Disk Size:", "—")
         self.free_space_row = TechInfoRow("Free Space:", "—")
         self.art_formats_row = TechInfoRow("Art Formats:", "—")
+        self.photo_formats_row = TechInfoRow("Photo Formats:", "—")
+        self.chapter_formats_row = TechInfoRow("Chapter Img:", "—")
 
         # Three grouped sections with hairline separators
         tech_layout.addWidget(make_section_header("Identity"))
         for w in (
             self.model_num_row, self.serial_row, self.firmware_row,
-            self.board_row, self.fw_guid_row, self.usb_pid_row,
-            self.id_method_row,
+            self.board_row, self.family_id_row, self.updater_family_id_row,
+            self.product_type_row, self.fw_guid_row, self.id_method_row,
+            self.conflicts_row,
+        ):
+            tech_layout.addWidget(w)
+
+        tech_layout.addWidget(make_separator())
+        tech_layout.addWidget(make_section_header("USB / SCSI"))
+        for w in (
+            self.usb_vid_row, self.usb_pid_row, self.usb_serial_row,
+            self.scsi_row, self.bus_format_row, self.usbstor_row,
+            self.usb_parent_row,
         ):
             tech_layout.addWidget(w)
 
         tech_layout.addWidget(make_separator())
         tech_layout.addWidget(make_section_header("Database"))
         for w in (
-            self.db_version_row, self.db_id_row,
+            self.db_version_row, self.device_db_version_row,
+            self.shadow_db_version_row, self.sqlite_row, self.db_id_row,
             self.checksum_row, self.hash_scheme_row,
+        ):
+            tech_layout.addWidget(w)
+
+        tech_layout.addWidget(make_separator())
+        tech_layout.addWidget(make_section_header("Capabilities"))
+        for w in (
+            self.podcast_support_row, self.voice_memo_row,
+            self.sparse_art_row, self.max_transfer_row,
+            self.max_file_row, self.audio_codecs_row,
         ):
             tech_layout.addWidget(w)
 
@@ -297,6 +389,7 @@ class DeviceInfoCard(QFrame):
         tech_layout.addWidget(make_section_header("Storage"))
         for w in (
             self.disk_size_row, self.free_space_row, self.art_formats_row,
+            self.photo_formats_row, self.chapter_formats_row,
         ):
             tech_layout.addWidget(w)
 
@@ -443,12 +536,71 @@ class DeviceInfoCard(QFrame):
             dev = None
 
         if dev:
+            def source_tip(field: str, value: str) -> str:
+                source = dev._field_sources.get(field, "")
+                if source and value != "—":
+                    return f"{value}\nSource: {source}"
+                return value
+
             self.model_num_row.setValue(dev.model_number or '—')
             self.serial_row.setValue(dev.serial or '—')
             self.firmware_row.setValue(dev.firmware or '—')
             self.board_row.setValue(dev.board or '—')
             self.fw_guid_row.setValue(dev.firewire_guid or '—')
+            family_id = _dash(dev.family_id)
+            self.family_id_row.setValue(
+                family_id,
+                source_tip("family_id", family_id),
+            )
+            self.updater_family_id_row.setValue(
+                _dash(dev.updater_family_id),
+                source_tip("updater_family_id", _dash(dev.updater_family_id)),
+            )
+            self.product_type_row.setValue(_dash(dev.product_type))
+            conflicts = getattr(dev, "identity_conflicts", []) or []
+            if conflicts:
+                detail = "; ".join(
+                    str(c.get("reason") or c.get("field") or c)
+                    for c in conflicts
+                    if isinstance(c, dict)
+                ) or str(conflicts)
+                self.conflicts_row.setValue(str(len(conflicts)), detail)
+            else:
+                self.conflicts_row.setValue("None")
+
+            usb_vid = _hex_id(dev.usb_vid)
+            self.usb_vid_row.setValue(usb_vid, source_tip("usb_vid", usb_vid))
             self.usb_pid_row.setValue(f"0x{dev.usb_pid:04X}" if dev.usb_pid else '—')
+            usb_serial = _dash(dev.usb_serial)
+            self.usb_serial_row.setValue(
+                _compact_middle(usb_serial),
+                source_tip("usb_serial", usb_serial),
+            )
+            scsi_bits = [
+                bit for bit in (
+                    dev.scsi_vendor,
+                    dev.scsi_product,
+                    dev.scsi_revision,
+                )
+                if bit
+            ]
+            scsi_text = " ".join(scsi_bits) if scsi_bits else "—"
+            self.scsi_row.setValue(scsi_text)
+            bus_bits = [
+                bit for bit in (
+                    dev.connected_bus,
+                    dev.volume_format,
+                )
+                if bit
+            ]
+            self.bus_format_row.setValue(" / ".join(bus_bits) if bus_bits else "—")
+            usbstor = _dash(dev.usbstor_instance_id)
+            self.usbstor_row.setValue(_compact_middle(usbstor), usbstor)
+            usb_parent = _dash(
+                dev.usb_grandparent_instance_id
+                or dev.usb_parent_instance_id
+            )
+            self.usb_parent_row.setValue(_compact_middle(usb_parent), usb_parent)
             self.id_method_row.setValue(dev.identification_method or '—')
 
             # Checksum / hashing — derive display name from the canonical enum
@@ -459,13 +611,63 @@ class DeviceInfoCard(QFrame):
                 cs_name = 'Unknown'
             self.checksum_row.setValue(cs_name)
             scheme_names = {-1: '—', 0: 'None', 1: 'Scheme 1', 2: 'Scheme 2'}
-            self.hash_scheme_row.setValue(scheme_names.get(dev.hashing_scheme, str(dev.hashing_scheme)))
+            self.hash_scheme_row.setValue(
+                scheme_names.get(dev.hashing_scheme, str(dev.hashing_scheme))
+            )
+            self.device_db_version_row.setValue(
+                f"0x{int(dev.db_version):X}" if dev.db_version else "—",
+                source_tip(
+                    "db_version",
+                    f"0x{int(dev.db_version):X}" if dev.db_version else "—",
+                ),
+            )
+            self.shadow_db_version_row.setValue(
+                str(dev.shadow_db_version) if dev.shadow_db_version else "—"
+            )
+            caps = dev.capabilities
+            self.sqlite_row.setValue(
+                _yes_no(dev.uses_sqlite_db or getattr(caps, "uses_sqlite_db", False))
+            )
+
+            podcast_known = "podcasts_supported" in dev._field_sources
+            self.podcast_support_row.setValue(
+                _yes_no(
+                    dev.podcasts_supported
+                    if podcast_known else caps.supports_podcast
+                )
+            )
+            voice_known = "voice_memos_supported" in dev._field_sources
+            self.voice_memo_row.setValue(
+                _yes_no(dev.voice_memos_supported) if voice_known else "—"
+            )
+            self.sparse_art_row.setValue(
+                _yes_no(dev.supports_sparse_artwork or caps.supports_sparse_artwork)
+            )
+            if dev.max_transfer_speed:
+                self.max_transfer_row.setValue(
+                    f"{int(dev.max_transfer_speed):,} KB/s"
+                )
+            else:
+                self.max_transfer_row.setValue("—")
+            if dev.max_file_size_gb:
+                self.max_file_row.setValue(f"{dev.max_file_size_gb} GB")
+            else:
+                self.max_file_row.setValue("—")
+            if dev.audio_codecs:
+                codecs = ", ".join(sorted(str(k) for k in dev.audio_codecs))
+                self.audio_codecs_row.setValue(_compact_middle(codecs), codecs)
+            else:
+                self.audio_codecs_row.setValue("—")
 
             # Storage
             if dev.disk_size_gb > 0:
                 self.disk_size_row.setValue(f"{dev.disk_size_gb:.1f} GB")
+            else:
+                self.disk_size_row.setValue("—")
             if dev.free_space_gb > 0:
                 self.free_space_row.setValue(f"{dev.free_space_gb:.1f} GB")
+            else:
+                self.free_space_row.setValue("—")
 
             # Capacity hero: bar + label directly under the device name
             if dev.disk_size_gb > 0:
@@ -481,10 +683,34 @@ class DeviceInfoCard(QFrame):
 
             # Artwork formats
             if dev.artwork_formats:
-                fmt_strs = [f"{fid}" for fid in sorted(dev.artwork_formats)]
-                self.art_formats_row.setValue(", ".join(fmt_strs))
+                self.art_formats_row.setValue(_format_format_ids(dev.artwork_formats))
             else:
                 self.art_formats_row.setValue('—')
+            self.photo_formats_row.setValue(_format_format_ids(dev.photo_formats))
+            self.chapter_formats_row.setValue(
+                _format_format_ids(dev.chapter_image_formats)
+            )
+
+            if not getattr(self, "_refreshing_tech_details", False):
+                QTimer.singleShot(
+                    1800,
+                    self._refresh_technical_details_from_current_device,
+                )
+
+    def _refresh_technical_details_from_current_device(self):
+        """Refresh rows after background device validation fills richer fields."""
+        try:
+            from ipod_device import get_current_device
+            dev = get_current_device()
+        except Exception:
+            dev = None
+        if not dev:
+            return
+        self._refreshing_tech_details = True
+        try:
+            self.update_device_info(self.name_label.text(), self.model_label.text())
+        finally:
+            self._refreshing_tech_details = False
 
     def update_database_info(self, version_hex: str, version_name: str, db_id: int):
         """Update database technical information."""
@@ -561,11 +787,19 @@ class DeviceInfoCard(QFrame):
         # Clear tech details
         for row in (
             self.model_num_row, self.serial_row, self.firmware_row,
-            self.board_row, self.fw_guid_row, self.usb_pid_row,
-            self.id_method_row,
-            self.db_version_row, self.db_id_row,
+            self.board_row, self.family_id_row, self.updater_family_id_row,
+            self.product_type_row, self.fw_guid_row, self.conflicts_row,
+            self.usb_vid_row, self.usb_pid_row, self.usb_serial_row,
+            self.scsi_row, self.bus_format_row, self.usbstor_row,
+            self.usb_parent_row, self.id_method_row,
+            self.db_version_row, self.device_db_version_row,
+            self.shadow_db_version_row, self.sqlite_row, self.db_id_row,
             self.checksum_row, self.hash_scheme_row,
-            self.disk_size_row, self.free_space_row, self.art_formats_row,
+            self.podcast_support_row, self.voice_memo_row,
+            self.sparse_art_row, self.max_transfer_row, self.max_file_row,
+            self.audio_codecs_row, self.disk_size_row, self.free_space_row,
+            self.art_formats_row, self.photo_formats_row,
+            self.chapter_formats_row,
         ):
             row.setValue("—")
 
@@ -830,7 +1064,16 @@ class Sidebar(QFrame):
                 btn.setVisible(visible)
         self._ensure_selected_category_visible()
 
-    def selectCategory(self, category):
+    def resetLibraryCategory(self) -> None:
+        """Select the default library category and notify listeners."""
+        previous = self.selectedCategory
+        if previous != "Albums":
+            self._style_nav_btn(previous, selected=False)
+        self.selectedCategory = "Albums"
+        self._style_nav_btn("Albums", selected=True)
+        self.category_changed.emit("Albums")
+
+    def selectCategory(self, category, force_emit: bool = False):
         btn = self.buttons.get(category)
         if btn is None or not btn.isVisible():
             fallback = self._first_visible_category()
@@ -840,6 +1083,8 @@ class Sidebar(QFrame):
 
         if category == self.selectedCategory:
             self._style_nav_btn(category, selected=True)
+            if force_emit:
+                self.category_changed.emit(category)
             return
 
         self._style_nav_btn(self.selectedCategory, selected=False)
