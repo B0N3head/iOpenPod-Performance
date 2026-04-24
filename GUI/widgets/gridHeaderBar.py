@@ -59,7 +59,7 @@ class GridHeaderBar(QFrame):
 
         self._sort_btn = QPushButton(f"Sort: {_DEFAULT_LABEL} \u25be")
         self._sort_btn.setStyleSheet(
-            btn_css(padding=f"4px 10px", radius=Metrics.BORDER_RADIUS_SM)
+            btn_css(padding="4px 10px", radius=Metrics.BORDER_RADIUS_SM)
         )
         self._sort_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._sort_btn.setCursor(Qt.CursorShape.PointingHandCursor)

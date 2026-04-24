@@ -181,7 +181,7 @@ class PodcastSearchDialog(QDialog):
         self._search_btn.setEnabled(False)
         self._status_label.setText("Searching…")
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.itunes_search import search_podcasts
 
         worker = Worker(search_podcasts, query)
@@ -316,7 +316,7 @@ class _SearchResultCard(QFrame):
 
     def _load_artwork(self, url: str):
         """Load artwork thumbnail in background."""
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
 
         def _fetch():

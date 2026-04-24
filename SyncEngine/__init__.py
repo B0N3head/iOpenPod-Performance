@@ -18,7 +18,8 @@ from .fingerprint_diff_engine import (
     SyncItem,
     StorageSummary,
 )
-from .sync_executor import SyncExecutor, SyncResult, SyncProgress
+from .contracts import SyncOutcome, SyncProgress, SyncRequest
+from .sync_executor import SyncExecutor
 from .audio_fingerprint import (
     compute_fingerprint,
     read_fingerprint,
@@ -47,7 +48,6 @@ from .transcoder import (
 from ._formats import IPOD_NATIVE_FORMATS
 from .transcode_cache import TranscodeCache, CachedFile, CacheIndex
 from .backup_manager import BackupManager, SnapshotInfo, BackupProgress, get_device_identifier, get_device_display_name
-from .eta import ETATracker
 from .spl_evaluator import spl_update, spl_update_from_parsed, spl_update_all
 from .photos import (
     PhotoDB,
@@ -75,8 +75,9 @@ __all__ = [
     "StorageSummary",
     # Sync execution
     "SyncExecutor",
-    "SyncResult",
+    "SyncOutcome",
     "SyncProgress",
+    "SyncRequest",
     # Audio fingerprinting
     "compute_fingerprint",
     "read_fingerprint",
@@ -115,8 +116,6 @@ __all__ = [
     "BackupProgress",
     "get_device_identifier",
     "get_device_display_name",
-    # ETA tracking
-    "ETATracker",
     # Smart playlist evaluator
     "spl_update",
     "spl_update_from_parsed",

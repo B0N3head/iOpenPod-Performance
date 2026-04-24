@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_default_backup_dir() -> str:
     try:
-        from settings import default_data_dir
+        from infrastructure.settings_paths import default_data_dir
         return os.path.join(default_data_dir(), "backups")
     except Exception:
         return os.path.join(os.path.expanduser("~"), "iOpenPod", "backups")

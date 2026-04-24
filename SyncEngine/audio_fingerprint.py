@@ -133,7 +133,7 @@ class FingerprintCache:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    from settings import default_cache_dir
+                    from infrastructure.settings_paths import default_cache_dir
                     cache_dir = default_cache_dir()
                     path = os.path.join(cache_dir, "fingerprint_cache.json")
                     cls._instance = cls(path)
@@ -146,22 +146,17 @@ class FingerprintCache:
             cls._instance = None
 
 
-def find_fpcalc() -> Optional[str]:
+def find_fpcalc(fpcalc_path: Optional[str] = None) -> Optional[str]:
     """Find the fpcalc binary.
 
     Search order:
-    1. User-configured path in settings
+    1. Explicit path provided by the caller
     2. Bundled binary (auto-downloaded to <settings_dir>/bin/)
     3. System PATH
     4. Common installation directories
     """
-    try:
-        from settings import get_settings
-        custom = get_settings().fpcalc_path
-        if custom and Path(custom).is_file():
-            return custom
-    except Exception:
-        pass
+    if fpcalc_path and Path(fpcalc_path).is_file():
+        return fpcalc_path
 
     # 2. Bundled binary
     try:
@@ -454,6 +449,6 @@ def get_or_compute_fingerprint(
     return fingerprint
 
 
-def is_fpcalc_available() -> bool:
+def is_fpcalc_available(fpcalc_path: Optional[str] = None) -> bool:
     """Check if fpcalc is available on this system."""
-    return find_fpcalc() is not None
+    return find_fpcalc(fpcalc_path) is not None

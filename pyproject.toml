@@ -47,16 +47,21 @@ iopenpod = "main:main"
 
 [dependency-groups]
 dev = [
+    "mypy>=1.15.0",
     "nuitka>=4.0.3",
     "ordered-set>=4.1.0",
+    "pytest>=8.3.5",
+    "pytest-qt>=4.4.0",
     "pyinstaller>=6.19.0",
+    "ruff>=0.11.7",
     "zstandard>=0.25.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 only-include = [
+    "app_core",
+    "infrastructure",
     "main.py",
-    "settings.py",
     "GUI",
     "PodcastManager",
     "ipod_device",
@@ -78,3 +83,52 @@ only-include = [
 extend-ignore = ["W503"]
 # Keep line length reasonable; adjust if you prefer a different value
 max-line-length = 88
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-exclude = ["compendium", "vendor"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+files = [
+    "app_core/device_identity.py",
+    "app_core/services.py",
+    "app_core/context.py",
+    "app_core/jobs.py",
+    "app_core/progress.py",
+    "app_core/sync_review_model.py",
+    "app_core/sync_plan_builder.py",
+    "app_core/sync_options.py",
+    "infrastructure/settings_persistence.py",
+    "infrastructure/settings_paths.py",
+    "infrastructure/settings_runtime.py",
+    "infrastructure/settings_schema.py",
+    "infrastructure/settings_secrets.py",
+    "infrastructure/version.py",
+    "SyncEngine/contracts.py",
+    "SyncEngine/quick_writes.py",
+    "scripts/check_architecture.py",
+    "tests/test_architecture_checks.py",
+    "tests/test_backup_jobs.py",
+    "tests/test_settings_persistence.py",
+    "tests/test_settings_secrets.py",
+    "tests/test_settings_snapshot.py",
+    "tests/test_device_session_snapshots.py",
+    "tests/test_device_identity_helpers.py",
+    "tests/test_device_scan_jobs.py",
+    "tests/test_quick_writes.py",
+    "tests/test_sync_review_model.py",
+    "tests/test_sync_plan_builder.py",
+    "main.py",
+]
+follow_imports = "silent"
+ignore_missing_imports = true
+show_error_codes = true

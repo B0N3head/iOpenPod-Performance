@@ -24,9 +24,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
+from .contracts import SyncOutcome, SyncProgress, SyncRequest
 from .fingerprint_diff_engine import SyncPlan, SyncItem
 from .mapping import MappingManager, MappingFile
-from .transcoder import transcode, needs_transcoding, resolve_transcode_plan, clear_caches as _clear_transcoder_caches
+from .transcoder import (
+    TranscodeOptions,
+    clear_caches as _clear_transcoder_caches,
+    needs_transcoding,
+    quality_to_nominal_bitrate,
+    resolve_transcode_plan,
+    transcode,
+)
 from .audio_fingerprint import get_or_compute_fingerprint
 from .itunes_prefs import protect_from_itunes
 from .photos import apply_photo_sync_plan, read_photo_db
@@ -89,92 +97,6 @@ def _current_source_stat(pc_track) -> tuple[int, float]:
 
 
 @dataclass
-class SyncProgress:
-    """Progress info for sync callbacks."""
-
-    stage: str  # "add", "remove", "update_metadata", "update_file", etc.
-    current: int
-    total: int
-    current_item: Optional[SyncItem] = None
-    message: str = ""
-    # Per-worker status lines (for parallel copy/transcode stages)
-    worker_lines: Optional[list[str]] = None
-    # Size-weighted progress fraction (0.0–1.0), None when not applicable
-    size_progress: Optional[float] = None
-
-
-@dataclass
-class SyncResult:
-    """Result of a sync operation."""
-
-    success: bool
-    tracks_added: int = 0
-    tracks_removed: int = 0
-    tracks_updated_metadata: int = 0
-    tracks_updated_file: int = 0
-    playcounts_synced: int = 0
-    ratings_synced: int = 0
-    photos_added: int = 0
-    photos_removed: int = 0
-    photos_updated: int = 0
-    photo_albums_added: int = 0
-    photo_albums_removed: int = 0
-    sound_check_computed: int = 0
-    scrobbles_submitted: int = 0
-    errors: list[tuple[str, str]] = field(default_factory=list)
-    # True when the sync stopped early (storage full, cancelled, etc.) but a
-    # partial database write was still attempted to keep iPod consistent.
-    partial_save: bool = False
-
-    @property
-    def has_errors(self) -> bool:
-        return len(self.errors) > 0
-
-    @property
-    def summary(self) -> str:
-        lines = []
-        if self.tracks_added:
-            lines.append(f"  Added {self.tracks_added} tracks")
-        if self.tracks_removed:
-            lines.append(f"  Removed {self.tracks_removed} tracks")
-        if self.tracks_updated_metadata:
-            lines.append(f"  Updated metadata for {self.tracks_updated_metadata} tracks")
-        if self.tracks_updated_file:
-            lines.append(f"  Re-synced {self.tracks_updated_file} tracks")
-        if self.playcounts_synced:
-            lines.append(f"  Synced play counts for {self.playcounts_synced} tracks")
-        if self.ratings_synced:
-            lines.append(f"  Synced ratings for {self.ratings_synced} tracks")
-        if self.photos_added:
-            lines.append(f"  Added {self.photos_added} photos")
-        if self.photos_removed:
-            lines.append(f"  Removed {self.photos_removed} photos")
-        if self.photos_updated:
-            lines.append(f"  Updated {self.photos_updated} device photo views")
-        if self.photo_albums_added:
-            lines.append(f"  Added {self.photo_albums_added} photo albums")
-        if self.photo_albums_removed:
-            lines.append(f"  Removed {self.photo_albums_removed} photo albums")
-        if self.sound_check_computed:
-            lines.append(f"  Computed Sound Check for {self.sound_check_computed} tracks")
-        if self.scrobbles_submitted:
-            lines.append(f"  Scrobbled {self.scrobbles_submitted} plays")
-        if self.errors:
-            lines.append(f"  {len(self.errors)} errors occurred")
-
-        if not lines:
-            return "No changes made."
-
-        if self.partial_save:
-            status = "Sync stopped early — partial results saved"
-        elif self.success:
-            status = "Sync completed"
-        else:
-            status = "Sync completed with errors"
-        return f"{status}:\n" + "\n".join(lines)
-
-
-@dataclass
 class _SyncContext:
     """Shared mutable state flowing through all sync stages.
 
@@ -200,7 +122,7 @@ class _SyncContext:
     _is_scrobble_cancelled: Optional[Callable[[], bool]] = None
 
     # ── Result accumulator ──────────────────────────────────────────
-    result: SyncResult = field(default_factory=lambda: SyncResult(success=True))
+    result: SyncOutcome = field(default_factory=lambda: SyncOutcome(success=True))
 
     # ── Existing iPod database (populated by _load_existing_database) ──
     existing_tracks_data: list[dict] = field(default_factory=list)
@@ -254,14 +176,28 @@ class SyncExecutor:
         result = executor.execute(plan, mapping, progress_callback)
     """
 
-    def __init__(self, ipod_path: str | Path, cache_dir: Optional[Path] = None,
-                 max_workers: int = 0):
+    def __init__(
+        self,
+        ipod_path: str | Path,
+        cache_dir: Optional[Path] = None,
+        max_workers: int = 0,
+        max_cache_size_gb: float = 5.0,
+        fpcalc_path: str = "",
+        photo_sync_settings: dict[str, bool] | None = None,
+        transcode_options: TranscodeOptions | None = None,
+    ):
         from .transcode_cache import TranscodeCache
 
         self.ipod_path = Path(ipod_path)
         self.music_dir = self.ipod_path / "iPod_Control" / "Music"
         self.mapping_manager = MappingManager(ipod_path)
-        self.transcode_cache = TranscodeCache.get_instance(cache_dir)
+        self.transcode_cache = TranscodeCache.get_instance(
+            cache_dir,
+            max_cache_size_gb=max_cache_size_gb,
+        )
+        self.fpcalc_path = fpcalc_path
+        self.photo_sync_settings = photo_sync_settings
+        self.transcode_options = transcode_options or TranscodeOptions()
 
         self._folder_counter = 0
         self._folder_lock = threading.Lock()
@@ -273,6 +209,29 @@ class SyncExecutor:
             self._max_workers = max_workers
 
     # ── Public API ──────────────────────────────────────────────────────────
+
+    def execute_request(self, request: SyncRequest) -> SyncOutcome:
+        """Execute a typed request object.
+
+        ``execute`` remains the low-level compatibility surface inside the
+        engine; app-core/UI orchestration should prefer this method so the sync
+        boundary has one explicit contract.
+        """
+        return self.execute(
+            plan=request.plan,
+            mapping=request.mapping,
+            progress_callback=request.progress_callback,
+            dry_run=request.dry_run,
+            is_cancelled=request.is_cancelled,
+            write_back_to_pc=request.write_back_to_pc,
+            user_playlists=list(request.user_playlists),
+            on_sync_complete=request.on_sync_complete,
+            compute_sound_check=request.compute_sound_check,
+            scrobble_on_sync=request.scrobble_on_sync,
+            listenbrainz_token=request.listenbrainz_token,
+            is_scrobble_cancelled=request.is_scrobble_cancelled,
+            on_cancel_with_partial=request.on_cancel_with_partial,
+        )
 
     def execute(
         self,
@@ -290,7 +249,7 @@ class SyncExecutor:
         listenbrainz_token: str = "",
         is_scrobble_cancelled: Optional[Callable[[], bool]] = None,
         on_cancel_with_partial: Optional[Callable[[int, int], bool]] = None,
-    ) -> SyncResult:
+    ) -> SyncOutcome:
         """Execute the sync plan.
 
         Flow:
@@ -443,7 +402,7 @@ class SyncExecutor:
                     # Only adds happened — safe to truly discard
                     ctx.result.errors.append((
                         "cancelled",
-                        f"Sync was cancelled. "
+                        "Sync was cancelled. "
                         + (
                             f"{_n_added} track{'s' if _n_added != 1 else ''} were "
                             f"copied to the iPod but the database was not updated — "
@@ -465,146 +424,24 @@ class SyncExecutor:
         user_playlists: list[dict],
         progress_callback: Optional[Callable[["SyncProgress"], None]] = None,
         on_complete: Optional[Callable[[], None]] = None,
-    ) -> SyncResult:
-        """Rewrite the iPod database with only playlist changes (no file ops).
+    ) -> SyncOutcome:
+        """Rewrite the iPod database with only playlist changes (no file ops)."""
 
-        Reads the existing database, merges *user_playlists* into the existing
-        playlist lists, rebuilds every track as-is, and writes the DB in one
-        shot.  Much faster than a full sync because no fingerprinting,
-        transcoding, or file copying is involved.
-        """
-        result = SyncResult(success=True)
+        from .quick_writes import quick_write_playlists
 
-        def _progress(stage, cur, total, message=""):
-            if progress_callback:
-                progress_callback(SyncProgress(stage, cur, total, message=message))
-
-        _progress("playlist_sync", 0, 3, "Reading iPod database…")
-
-        # 1. Read existing DB
-        existing_db = self._read_existing_database()
-        tracks_data = existing_db["tracks"]
-        playlists_raw = existing_db["playlists"]
-        smart_raw = existing_db["smart_playlists"]
-
-        if not tracks_data:
-            result.success = False
-            result.errors.append(("playlist_sync", "No existing database found on iPod"))
-            return result
-
-        # 2. Convert existing tracks to TrackInfo (unchanged)
-        all_tracks: list[TrackInfo] = []
-        for t in tracks_data:
-            ti = self._track_dict_to_info(t)
-            if ti.db_track_id:
-                all_tracks.append(ti)
-
-        _progress("playlist_sync", 1, 3, "Merging playlists…")
-
-        # 3. Merge user playlists into existing raw lists
-        for upl in user_playlists:
-            if upl.get("master_flag"):
-                continue
-            pid = upl.get("playlist_id", 0)
-            is_new = upl.get("_isNew", False)
-            if is_new:
-                playlists_raw.append(upl)
-            else:
-                replaced = False
-                for i, epl in enumerate(playlists_raw):
-                    if epl.get("playlist_id") == pid:
-                        playlists_raw[i] = upl
-                        replaced = True
-                        break
-                if not replaced:
-                    for i, epl in enumerate(smart_raw):
-                        if epl.get("playlist_id") == pid:
-                            smart_raw[i] = upl
-                            replaced = True
-                            break
-                if not replaced:
-                    playlists_raw.append(upl)
-
-        # 4. Build PlaylistInfo objects
-        from ._playlist_builder import build_and_evaluate_playlists
-        master_name, playlists, smart_playlists = build_and_evaluate_playlists(
-            tracks_data, playlists_raw, smart_raw, all_tracks, user_playlists,
+        return quick_write_playlists(
+            self.ipod_path,
+            user_playlists,
+            progress_callback=progress_callback,
+            on_complete=on_complete,
         )
-
-        _progress("playlist_sync", 2, 3, "Writing database…")
-
-        # 5. Write DB (no artwork pc_file_paths needed — tracks unchanged)
-        db_ok = self._write_database(
-            all_tracks,
-            playlists=playlists,
-            smart_playlists=smart_playlists,
-            master_playlist_name=master_name,
-        )
-
-        if not db_ok:
-            result.success = False
-            result.errors.append(("playlist_sync", "Database write failed"))
-            return result
-
-        # 6. iTunes protection + cleanup
-        try:
-            self._apply_itunes_protections_from_tracks(all_tracks)
-        except Exception as e:
-            logger.warning("iTunesPrefs protection failed (non-fatal): %s", e)
-
-        if on_complete:
-            try:
-                on_complete()
-            except Exception:
-                pass
-
-        _progress("playlist_sync", 3, 3, "Playlists synced")
-        result.success = True
-        return result
 
     def _apply_itunes_protections_from_tracks(self, all_tracks: list[TrackInfo]) -> None:
         """Lightweight iTunesPrefs update from a track list (no _SyncContext)."""
-        from .itunes_prefs import protect_from_itunes
 
-        _MEDIA_BUCKETS = [
-            (0x04, "podcast"), (0x08, "audiobook"), (0x40, "tv"),
-            (0x20, "mv"), (0x02, "video"),
-        ]
-        totals: dict[str, list[int]] = {
-            k: [0, 0, 0] for k in ("music", "video", "podcast", "audiobook", "tv", "mv")
-        }
-        for t in all_tracks:
-            mt = t.media_type
-            bucket = "music"
-            for mask, label in _MEDIA_BUCKETS:
-                if mt & mask:
-                    bucket = label
-                    break
-            totals[bucket][0] += t.size
-            totals[bucket][1] += t.length // 1000
-            totals[bucket][2] += 1
+        from .quick_writes import apply_itunes_protections_from_tracks
 
-        protect_from_itunes(
-            self.ipod_path,
-            track_count=totals["music"][2],
-            total_music_bytes=totals["music"][0],
-            total_music_seconds=totals["music"][1],
-            video_tracks=totals["video"][2],
-            video_bytes=totals["video"][0],
-            video_seconds=totals["video"][1],
-            podcast_tracks=totals["podcast"][2],
-            podcast_bytes=totals["podcast"][0],
-            podcast_seconds=totals["podcast"][1],
-            audiobook_tracks=totals["audiobook"][2],
-            audiobook_bytes=totals["audiobook"][0],
-            audiobook_seconds=totals["audiobook"][1],
-            tv_show_tracks=totals["tv"][2],
-            tv_show_bytes=totals["tv"][0],
-            tv_show_seconds=totals["tv"][1],
-            music_video_tracks=totals["mv"][2],
-            music_video_bytes=totals["mv"][0],
-            music_video_seconds=totals["mv"][1],
-        )
+        apply_itunes_protections_from_tracks(self.ipod_path, all_tracks)
 
     # ── Pre-flight & Loading ────────────────────────────────────────────────
 
@@ -809,6 +646,7 @@ class SyncExecutor:
                         stage, cur, total, message=msg,
                     ),
                     is_cancelled=ctx._is_cancelled,
+                    sync_settings=self.photo_sync_settings,
                 )
                 ctx.result.photos_added = len(ctx.plan.photo_plan.photos_to_add)
                 ctx.result.photos_removed = len(ctx.plan.photo_plan.photos_to_remove)
@@ -1068,7 +906,10 @@ class SyncExecutor:
                 logger.error("_do_copy called with None pc_track for %s", item.description)
                 return (item, False, None, False, "No source track")
             source_path = Path(item.pc_track.path)
-            need_transcode = needs_transcoding(source_path)
+            need_transcode = needs_transcoding(
+                source_path,
+                prefer_lossy=self.transcode_options.prefer_lossy,
+            )
             expected_write_bytes = item.estimated_size if item.estimated_size and item.estimated_size > 0 else item.pc_track.size
 
             with completed_lock:
@@ -1154,8 +995,8 @@ class SyncExecutor:
                             )
                         else:
                             oom_msg = (
-                                f"Not enough space to copy any tracks. "
-                                f"The iPod database was not changed."
+                                "Not enough space to copy any tracks. "
+                                "The iPod database was not changed."
                             )
                         ctx.result.errors.append(("storage", oom_msg))
                         ctx.result.success = False
@@ -1248,9 +1089,14 @@ class SyncExecutor:
 
                 if was_transcoded:
                     if ext in ("m4a", "aac") and ext != "alac":
-                        from .transcoder import quality_to_nominal_bitrate
-                        plan = resolve_transcode_plan(source_path)
-                        existing_track.bitrate = quality_to_nominal_bitrate(plan.effective_quality)
+                        plan = resolve_transcode_plan(
+                            source_path,
+                            options=self.transcode_options,
+                        )
+                        existing_track.bitrate = quality_to_nominal_bitrate(
+                            plan.effective_quality,
+                            self.transcode_options,
+                        )
 
                 if item.pc_track.duration_ms:
                     existing_track.length = item.pc_track.duration_ms
@@ -1493,14 +1339,7 @@ class SyncExecutor:
             if not dest_dir:
                 import hashlib
                 url_hash = hashlib.sha256(feed_url.encode()).hexdigest()[:16]
-                try:
-                    from settings import get_settings
-                    base = get_settings().transcode_cache_dir
-                except Exception:
-                    base = ""
-                if not base:
-                    from settings import default_cache_dir
-                    base = default_cache_dir()
+                base = str(self.transcode_cache.cache_dir)
                 dest_dir = str(Path(base) / "podcasts" / url_hash)
 
             # Look up feed artwork URL from the subscription store
@@ -1582,7 +1421,10 @@ class SyncExecutor:
 
             fingerprint = item.fingerprint
             if not fingerprint:
-                fingerprint = get_or_compute_fingerprint(Path(item.pc_track.path))
+                fingerprint = get_or_compute_fingerprint(
+                    Path(item.pc_track.path),
+                    fpcalc_path=self.fpcalc_path,
+                )
 
             if fingerprint:
                 ctx.new_track_fingerprints[id(track_info)] = fingerprint
@@ -1832,7 +1674,10 @@ class SyncExecutor:
 
     def _get_target_format(self, source_path: Path) -> str:
         """Determine the target format for transcoding."""
-        return resolve_transcode_plan(source_path).cache_target_format
+        return resolve_transcode_plan(
+            source_path,
+            options=self.transcode_options,
+        ).cache_target_format
 
     def _copy_to_ipod(
         self,
@@ -1873,7 +1718,10 @@ class SyncExecutor:
             pass  # Can't check — proceed and let the copy fail naturally
 
         if needs_transcode:
-            plan = resolve_transcode_plan(source_path)
+            plan = resolve_transcode_plan(
+                source_path,
+                options=self.transcode_options,
+            )
             target_format = plan.cache_target_format
             bitrate = plan.cache_bitrate_kbps
 
@@ -1918,6 +1766,7 @@ class SyncExecutor:
                 source_path, output_dir,
                 output_filename=output_filename,
                 progress_callback=transcode_progress,
+                options=self.transcode_options,
                 is_cancelled=is_cancelled,
             )
             if result.success and result.output_path:

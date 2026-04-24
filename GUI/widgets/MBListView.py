@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys as _sys
 
 import logging
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent, QPainter
@@ -32,6 +32,13 @@ from ..hidpi import scale_pixmap_for_display
 from ..styles import Colors, FONT_FAMILY, Metrics, table_css
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        SettingsService,
+    )
 
 # Platform-correct modifier key labels for menu shortcut hints.
 _CTRL = "⌘" if _sys.platform == "darwin" else "Ctrl"
@@ -589,8 +596,19 @@ class MusicBrowserList(QFrame):
 
     remove_from_ipod_requested = pyqtSignal(list)
 
-    def __init__(self):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        *,
+        library_cache: "LibraryCacheLike | None" = None,
+        show_art_override: bool | None = None,
+    ):
         super().__init__()
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_cache = library_cache
+        self._show_art_override = show_art_override
 
         # Layout
         self._layout = QVBoxLayout(self)
@@ -813,8 +831,9 @@ class MusicBrowserList(QFrame):
         ]
         playlist.setdefault("_source", "regular")
 
-        from ..app import iTunesDBCache
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         cache.save_user_playlist(playlist)
         cache.playlist_quick_sync.emit()
 
@@ -876,9 +895,9 @@ class MusicBrowserList(QFrame):
                                ("Audio/Video") passes both audio and video
                                filters, matching iTunes behaviour.
         """
-        from ..app import iTunesDBCache
-
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         if not cache.is_ready():
             return
 
@@ -1016,9 +1035,9 @@ class MusicBrowserList(QFrame):
         so that filterByAlbum/Artist/Genre don't reintroduce excluded tracks.
         """
         if not self._all_tracks:
-            from ..app import iTunesDBCache
-
-            cache = iTunesDBCache.get_instance()
+            cache = self._library_cache
+            if cache is None:
+                return
             if cache.is_ready():
                 self._all_tracks = cache.get_tracks()
                 mf = getattr(self, "_media_type_filter", None)
@@ -1089,9 +1108,15 @@ class MusicBrowserList(QFrame):
             if self.table.columnCount() > 0:
                 self._save_user_widths()
 
-            # Check artwork setting
-            from settings import get_settings
-            self._show_art = get_settings().show_art_in_tracklist
+            # Check artwork setting, with callers able to force list-only modes.
+            if self._show_art_override is None:
+                self._show_art = (
+                    self._settings_service
+                    .get_effective_settings()
+                    .show_art_in_tracklist
+                )
+            else:
+                self._show_art = self._show_art_override
 
             # Capture state for this load
             load_id = self._load_id
@@ -1328,7 +1353,7 @@ class MusicBrowserList(QFrame):
 
     def _load_art_async(self) -> None:
         """Scan rows for missing artwork and load in background batches."""
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
 
         # Collect unique mhiiLinks that need loading
         links_to_load: set[int] = set()
@@ -1348,6 +1373,12 @@ class MusicBrowserList(QFrame):
         if not links_to_load:
             return
 
+        session = self._device_sessions.current_session()
+        if not session.device_path or not session.artworkdb_path:
+            return
+        artwork_folder = session.artwork_folder_path or ""
+        cancellation_token = self._device_sessions.manager().cancellation_token
+
         self._art_pending |= links_to_load
         load_id = self._load_id
 
@@ -1358,30 +1389,35 @@ class MusicBrowserList(QFrame):
 
         for i in range(0, len(links_list), chunk_size):
             chunk = links_list[i:i + chunk_size]
-            worker = Worker(self._load_art_batch, chunk)
+            worker = Worker(
+                self._load_art_batch,
+                chunk,
+                session.artworkdb_path,
+                artwork_folder,
+                cancellation_token,
+            )
             # Use default arguments correctly to capture the current load_id
             worker.signals.result.connect(
                 lambda result, lid=load_id: self._on_art_loaded(result, lid)
             )
             pool.start(worker)
 
-    def _load_art_batch(self, links: list[int]) -> dict[int, tuple[int, int, bytes] | None]:
+    def _load_art_batch(
+        self,
+        links: list[int],
+        artworkdb_path: str,
+        artwork_folder: str,
+        cancellation_token: Any,
+    ) -> dict[int, tuple[int, int, bytes] | None]:
         """Background worker: decode artwork for a batch of mhiiLinks.
 
         Returns dict mapping mhiiLink -> (width, height, rgba_bytes) or None.
         Uses decode-only path (no color extraction) since the list view
         only needs the thumbnail pixmap.
         """
-        from ..app import DeviceManager
         from ..imgMaker import decode_image_by_img_id, get_artworkdb_cached
         import os
 
-        device = DeviceManager.get_instance()
-        if not device.device_path:
-            return {}
-
-        artworkdb_path = device.artworkdb_path
-        artwork_folder = device.artwork_folder_path
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
@@ -1389,7 +1425,7 @@ class MusicBrowserList(QFrame):
         results: dict[int, tuple[int, int, bytes] | None] = {}
 
         for link in links:
-            if device.cancellation_token.is_cancelled():
+            if cancellation_token.is_cancelled():
                 break
             pil_img = decode_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
             if pil_img is not None:
@@ -1974,19 +2010,21 @@ class MusicBrowserList(QFrame):
             return
 
         try:
-            from ..app import DeviceManager
-            dev = DeviceManager.get_instance()
-            ipod_root = dev.device_path or ""
-            artworkdb_path = dev.artworkdb_path or ""
-            artwork_folder = dev.artwork_folder_path or ""
+            session = self._device_sessions.current_session()
+            ipod_root = session.device_path or ""
+            artworkdb_path = session.artworkdb_path or ""
+            artwork_folder = session.artwork_folder_path or ""
         except Exception:
             return
         if not ipod_root:
             return
 
         import shutil
-        from settings import default_cache_dir, get_settings
-        cache_root = get_settings().transcode_cache_dir or default_cache_dir()
+        from infrastructure.settings_paths import default_cache_dir
+        cache_root = (
+            self._settings_service.get_effective_settings().transcode_cache_dir
+            or default_cache_dir()
+        )
         temp_dir = os.path.join(cache_root, ".drag_tmp")
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -2094,8 +2132,6 @@ class MusicBrowserList(QFrame):
         if not selected:
             return
 
-        from ..app import iTunesDBCache
-
         menu = QMenu(self)
         menu_style = f"""
             QMenu {{
@@ -2118,10 +2154,10 @@ class MusicBrowserList(QFrame):
         """
         menu.setStyleSheet(menu_style)
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
 
         # ── "Add to Playlist >" cascade ──
-        if cache.is_ready():
+        if cache is not None and cache.is_ready():
             playlists = cache.get_playlists()
 
             # Filter to regular (non-master, non-smart, non-podcast) playlists
@@ -2185,13 +2221,15 @@ class MusicBrowserList(QFrame):
 
         # ── Track Flags ──
         menu.addSeparator()
-        self._build_flag_menu(menu, menu_style, selected, cache)
+        if cache is not None:
+            self._build_flag_menu(menu, menu_style, selected, cache)
 
         # ── Content Advisory (rtng / explicit flag) ──
         self._build_content_advisory_menu(menu, menu_style, selected)
 
         # ── Rating ──
-        self._build_rating_menu(menu, menu_style, selected, cache)
+        if cache is not None:
+            self._build_rating_menu(menu, menu_style, selected, cache)
 
         # ── Volume Adjustment ──
         self._build_volume_menu(menu, menu_style, selected)
@@ -2482,13 +2520,13 @@ class MusicBrowserList(QFrame):
 
     def _set_track_flag(self, key: str, value: int) -> None:
         """Apply a flag/field change to all selected tracks via the cache."""
-        from ..app import iTunesDBCache
-
         selected = self._get_selected_tracks()
         if not selected:
             return
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         if not cache.is_ready():
             return
 
@@ -2556,13 +2594,13 @@ class MusicBrowserList(QFrame):
 
     def _add_selected_to_playlist(self, playlist: dict) -> None:
         """Add all selected tracks to the given playlist and save it."""
-        from ..app import iTunesDBCache
-
         selected = self._get_selected_tracks()
         if not selected:
             return
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         if not cache.is_ready():
             return
 
@@ -2596,8 +2634,6 @@ class MusicBrowserList(QFrame):
 
     def _remove_selected_from_playlist(self) -> None:
         """Remove selected tracks from the current playlist and save it."""
-        from ..app import iTunesDBCache
-
         playlist = self._current_playlist
         if not playlist:
             return
@@ -2606,7 +2642,9 @@ class MusicBrowserList(QFrame):
         if not selected:
             return
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         if not cache.is_ready():
             return
 
@@ -2655,7 +2693,7 @@ class MusicBrowserList(QFrame):
         """
         import os
         import shutil
-        from settings import default_cache_dir, get_settings
+        from infrastructure.settings_paths import default_cache_dir
 
         if self._clip_prep_thread is not None:
             return  # already preparing
@@ -2665,18 +2703,20 @@ class MusicBrowserList(QFrame):
             return
 
         try:
-            from ..app import DeviceManager
-            dev = DeviceManager.get_instance()
-            ipod_root = dev.device_path or ""
-            artworkdb_path = dev.artworkdb_path or ""
-            artwork_folder = dev.artwork_folder_path or ""
+            session = self._device_sessions.current_session()
+            ipod_root = session.device_path or ""
+            artworkdb_path = session.artworkdb_path or ""
+            artwork_folder = session.artwork_folder_path or ""
         except Exception:
             return
         if not ipod_root:
             return
 
         # Build a fresh temp dir in the user's cache directory
-        cache_root = get_settings().transcode_cache_dir or default_cache_dir()
+        cache_root = (
+            self._settings_service.get_effective_settings().transcode_cache_dir
+            or default_cache_dir()
+        )
         temp_dir = os.path.join(cache_root, ".clip_tmp")
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)

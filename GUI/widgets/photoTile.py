@@ -160,12 +160,12 @@ class PhotoGridTile(QFrame):
                 border-radius: {Metrics.BORDER_RADIUS}px;
             }}
         """)
-        self.caption_frame.setStyleSheet(f"""
-            QFrame#photoTileCaptionFrame {{
+        self.caption_frame.setStyleSheet("""
+            QFrame#photoTileCaptionFrame {
                 background: transparent;
                 border: none;
                 border-radius: 0px;
-            }}
+            }
         """)
         self.title_label.setStyleSheet(
             f"border: none; background: transparent; color: {Colors.TEXT_PRIMARY};"

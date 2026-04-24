@@ -404,12 +404,21 @@ class FingerprintDiffEngine:
         print(plan.summary)
     """
 
-    def __init__(self, pc_library: PCLibrary, ipod_path: str | Path,
-                 supports_video: bool = True, supports_podcast: bool = True):
+    def __init__(
+        self,
+        pc_library: PCLibrary,
+        ipod_path: str | Path,
+        supports_video: bool = True,
+        supports_podcast: bool = True,
+        fpcalc_path: str = "",
+        photo_sync_settings: dict[str, bool] | None = None,
+    ):
         self.pc_library = pc_library
         self.ipod_path = Path(ipod_path)
         self.supports_video = supports_video
         self.supports_podcast = supports_podcast
+        self.fpcalc_path = fpcalc_path
+        self.photo_sync_settings = photo_sync_settings
         self.mapping_manager = MappingManager(ipod_path)
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -446,7 +455,7 @@ class FingerprintDiffEngine:
         Returns:
             SyncPlan
         """
-        if not is_fpcalc_available():
+        if not is_fpcalc_available(self.fpcalc_path):
             raise RuntimeError(
                 "fpcalc not found. Install Chromaprint: https://acoustid.org/chromaprint"
             )
@@ -570,7 +579,11 @@ class FingerprintDiffEngine:
         total = len(pc_tracks)
 
         def _fingerprint_one(track: PCTrack) -> tuple[PCTrack, Optional[str]]:
-            fp = get_or_compute_fingerprint(track.path, write_to_file=write_fingerprints)
+            fp = get_or_compute_fingerprint(
+                track.path,
+                fpcalc_path=self.fpcalc_path,
+                write_to_file=write_fingerprints,
+            )
             return (track, fp)
 
         logger.info(f"Fingerprinting {total} tracks with {fp_workers} workers")
@@ -1143,6 +1156,7 @@ class FingerprintDiffEngine:
                     device_photos,
                     photo_edits,
                     ipod_path=self.ipod_path,
+                    sync_settings=self.photo_sync_settings,
                 )
             elif photo_edits and photo_edits.has_changes:
                 plan.photo_plan = build_photo_sync_plan(
@@ -1150,6 +1164,7 @@ class FingerprintDiffEngine:
                     device_photos,
                     photo_edits,
                     ipod_path=self.ipod_path,
+                    sync_settings=self.photo_sync_settings,
                 )
         except Exception as exc:
             logger.warning("Photo sync planning failed: %s", exc)
@@ -1280,7 +1295,11 @@ class FingerprintDiffEngine:
                 skipped_no_path += 1
                 continue
 
-            fp = get_or_compute_fingerprint(ipod_path, write_to_file=False)
+            fp = get_or_compute_fingerprint(
+                ipod_path,
+                fpcalc_path=self.fpcalc_path,
+                write_to_file=False,
+            )
             if not fp:
                 skipped_no_fp += 1
                 continue

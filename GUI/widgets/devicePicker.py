@@ -9,6 +9,7 @@ Automatically rescans when a new drive is mounted (cross-platform).
 
 import logging
 import sys
+from typing import Any
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -17,8 +18,8 @@ from PyQt6.QtWidgets import (
     QWidget, QGridLayout, QFileDialog, QMessageBox, QFrame,
 )
 
-from ipod_device import DeviceInfo
-from ipod_device import scan_for_ipods
+from app_core.jobs import DeviceScanWorker
+
 from ..ipod_images import get_ipod_image
 from ..styles import Colors, FONT_FAMILY, Metrics, btn_css, accent_btn_css, make_scroll_area
 
@@ -100,21 +101,12 @@ class _DriveWatcher(QThread):
         self._running = False
 
 
-class _ScanThread(QThread):
-    """Background thread to scan for iPods without freezing the UI."""
-    finished = pyqtSignal(list)  # list[DeviceInfo]
-
-    def run(self):
-        ipods = scan_for_ipods()
-        self.finished.emit(ipods)
-
-
 class DeviceCard(QFrame):
     """A clickable card representing a discovered iPod."""
 
-    clicked = pyqtSignal(DeviceInfo)
+    clicked = pyqtSignal(object)
 
-    def __init__(self, ipod: DeviceInfo, parent=None):
+    def __init__(self, ipod: Any, parent=None):
         super().__init__(parent)
         self.ipod = ipod
         self._selected = False
@@ -228,9 +220,9 @@ class DevicePickerDialog(QDialog):
         self.resize(560, 440)
 
         self.selected_path: str = ""
-        self.selected_ipod: DeviceInfo | None = None
+        self.selected_ipod: Any | None = None
         self._cards: list[DeviceCard] = []
-        self._scan_thread: _ScanThread | None = None
+        self._scan_thread: DeviceScanWorker | None = None
 
         # Debounce timer — drives may settle over a second or two after mount
         self._rescan_debounce = QTimer(self)
@@ -354,13 +346,15 @@ class DevicePickerDialog(QDialog):
     def _start_scan(self):
         """Kick off a background scan for iPods."""
         self._subtitle.setText("Scanning for connected iPods...")
+        self._no_devices_label.hide()
         self._rescan_btn.setEnabled(False)
 
-        self._scan_thread = _ScanThread()
+        self._scan_thread = DeviceScanWorker()
         self._scan_thread.finished.connect(self._on_scan_complete)
+        self._scan_thread.error.connect(self._on_scan_error)
         self._scan_thread.start()
 
-    def _on_scan_complete(self, ipods: list[DeviceInfo]):
+    def _on_scan_complete(self, ipods: list[Any]):
         """Handle scan results."""
         self._rescan_btn.setEnabled(True)
 
@@ -392,7 +386,14 @@ class DevicePickerDialog(QDialog):
             self._subtitle.setText("No iPods found")
             self._no_devices_label.show()
 
-    def _on_card_clicked(self, ipod: DeviceInfo):
+    def _on_scan_error(self, error_msg: str) -> None:
+        """Surface scan failures without leaving the dialog stuck as busy."""
+        logger.warning("iPod scan failed: %s", error_msg)
+        self._subtitle.setText("Scan failed")
+        self._rescan_btn.setEnabled(True)
+        self._no_devices_label.show()
+
+    def _on_card_clicked(self, ipod: Any):
         """Handle a device card being clicked."""
         self.selected_path = ipod.path
         self.selected_ipod = ipod

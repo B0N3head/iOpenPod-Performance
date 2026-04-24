@@ -1,10 +1,15 @@
 import difflib
 import logging
 from collections import deque
+from typing import TYPE_CHECKING, Any
+
 from PyQt6.QtCore import QRect, QSize, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QSizePolicy
 from .MBGridViewItem import MusicBrowserGridItem
 from ..styles import Metrics
+
+if TYPE_CHECKING:
+    from app_core.services import DeviceSessionService, LibraryCacheLike
 
 # Fuzzy search: only attempt fuzzy matching for tokens at least this long,
 # and require a SequenceMatcher ratio above the threshold.
@@ -132,8 +137,15 @@ class MusicBrowserGrid(QFrame):
     """Grid view that displays albums, artists, or genres as clickable items."""
     item_selected = pyqtSignal(dict)  # Emits when an item is clicked
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        device_sessions: "DeviceSessionService | None" = None,
+        library_cache: "LibraryCacheLike | None" = None,
+    ):
         super().__init__()
+        self._device_sessions = device_sessions
+        self._library_cache = library_cache
         self._flow = _FlowLayout(self, spacing=Metrics.GRID_SPACING)
         self._flow.setContentsMargins(Metrics.GRID_SPACING, Metrics.GRID_SPACING,
                                       Metrics.GRID_SPACING, Metrics.GRID_SPACING)
@@ -161,12 +173,18 @@ class MusicBrowserGrid(QFrame):
 
     def loadCategory(self, category: str):
         """Load and display items for the specified category."""
-        from ..app import iTunesDBCache, build_album_list, build_artist_list, build_genre_list
+        from app_core.runtime import (
+            build_album_list,
+            build_artist_list,
+            build_genre_list,
+        )
         log.debug(f"loadCategory() called: {category}")
 
         self._current_category = category
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
+        if cache is None:
+            return
         if not cache.is_ready():
             return
 
@@ -272,11 +290,19 @@ class MusicBrowserGrid(QFrame):
 
     def _load_art_async(self):
         """Collect unique mhiiLinks and load artwork in background batches."""
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
 
         links_to_load = set(self._items_by_link.keys()) - self._art_pending
         if not links_to_load:
             return
+        if self._device_sessions is None:
+            return
+
+        session = self._device_sessions.current_session()
+        if not session.device_path or not session.artworkdb_path:
+            return
+        artwork_folder = session.artwork_folder_path or ""
+        cancellation_token = self._device_sessions.manager().cancellation_token
 
         self._art_pending |= links_to_load
         load_id = self._load_id
@@ -285,25 +311,29 @@ class MusicBrowserGrid(QFrame):
 
         for i in range(0, len(links_list), _ART_BATCH_SIZE):
             chunk = links_list[i:i + _ART_BATCH_SIZE]
-            worker = Worker(self._load_art_batch, chunk)
+            worker = Worker(
+                self._load_art_batch,
+                chunk,
+                session.artworkdb_path,
+                artwork_folder,
+                cancellation_token,
+            )
             worker.signals.result.connect(
                 lambda result, lid=load_id: self._on_art_loaded(result, lid)
             )
             pool.start(worker)
 
     @staticmethod
-    def _load_art_batch(links: list[int]) -> dict:
+    def _load_art_batch(
+        links: list[int],
+        artworkdb_path: str,
+        artwork_folder: str,
+        cancellation_token: Any,
+    ) -> dict:
         """Background worker: decode artwork + colors for a batch of mhiiLinks."""
-        from ..app import DeviceManager
         from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
         import os
 
-        device = DeviceManager.get_instance()
-        if not device.device_path:
-            return {}
-
-        artworkdb_path = device.artworkdb_path
-        artwork_folder = device.artwork_folder_path
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
@@ -311,7 +341,7 @@ class MusicBrowserGrid(QFrame):
         results: dict[int, tuple | None] = {}
 
         for link in links:
-            if device.cancellation_token.is_cancelled():
+            if cancellation_token.is_cancelled():
                 break
             result = find_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
             if result is not None:

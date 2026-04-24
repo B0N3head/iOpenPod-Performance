@@ -1,16 +1,19 @@
 """
 iPod product image resolver.
 
-Thin wrapper around ``ipod_device.resolve_image_filename()`` that returns
-a Qt ``QPixmap``.  All data tables (COLOR_MAP, FAMILY_FALLBACK, etc.) live
-in ``ipod_device`` — this file only handles the PyQt6 pixmap loading and
-caching.
+Thin Qt wrapper that returns a ``QPixmap``. Product image filename resolution
+lives in app-core so GUI modules do not import the iPod device package.
 """
 
 from functools import lru_cache
+
+from app_core.device_identity import (
+    generic_ipod_image_filename,
+    resolve_ipod_product_image_filename,
+)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
-from ipod_device import resolve_image_filename, GENERIC_IMAGE
+
 from GUI import PROJECT_ROOT
 
 from .hidpi import scale_pixmap_for_display
@@ -47,10 +50,10 @@ def get_ipod_image(
     Returns:
         QPixmap  to fit within sizexsize.
     """
-    filename = resolve_image_filename(family, generation, color)
+    filename = resolve_ipod_product_image_filename(family, generation, color)
     path = _IMAGE_DIR / filename
     if not path.exists():
-        path = _IMAGE_DIR / GENERIC_IMAGE
+        path = _IMAGE_DIR / generic_ipod_image_filename()
 
     pixmap = QPixmap(str(path))
     if pixmap.isNull():

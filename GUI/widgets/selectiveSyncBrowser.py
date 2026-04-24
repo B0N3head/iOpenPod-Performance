@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import TYPE_CHECKING
+
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor, QPixmap
 from PyQt6.QtWidgets import (
@@ -53,6 +55,9 @@ from ArtworkDB_Writer.art_extractor import (
 from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app_core.services import DeviceSessionService, SettingsService
 
 # ── Artwork extraction helpers ─────────────────────────────────────────────
 
@@ -182,7 +187,7 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
 
     def _load_pc_art(self):
         """Kick off background artwork extraction for PC albums."""
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PIL import Image
 
         # Map grid widget titles back to the pre-stored art paths.
@@ -320,7 +325,11 @@ class _PCMusicBrowserList:
         """Create and configure a MusicBrowserList for PC track use."""
         from .MBListView import MusicBrowserList
 
-        bl = MusicBrowserList()
+        bl = MusicBrowserList(
+            settings_service=owner._settings_service,
+            device_sessions=owner._device_sessions,
+            show_art_override=False,
+        )
 
         # Disable iPod-specific features
         bl.table.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
@@ -340,16 +349,7 @@ class _PCMusicBrowserList:
 
         def _patched_populate():
             owner._has_checkbox_col = False
-            # Temporarily disable art in settings so _populate_table
-            # sees _show_art = False (it reads settings directly).
-            from settings import get_settings
-            s = get_settings()
-            saved = s.show_art_in_tracklist
-            s.show_art_in_tracklist = False
-            try:
-                _orig_populate()
-            finally:
-                s.show_art_in_tracklist = saved
+            _orig_populate()
 
         def _patched_finish():
             _orig_finish()
@@ -381,8 +381,15 @@ class PCTrackListView(QWidget):
     select_all_requested = pyqtSignal()
     deselect_all_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
         self._tracks: list = []
         self._selection: dict[str, bool] = {}
         self._loading = False
@@ -938,8 +945,15 @@ class SelectiveSyncBrowser(QWidget):
     selection_done = pyqtSignal(str, object)  # (folder, frozenset[str])
     cancelled = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
         self._folder = ""
         self._all_tracks: list = []
         self._photo_library = PCPhotoLibrary(sync_root="")
@@ -1122,7 +1136,10 @@ class SelectiveSyncBrowser(QWidget):
         self._content.addWidget(grid_page)  # index 1
 
         # Page 2: track list
-        self._track_list = PCTrackListView()
+        self._track_list = PCTrackListView(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+        )
         self._track_list.toggled.connect(self._on_track_toggled)
         self._track_list.back_requested.connect(self._on_track_back)
         self._track_list.select_all_requested.connect(self._on_group_select_all)
@@ -1159,7 +1176,7 @@ class SelectiveSyncBrowser(QWidget):
 
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
-        cancel_btn.setStyleSheet(btn_css(padding=f"6px 16px", radius=Metrics.BORDER_RADIUS_SM))
+        cancel_btn.setStyleSheet(btn_css(padding="6px 16px", radius=Metrics.BORDER_RADIUS_SM))
         cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         cancel_btn.clicked.connect(self._on_cancel)
         ft_lay.addWidget(cancel_btn)
@@ -1172,7 +1189,7 @@ class SelectiveSyncBrowser(QWidget):
             bg_press=Colors.ACCENT_PRESS,
             fg=Colors.TEXT_ON_ACCENT,
             border=f"1px solid {Colors.ACCENT_BORDER}",
-            padding=f"6px 16px",
+            padding="6px 16px",
             radius=Metrics.BORDER_RADIUS_SM,
         ))
         self._done_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))

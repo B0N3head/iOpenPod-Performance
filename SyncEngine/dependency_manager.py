@@ -35,14 +35,14 @@ def get_bin_dir() -> Path:
     Always co-located with the active settings directory as ``<settings_dir>/bin/``.
     """
     try:
-        from settings import get_settings_dir
+        from infrastructure.settings_paths import get_settings_dir
         return Path(get_settings_dir()) / "bin"
     except Exception:
         pass
 
     # Fallback if settings module isn't available
     try:
-        from settings import default_data_dir
+        from infrastructure.settings_paths import default_data_dir
         return Path(default_data_dir()) / "bin"
     except Exception:
         return Path.home() / "iOpenPod" / "bin"

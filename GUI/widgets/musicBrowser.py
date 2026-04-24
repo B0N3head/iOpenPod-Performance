@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
+
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtWidgets import QFrame, QSplitter, QVBoxLayout, QSizePolicy, QStackedWidget
 from .MBGridView import MusicBrowserGrid
@@ -12,12 +16,29 @@ from ..styles import Colors, make_scroll_area
 
 log = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        LibraryService,
+        SettingsService,
+    )
+
 
 class MusicBrowser(QFrame):
     """Main browser widget with grid and track list views."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        libraries: LibraryService,
+    ):
         super().__init__()
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_service = libraries
+        self._library_cache: LibraryCacheLike = libraries.cache()
         self._current_category = "Albums"
         self._tab_dirty: dict[str, bool] = {
             "Playlists": True,
@@ -37,7 +58,10 @@ class MusicBrowser(QFrame):
         self.gridTrackSplitter = QSplitter(Qt.Orientation.Vertical)
 
         # Top: Header bar + Grid Browser in scroll area, wrapped in a container
-        self.browserGrid = MusicBrowserGrid()
+        self.browserGrid = MusicBrowserGrid(
+            device_sessions=self._device_sessions,
+            library_cache=self._library_cache,
+        )
         self.browserGrid.item_selected.connect(self._onGridItemSelected)
 
         self.browserGridScroll = make_scroll_area()
@@ -70,7 +94,11 @@ class MusicBrowser(QFrame):
         self.trackContainerLayout.setContentsMargins(0, 0, 0, 0)
         self.trackContainerLayout.setSpacing(0)
 
-        self.browserTrack = MusicBrowserList()
+        self.browserTrack = MusicBrowserList(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+            library_cache=self._library_cache,
+        )
         self.browserTrack.setMinimumHeight(0)
         self.browserTrack.setMinimumWidth(0)
         self.browserTrack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -107,8 +135,7 @@ class MusicBrowser(QFrame):
 
         # Set initial sizes (60% grid, 40% tracks) or restore from settings
         try:
-            from settings import get_settings
-            saved = get_settings().splitter_sizes
+            saved = self._settings_service.get_effective_settings().splitter_sizes
             if isinstance(saved, list) and len(saved) == 2:
                 self.gridTrackSplitter.setSizes([int(saved[0]), int(saved[1])])
             else:
@@ -120,11 +147,23 @@ class MusicBrowser(QFrame):
         self.gridTrackSplitter.splitterMoved.connect(self._save_splitter_sizes)
 
         # Playlist browser (shown when Playlists category is active)
-        self.playlistBrowser = PlaylistBrowser()
+        self.playlistBrowser = PlaylistBrowser(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+            libraries=self._library_service,
+        )
 
         # Podcast browser (shown when Podcasts category is active)
-        self.podcastBrowser = PodcastBrowser()
-        self.photoBrowser = PhotoBrowserWidget()
+        self.podcastBrowser = PodcastBrowser(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+            libraries=self._library_service,
+        )
+        self.photoBrowser = PhotoBrowserWidget(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+            libraries=self._library_service,
+        )
 
         # Use a stacked widget to toggle between grid/track and playlist views
         self.stack = QStackedWidget()
@@ -144,9 +183,7 @@ class MusicBrowser(QFrame):
     def _bind_cache_signals(self) -> None:
         """Mark heavy tabs dirty when cache-backed data changes."""
         try:
-            from ..app import iTunesDBCache
-
-            cache = iTunesDBCache.get_instance()
+            cache = self._library_cache
             cache.playlists_changed.connect(lambda: self._mark_tab_dirty("Playlists"))
             cache.photos_changed.connect(lambda: self._mark_tab_dirty("Photos"))
         except Exception:
@@ -180,12 +217,11 @@ class MusicBrowser(QFrame):
     def _save_splitter_sizes(self):
         """Persist the current splitter sizes to settings."""
         try:
-            from settings import get_global_settings
-            s = get_global_settings()
+            s = self._settings_service.get_global_settings()
             s.splitter_sizes = list(self.gridTrackSplitter.sizes())
-            s.save()
+            self._settings_service.save_global_settings(s)
         except Exception:
-            pass
+            log.debug("Failed to save splitter sizes", exc_info=True)
 
     def _apply_constrained_splitter_sizes(self):
         """Apply splitter sizing with constraint: track list <= 50% of window height.
@@ -195,8 +231,7 @@ class MusicBrowser(QFrame):
         taking more than 50% of window height, ensuring grid stays visible.
         """
         try:
-            from settings import get_settings
-            saved = get_settings().splitter_sizes
+            saved = self._settings_service.get_effective_settings().splitter_sizes
             if isinstance(saved, list) and len(saved) == 2:
                 grid_h, track_h = int(saved[0]), int(saved[1])
             else:
@@ -228,8 +263,7 @@ class MusicBrowser(QFrame):
 
     def _refreshCurrentCategory(self):
         """Refresh display based on current category and cache state."""
-        from ..app import iTunesDBCache
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
 
         # Don't do anything if cache isn't ready yet
         if not cache.is_ready():
@@ -352,13 +386,14 @@ class MusicBrowser(QFrame):
 
     def _ensure_podcast_device(self):
         """Bind the podcast browser to the current iPod device if not done."""
-        from ..app import DeviceManager
-        from ipod_device import get_current_device
-
-        dm = DeviceManager.get_instance()
-        if not dm.device_path:
+        session = self._device_sessions.current_session()
+        if not session.device_path:
             return
 
-        device = get_current_device()
-        serial = (device.serial or device.firewire_guid or "_default") if device else "_default"
-        self.podcastBrowser.set_device(serial, dm.device_path)
+        device = session.discovered_ipod
+        serial = (
+            getattr(device, "serial", "")
+            or getattr(device, "firewire_guid", "")
+            or "_default"
+        )
+        self.podcastBrowser.set_device(serial, session.device_path)

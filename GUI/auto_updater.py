@@ -93,7 +93,7 @@ def _platform_asset_pattern() -> re.Pattern:
 
 def _current_version() -> str:
     """Get the running version string."""
-    from settings import get_version
+    from infrastructure.version import get_version
     return get_version()
 
 
@@ -487,7 +487,7 @@ def launch_bootstrap_and_exit(staged_dir: Path) -> bool:
     Returns ``False`` if this is not a frozen build or the bootstrap
     could not be launched.
     """
-    _log_update(f"=== launch_bootstrap_and_exit called ===")
+    _log_update("=== launch_bootstrap_and_exit called ===")
     _log_update(f"sys.frozen={getattr(sys, 'frozen', False)}")
     _log_update(f"sys.executable={sys.executable}")
     _log_update(f"sys.platform={sys.platform}")

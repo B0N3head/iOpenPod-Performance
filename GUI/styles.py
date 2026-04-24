@@ -12,6 +12,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 
+from app_core.device_identity import resolve_ipod_image_color
 from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QColor, QCursor, QPainter, QPalette
 from PyQt6.QtWidgets import (
@@ -581,8 +582,7 @@ def resolve_accent_color(
         return "blue"
     if setting == "match-ipod":
         if ipod_image:
-            from ipod_device import color_for_image
-            rgb = color_for_image(ipod_image)
+            rgb = resolve_ipod_image_color(ipod_image)
             if rgb is not None:
                 # Reject white/silver and black/gray iPods — they don't work
                 # as accent colors. Check saturation: achromatic colors have

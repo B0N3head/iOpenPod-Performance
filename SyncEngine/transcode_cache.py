@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_default_cache_dir() -> Path:
     try:
-        from settings import default_cache_dir
+        from infrastructure.settings_paths import default_cache_dir
         return Path(default_cache_dir())
     except Exception:
         return Path.home() / "iOpenPod" / "cache"
@@ -192,7 +192,12 @@ class TranscodeCache:
     _instance_lock = threading.Lock()
 
     @classmethod
-    def get_instance(cls, cache_dir: Optional[Path] = None) -> "TranscodeCache":
+    def get_instance(
+        cls,
+        cache_dir: Optional[Path] = None,
+        *,
+        max_cache_size_gb: float = 5.0,
+    ) -> "TranscodeCache":
         """Return the shared singleton, creating it on first call.
 
         If *cache_dir* differs from the current instance's directory,
@@ -201,11 +206,22 @@ class TranscodeCache:
         resolved = cache_dir or DEFAULT_CACHE_DIR
         with cls._instance_lock:
             if cls._instance is None or cls._instance.cache_dir != resolved:
-                cls._instance = cls(cache_dir)
+                cls._instance = cls(
+                    cache_dir,
+                    max_cache_size_gb=max_cache_size_gb,
+                )
+            else:
+                cls._instance.max_cache_size_gb = max_cache_size_gb
         return cls._instance
 
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        *,
+        max_cache_size_gb: float = 5.0,
+    ):
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
+        self.max_cache_size_gb = max_cache_size_gb
         self.files_dir = self.cache_dir / "files"
         self.index_path = self.cache_dir / "index.json"
         self._lock = threading.Lock()
@@ -260,8 +276,7 @@ class TranscodeCache:
     def _get_max_bytes(self) -> int:
         """Return the configured max cache size in bytes. 0 = unlimited."""
         try:
-            from settings import get_settings
-            gb = float(getattr(get_settings(), "max_cache_size_gb", 5.0))
+            gb = float(self.max_cache_size_gb)
             return int(gb * 1_073_741_824) if gb > 0 else 0
         except Exception:
             return 0

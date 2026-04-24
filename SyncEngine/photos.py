@@ -247,24 +247,35 @@ def _load_photo_mapping(ipod_path: str | Path) -> dict[str, PhotoMappingEntry]:
     return {}
 
 
-def _current_photo_sync_settings() -> dict[str, bool]:
-    try:
-        from settings import get_settings
-        settings = get_settings()
-        return {
-            "rotate_tall_photos_for_device": bool(
-                getattr(settings, "rotate_tall_photos_for_device", False)
-            ),
-            "fit_photo_thumbnails": bool(
-                getattr(settings, "fit_photo_thumbnails", False)
-            ),
-        }
-    except Exception as exc:
-        logger.debug("Photo sync settings load failed: %s", exc)
+def photo_sync_settings_from_settings(settings: object) -> dict[str, bool]:
+    """Extract the photo sync settings needed by this module."""
+
+    return {
+        "rotate_tall_photos_for_device": bool(
+            getattr(settings, "rotate_tall_photos_for_device", False)
+        ),
+        "fit_photo_thumbnails": bool(
+            getattr(settings, "fit_photo_thumbnails", False)
+        ),
+    }
+
+
+def _current_photo_sync_settings(
+    sync_settings: Optional[dict[str, bool]] = None,
+) -> dict[str, bool]:
+    if sync_settings is None:
         return {
             "rotate_tall_photos_for_device": False,
             "fit_photo_thumbnails": False,
         }
+    return {
+        "rotate_tall_photos_for_device": bool(
+            sync_settings.get("rotate_tall_photos_for_device", False)
+        ),
+        "fit_photo_thumbnails": bool(
+            sync_settings.get("fit_photo_thumbnails", False)
+        ),
+    }
 
 
 def _load_photo_mapping_settings(ipod_path: str | Path) -> dict[str, bool]:
@@ -1261,6 +1272,7 @@ def _write_photo_db_snapshot(
     source_images: dict[int, Image.Image],
     progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    sync_settings: Optional[dict[str, bool]] = None,
 ) -> None:
     ipod_path = Path(ipod_path)
     db_path = _photo_db_path(ipod_path)
@@ -1273,7 +1285,7 @@ def _write_photo_db_snapshot(
     formats = _photo_formats_for_current_device(ipod_path)
     if not formats:
         raise RuntimeError("No photo formats available for the current device")
-    sync_settings = _current_photo_sync_settings()
+    sync_settings = _current_photo_sync_settings(sync_settings)
     rotate_tall_photos = bool(sync_settings.get("rotate_tall_photos_for_device", False))
     fit_thumbnails = bool(sync_settings.get("fit_photo_thumbnails", False))
 
@@ -1383,13 +1395,14 @@ def build_photo_sync_plan(
     staged_edits: Optional[PhotoEditState] = None,
     *,
     ipod_path: str | Path | None = None,
+    sync_settings: Optional[dict[str, bool]] = None,
 ) -> PhotoSyncPlan:
     library = _apply_photo_edits(pc_photos, staged_edits)
     photodb = copy.deepcopy(device_photos)
     if ipod_path is not None:
         # Keep sync planning deterministic from on-device data only.
         _ensure_visual_hashes(photodb, ipod_path)
-    sync_settings = _current_photo_sync_settings()
+    sync_settings = _current_photo_sync_settings(sync_settings)
     stored_sync_settings = (
         _load_photo_mapping_settings(ipod_path) if ipod_path is not None
         else {
@@ -1648,7 +1661,7 @@ def write_photo_db_metadata_only(
     _save_photo_mapping(
         ipod_path,
         photodb,
-        sync_settings=sync_settings if sync_settings is not None else _current_photo_sync_settings(),
+        sync_settings=_current_photo_sync_settings(sync_settings),
     )
 
 
@@ -2006,6 +2019,7 @@ def _apply_photo_sync_plan_incremental(
     photo_plan: PhotoSyncPlan,
     progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    sync_settings: Optional[dict[str, bool]] = None,
 ) -> PhotoDB:
     """Apply photo sync plan incrementally in three phases.
 
@@ -2019,7 +2033,7 @@ def _apply_photo_sync_plan_incremental(
 
     _remove_deleted_full_res_files(ipod_path, pre_merge_by_id, change_set.removed_ids)
 
-    sync_settings = _current_photo_sync_settings()
+    sync_settings = _current_photo_sync_settings(sync_settings)
 
     # Albums/membership/removes-only plans can skip re-encoding entirely.
     if not change_set.touch_ids:
@@ -2061,6 +2075,7 @@ def apply_photo_sync_plan(
     photo_plan: Optional[PhotoSyncPlan],
     progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    sync_settings: Optional[dict[str, bool]] = None,
 ) -> PhotoDB:
     ipod_path = Path(ipod_path)
     current_db = copy.deepcopy(photo_plan.current_db if photo_plan and photo_plan.current_db else read_photo_db(ipod_path))
@@ -2073,4 +2088,5 @@ def apply_photo_sync_plan(
         photo_plan,
         progress_callback=progress_callback,
         is_cancelled=is_cancelled,
+        sync_settings=sync_settings,
     )

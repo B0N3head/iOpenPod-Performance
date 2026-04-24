@@ -1,0 +1,97 @@
+{
+  "allowed_gui_forbidden_imports": {
+    "GUI/widgets/MBListView.py": [
+      "SyncEngine._playlist_builder"
+    ],
+    "GUI/widgets/musicBrowser.py": [
+      "ipod_device"
+    ],
+    "GUI/widgets/photoBrowser.py": [
+      "SyncEngine.photos",
+      "ipod_device.artwork"
+    ],
+    "GUI/widgets/podcastBrowser.py": [
+      "PodcastManager.feed_parser",
+      "PodcastManager.models",
+      "PodcastManager.podcast_sync",
+      "PodcastManager.subscription_store"
+    ],
+    "GUI/widgets/podcastSearchDialog.py": [
+      "PodcastManager.itunes_search"
+    ],
+    "GUI/widgets/selectiveSyncBrowser.py": [
+      "SyncEngine.pc_library",
+      "SyncEngine.photos"
+    ],
+    "GUI/widgets/settingsPage.py": [
+      "SyncEngine.audio_fingerprint",
+      "SyncEngine.dependency_manager",
+      "SyncEngine.scrobbler",
+      "SyncEngine.transcode_cache",
+      "SyncEngine.transcoder",
+      "ipod_device"
+    ]
+  },
+  "allowed_import_cycles": [
+    [
+      "ipod_device.authority",
+      "ipod_device.info",
+      "ipod_device.scanner",
+      "ipod_device.vpd_libusb",
+      "ipod_device.vpd_linux"
+    ],
+    [
+      "ArtworkDB_Parser.chunk_parser",
+      "ArtworkDB_Parser.mhfd_parser",
+      "ArtworkDB_Parser.mhii_parser",
+      "ArtworkDB_Parser.mhli_parser",
+      "ArtworkDB_Parser.mhni_parser",
+      "ArtworkDB_Parser.mhod_parser",
+      "ArtworkDB_Parser.mhsd_parser"
+    ],
+    [
+      "iTunesDB_Parser.chunk_parser",
+      "iTunesDB_Parser.mhbd_parser",
+      "iTunesDB_Parser.mhia_parser",
+      "iTunesDB_Parser.mhii_parser",
+      "iTunesDB_Parser.mhip_parser",
+      "iTunesDB_Parser.mhit_parser",
+      "iTunesDB_Parser.mhsd_parser",
+      "iTunesDB_Parser.mhyp_parser"
+    ]
+  ],
+  "allowed_runtime_singleton_access": {},
+  "allowed_except_exception_pass_counts": {
+    "ArtworkDB_Writer/art_extractor.py": 3,
+    "GUI/app.py": 2,
+    "GUI/hidpi.py": 4,
+    "GUI/styles.py": 2,
+    "GUI/widgets/MBListView.py": 5,
+    "GUI/widgets/backupBrowser.py": 1,
+    "GUI/widgets/musicBrowser.py": 2,
+    "GUI/widgets/playlistBrowser.py": 7,
+    "GUI/widgets/podcastBrowser.py": 4,
+    "GUI/widgets/selectiveSyncBrowser.py": 2,
+    "GUI/widgets/settingsPage.py": 2,
+    "GUI/widgets/sidebar.py": 1,
+    "GUI/widgets/syncReview.py": 1,
+    "PodcastManager/downloader.py": 2,
+    "PodcastManager/feed_parser.py": 1,
+    "SQLiteDB_Writer/cbk_writer.py": 3,
+    "SyncEngine/audio_fingerprint.py": 2,
+    "SyncEngine/dependency_manager.py": 1,
+    "SyncEngine/photos.py": 2,
+    "SyncEngine/sync_executor.py": 5,
+    "SyncEngine/transcode_cache.py": 1,
+    "SyncEngine/transcoder.py": 6,
+    "app_core/bootstrap.py": 3,
+    "iTunesDB_Writer/hash72.py": 1,
+    "iTunesDB_Writer/mhbd_writer.py": 3,
+    "ipod_device/authority.py": 1,
+    "ipod_device/dump.py": 1,
+    "ipod_device/info.py": 4,
+    "ipod_device/usb_backend.py": 1,
+    "ipod_device/vpd_iokit.py": 1,
+    "ipod_device/vpd_libusb.py": 5
+  }
+}

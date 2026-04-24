@@ -6,14 +6,21 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
     QProgressBar, QPushButton,
     QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout,
     QWidget,
+)
+
+from app_core.jobs import (
+    PlaylistDeleteWorker as _PlaylistDeleteWorker,
+    PlaylistImportWorker as _PlaylistImportWorker,
+    PlaylistWriteWorker as _PlaylistWriteWorker,
 )
 
 from ..styles import (
@@ -41,6 +48,14 @@ from .playlistEditor import NewPlaylistDialog, RegularPlaylistEditor, SmartPlayl
 from .trackListTitleBar import TrackListTitleBar
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        LibraryService,
+        SettingsService,
+    )
 
 # Icons for each playlist type
 _ICON_REGULAR = "annotation-dots"
@@ -678,8 +693,16 @@ class PlaylistBrowser(QFrame):
         - **Edit**   — SmartPlaylistEditor replaces info card
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        libraries: LibraryService,
+    ):
         super().__init__()
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_cache: LibraryCacheLike = libraries.cache()
         self._current_playlist: dict | None = None
         self._editing = False
         self._playlist_signature: tuple | None = None
@@ -816,7 +839,11 @@ class PlaylistBrowser(QFrame):
         self.trackTitleBar = TrackListTitleBar(self.rightSplitter)
         self.trackContainerLayout.addWidget(self.trackTitleBar)
 
-        self.trackList = MusicBrowserList()
+        self.trackList = MusicBrowserList(
+            settings_service=self._settings_service,
+            device_sessions=self._device_sessions,
+            library_cache=self._library_cache,
+        )
         self.trackList.setMinimumHeight(0)
         self.trackList.setMinimumWidth(0)
         self.trackList.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -845,8 +872,7 @@ class PlaylistBrowser(QFrame):
 
     def loadPlaylists(self) -> None:
         """Load playlists from iTunesDBCache and populate the list panel."""
-        from ..app import iTunesDBCache
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         if not cache.is_ready():
             return
 
@@ -934,10 +960,8 @@ class PlaylistBrowser(QFrame):
         if self._editing:
             self._switchToBrowse()
 
-        from ..app import iTunesDBCache
-
         self._current_playlist = playlist
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         if not cache.is_ready():
             return
 
@@ -1025,13 +1049,11 @@ class PlaylistBrowser(QFrame):
         then immediately writes the full database to the iPod so the
         change takes effect right away.
         """
-        from ..app import iTunesDBCache
-
         # Tag smart playlists appropriately
         if playlist_data.get("smart_playlist_data"):
             playlist_data.setdefault("_source", "regular")
 
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         cache.save_user_playlist(playlist_data)
 
         # Remember the saved playlist so we can re-select it
@@ -1059,8 +1081,7 @@ class PlaylistBrowser(QFrame):
 
     def _refreshList(self) -> None:
         """Reload the playlist list from cache."""
-        from ..app import iTunesDBCache
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         if cache.is_ready():
             playlists = cache.get_playlists()
             self.listPanel.loadPlaylists(playlists)
@@ -1083,9 +1104,7 @@ class PlaylistBrowser(QFrame):
 
     def _deletePlaylistFromIPod(self, playlist: dict) -> None:
         """Remove a playlist from cache and rewrite the iPod database."""
-        from ..app import iTunesDBCache
-
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         pid = playlist.get("playlist_id", 0)
 
         # Remove from user playlists cache (if it was user-created)
@@ -1096,7 +1115,11 @@ class PlaylistBrowser(QFrame):
         self.infoCard.delete_btn.setEnabled(False)
         self.infoCard.evaluate_btn.setEnabled(False)
 
-        self._delete_worker = _PlaylistDeleteWorker(playlist)
+        self._delete_worker = _PlaylistDeleteWorker(
+            playlist,
+            self._device_sessions.current_session().device_path or "",
+            self._library_cache,
+        )
         self._delete_worker.finished_ok.connect(self._onDeleteDone)
         self._delete_worker.failed.connect(self._onDeleteFailed)
         self._delete_worker.start()
@@ -1146,7 +1169,11 @@ class PlaylistBrowser(QFrame):
         self.infoCard.evaluate_btn.setText("Writing…")
         self.infoCard.evaluate_btn.setVisible(True)
 
-        self._eval_worker = _PlaylistWriteWorker(playlist)
+        self._eval_worker = _PlaylistWriteWorker(
+            playlist,
+            self._device_sessions.current_session().device_path or "",
+            self._library_cache,
+        )
         self._eval_worker.finished_ok.connect(self._onWriteDone)
         self._eval_worker.failed.connect(self._onWriteFailed)
         self._eval_worker.start()
@@ -1181,8 +1208,7 @@ class PlaylistBrowser(QFrame):
 
     def _rescanAfterWrite(self) -> None:
         """Rescan the iPod database after a short post-write delay."""
-        from ..app import iTunesDBCache
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         cache.invalidate()
         cache.start_loading()
 
@@ -1225,7 +1251,6 @@ class PlaylistBrowser(QFrame):
     def _onExportClicked(self) -> None:
         """Export the current playlist to a standard playlist file."""
         import os
-        from ..app import DeviceManager
 
         tracks = self.trackList.tracks
         if not tracks:
@@ -1247,8 +1272,7 @@ class PlaylistBrowser(QFrame):
         if not path:
             return
 
-        device = DeviceManager.get_instance()
-        ipod_root = device.device_path or ""
+        ipod_root = self._device_sessions.current_session().device_path or ""
 
         def _abs_path(track: dict) -> str:
             location = track.get("Location", "")
@@ -1276,8 +1300,7 @@ class PlaylistBrowser(QFrame):
 
     def _onImportPlaylist(self) -> None:
         """Open a file dialog and kick off the import worker."""
-        from ..app import DeviceManager
-        device = DeviceManager.get_instance()
+        device = self._device_sessions.current_session()
         if not device.device_path:
             QMessageBox.warning(self, "No Device", "Please connect an iPod first.")
             return
@@ -1291,8 +1314,7 @@ class PlaylistBrowser(QFrame):
         if not path:
             return
 
-        from settings import get_settings
-        settings = get_settings()
+        settings = self._settings_service.get_effective_settings()
 
         self._set_import_busy(True)
         self._topStack.setCurrentIndex(3)
@@ -1304,6 +1326,7 @@ class PlaylistBrowser(QFrame):
             playlist_file=path,
             ipod_path=str(device.device_path),
             fpcalc_path=settings.fpcalc_path,
+            cache=self._library_cache,
         )
         self._import_worker.progress.connect(self._onImportProgress)
         self._import_worker.finished_ok.connect(self._onImportDone)
@@ -1401,571 +1424,3 @@ class PlaylistBrowser(QFrame):
         return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
             root, encoding="unicode"
         ) + "\n"
-
-
-# =============================================================================
-# _PlaylistWriteWorker — background thread for playlist save + write
-# =============================================================================
-
-class _PlaylistWriteWorker(QThread):
-    """Merge a playlist into the iPod database and rewrite it."""
-
-    finished_ok = pyqtSignal(int, str)  # matched_count, playlist_name
-    failed = pyqtSignal(str)            # error message
-
-    def __init__(self, playlist: dict):
-        super().__init__()
-        self._playlist = playlist
-
-    def run(self):
-        try:
-            from ..app import iTunesDBCache, DeviceManager
-            from SyncEngine.sync_executor import SyncExecutor, _SyncContext
-            from SyncEngine.mapping import MappingFile
-
-            cache = iTunesDBCache.get_instance()
-            device = DeviceManager.get_instance()
-            ipod_path = device.device_path
-            if not ipod_path:
-                self.failed.emit("No iPod connected.")
-                return
-
-            data = cache.get_data()
-            if not data:
-                self.failed.emit("No iPod database loaded.")
-                return
-
-            playlist = self._playlist
-            name = playlist.get("Title", "Untitled")
-
-            # ── Build a SyncExecutor to reuse its write + eval logic ──
-            executor = SyncExecutor(ipod_path)
-
-            existing_db = executor._read_existing_database()
-            existing_tracks_data = existing_db["tracks"]
-            existing_playlists_raw = list(existing_db["playlists"])
-            existing_smart_raw = list(existing_db["smart_playlists"])
-
-            # Build a minimal context for _build_and_evaluate_playlists
-            ctx = _SyncContext(
-                plan=None,  # type: ignore[arg-type]
-                mapping=MappingFile(),
-                progress_callback=None,
-                dry_run=False,
-                write_back_to_pc=False,
-                _is_cancelled=None,
-            )
-            ctx.existing_tracks_data = existing_tracks_data
-            ctx.existing_playlists_raw = existing_playlists_raw
-            ctx.existing_smart_raw = existing_smart_raw
-
-            # Convert tracks to TrackInfo objects
-            all_tracks = []
-            for t in existing_tracks_data:
-                all_tracks.append(executor._track_dict_to_info(t))
-
-            # Update the target playlist in the raw lists
-            target_pid = playlist.get("playlist_id", 0)
-            replaced = False
-            for i, epl in enumerate(existing_playlists_raw):
-                if epl.get("playlist_id") == target_pid:
-                    existing_playlists_raw[i] = playlist
-                    replaced = True
-                    break
-            if not replaced:
-                for i, epl in enumerate(existing_smart_raw):
-                    if epl.get("playlist_id") == target_pid:
-                        existing_smart_raw[i] = playlist
-                        replaced = True
-                        break
-            if not replaced:
-                # New playlist — also merge any other user playlists
-                existing_playlists_raw.append(playlist)
-
-            # Also merge other pending user playlists
-            try:
-                for upl in cache.get_user_playlists():
-                    uid = upl.get("playlist_id", 0)
-                    if uid == target_pid:
-                        continue  # already handled above
-                    is_new = upl.get("_isNew", False)
-                    if is_new:
-                        existing_playlists_raw.append(upl)
-                    else:
-                        ureplaced = False
-                        for i, epl in enumerate(existing_playlists_raw):
-                            if epl.get("playlist_id") == uid:
-                                existing_playlists_raw[i] = upl
-                                ureplaced = True
-                                break
-                        if not ureplaced:
-                            existing_playlists_raw.append(upl)
-            except Exception:
-                pass
-
-            # Build and evaluate all playlists
-            _master_name, playlists, smart_playlists = executor._build_and_evaluate_playlists(
-                ctx, all_tracks,
-            )
-
-            # Find how many tracks matched our target playlist
-            matched_count = 0
-            for pl in playlists:
-                if pl.playlist_id == target_pid:
-                    matched_count = len(pl.track_ids)
-                    break
-            else:
-                for pl in smart_playlists:
-                    if pl.playlist_id == target_pid:
-                        matched_count = len(pl.track_ids)
-                        break
-
-            # Write the database
-            success = executor._write_database(
-                all_tracks,
-                playlists=playlists,
-                smart_playlists=smart_playlists,
-                master_playlist_name=_master_name,
-            )
-
-            if success:
-                # Clear pending playlists — they've been written
-                try:
-                    cache._user_playlists.clear()
-                except Exception:
-                    pass
-                # OTG playlists were imported into the iTunesDB above;
-                # delete the source files so they aren't re-imported.
-                try:
-                    import os as _os
-                    from iTunesDB_Parser.otg import delete_otg_files
-                    delete_otg_files(
-                        _os.path.join(str(ipod_path), "iPod_Control", "iTunes")
-                    )
-                except Exception:
-                    pass
-                self.finished_ok.emit(matched_count, name)
-            else:
-                self.failed.emit("Database write returned False.")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.failed.emit(str(e))
-
-
-# =============================================================================
-# _PlaylistDeleteWorker — background thread for playlist deletion + rewrite
-# =============================================================================
-
-class _PlaylistDeleteWorker(QThread):
-    """Remove a playlist from the iPod database and rewrite it."""
-
-    finished_ok = pyqtSignal(str)   # playlist_name
-    failed = pyqtSignal(str)        # error message
-
-    def __init__(self, playlist: dict):
-        super().__init__()
-        self._playlist = playlist
-
-    def run(self):
-        try:
-            from ..app import iTunesDBCache, DeviceManager
-            from SyncEngine.sync_executor import SyncExecutor, _SyncContext
-            from SyncEngine.mapping import MappingFile
-
-            cache = iTunesDBCache.get_instance()
-            device = DeviceManager.get_instance()
-            ipod_path = device.device_path
-            if not ipod_path:
-                self.failed.emit("No iPod connected.")
-                return
-
-            data = cache.get_data()
-            if not data:
-                self.failed.emit("No iPod database loaded.")
-                return
-
-            playlist = self._playlist
-            name = playlist.get("Title", "Untitled")
-            target_pid = playlist.get("playlist_id", 0)
-
-            executor = SyncExecutor(ipod_path)
-
-            existing_db = executor._read_existing_database()
-            existing_tracks_data = existing_db["tracks"]
-            existing_playlists_raw = list(existing_db["playlists"])
-            existing_smart_raw = list(existing_db["smart_playlists"])
-
-            # Build a minimal context for _build_and_evaluate_playlists
-            ctx = _SyncContext(
-                plan=None,  # type: ignore[arg-type]
-                mapping=MappingFile(),
-                progress_callback=None,
-                dry_run=False,
-                write_back_to_pc=False,
-                _is_cancelled=None,
-            )
-            # Remove the target playlist from the raw lists
-            existing_playlists_raw = [
-                p for p in existing_playlists_raw
-                if p.get("playlist_id") != target_pid
-            ]
-            existing_smart_raw = [
-                p for p in existing_smart_raw
-                if p.get("playlist_id") != target_pid
-            ]
-
-            ctx.existing_tracks_data = existing_tracks_data
-            ctx.existing_playlists_raw = existing_playlists_raw
-            ctx.existing_smart_raw = existing_smart_raw
-
-            # Convert tracks to TrackInfo objects
-            all_tracks = []
-            for t in existing_tracks_data:
-                all_tracks.append(executor._track_dict_to_info(t))
-
-            # Merge remaining user playlists (excluding the deleted one)
-            try:
-                for upl in cache.get_user_playlists():
-                    uid = upl.get("playlist_id", 0)
-                    if uid == target_pid:
-                        continue
-                    is_new = upl.get("_isNew", False)
-                    if is_new:
-                        existing_playlists_raw.append(upl)
-                    else:
-                        ureplaced = False
-                        for i, epl in enumerate(existing_playlists_raw):
-                            if epl.get("playlist_id") == uid:
-                                existing_playlists_raw[i] = upl
-                                ureplaced = True
-                                break
-                        if not ureplaced:
-                            existing_playlists_raw.append(upl)
-            except Exception:
-                pass
-
-            # Build and evaluate all playlists
-            master_name, playlists, smart_playlists = executor._build_and_evaluate_playlists(
-                ctx, all_tracks,
-            )
-
-            # Write the database
-            success = executor._write_database(
-                all_tracks,
-                playlists=playlists,
-                smart_playlists=smart_playlists,
-                master_playlist_name=master_name,
-            )
-
-            if success:
-                # Clear pending playlists — they've been written
-                try:
-                    cache._user_playlists.clear()
-                except Exception:
-                    pass
-                self.finished_ok.emit(name)
-            else:
-                self.failed.emit("Database write returned False.")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.failed.emit(str(e))
-
-
-# =============================================================================
-# _PlaylistImportWorker — background thread for playlist file import
-# =============================================================================
-
-class _PlaylistImportWorker(QThread):
-    """Parse a playlist file, add missing tracks to iPod, create the playlist."""
-
-    progress = pyqtSignal(int, int, str)       # current, total, message
-    finished_ok = pyqtSignal(str, int, int, int)  # name, added, already_present, skipped
-    failed = pyqtSignal(str)                 # error message
-
-    def __init__(
-        self,
-        playlist_file: str,
-        ipod_path: str,
-        fpcalc_path: str,
-    ):
-        super().__init__()
-        self._playlist_file = playlist_file
-        self._ipod_path = ipod_path
-        self._fpcalc_path = fpcalc_path or None
-
-    def run(self):  # noqa: C901
-        try:
-            import random
-            from pathlib import Path
-
-            from SyncEngine.playlist_parser import parse_playlist
-            from SyncEngine.mapping import MappingManager
-            from SyncEngine.audio_fingerprint import get_or_compute_fingerprint
-            from SyncEngine.pc_library import PCLibrary
-            from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction
-            from SyncEngine.sync_executor import SyncExecutor, _SyncContext
-            from SyncEngine.mapping import MappingFile
-            from ..app import iTunesDBCache
-
-            # ── 1. Parse playlist file ──────────────────────────────────────
-            self.progress.emit(0, 0, "Parsing playlist file…")
-            try:
-                raw_paths, playlist_name = parse_playlist(self._playlist_file)
-            except Exception as exc:
-                self.failed.emit(f"Failed to parse playlist: {exc}")
-                return
-
-            if not raw_paths:
-                self.failed.emit("Playlist contains no tracks.")
-                return
-
-            # ── 2. Pre-screen: only files that exist on disk ────────────────
-            existing_paths: list[str] = []
-            skipped = 0
-            for p in raw_paths:
-                if Path(p).is_file():
-                    existing_paths.append(p)
-                else:
-                    skipped += 1
-
-            total = len(existing_paths)
-            if not existing_paths:
-                self.failed.emit("None of the playlist files could be found on this PC.")
-                return
-
-            self.progress.emit(0, total, f"Scanning {total} tracks…")
-
-            # ── 3. Fast-path: resolve iPod files by path lookup (O(1)) ──────
-            # Tracks already on the iPod have a known Location in iTunesDB.
-            # Convert file path → colon-separated Location and look up in a dict.
-            # No fpcalc needed for these.
-            ipod_root = Path(self._ipod_path)
-            cache = iTunesDBCache.get_instance()
-            track_id_index = cache.get_track_id_index()
-
-            loc_to_db_track_id: dict[str, int] = {}
-            for track in track_id_index.values():
-                loc = track.get("Location", "")
-                db_track_id = track.get("db_track_id", track.get("db_id"))
-                if loc and db_track_id:
-                    loc_to_db_track_id[loc.lower()] = db_track_id
-
-            def _path_to_location(p: Path) -> str:
-                try:
-                    rel = p.relative_to(ipod_root)
-                except ValueError:
-                    return ""
-                return ":" + str(rel).replace("\\", ":").replace("/", ":")
-
-            playlist_db_track_ids: list[int] = []
-            needs_fingerprint: list[str] = []
-            already_present_fps: list[str] = []
-            fast_path_count = 0
-
-            for i, p in enumerate(existing_paths):
-                fname = Path(p).name
-                loc = _path_to_location(Path(p))
-                if loc:
-                    db_track_id = loc_to_db_track_id.get(loc.lower())
-                    if db_track_id is not None:
-                        playlist_db_track_ids.append(db_track_id)
-                        fast_path_count += 1
-                        self.progress.emit(i + 1, total, f"On iPod: {fname}")
-                        continue
-                needs_fingerprint.append(p)
-                self.progress.emit(i + 1, total, f"Needs ID check: {fname}")
-
-            # ── 4. Fingerprint tracks that weren't resolved by path ─────────
-            to_add: list[SyncItem] = []
-
-            if needs_fingerprint:
-                mapping = MappingManager(self._ipod_path).load()
-                n_fp = len(needs_fingerprint)
-
-                for j, p in enumerate(needs_fingerprint):
-                    fname = Path(p).name
-                    # Global position: path-resolved tracks already counted
-                    global_i = fast_path_count + j + 1
-                    self.progress.emit(
-                        global_i, total,
-                        f"Identifying ({j + 1} of {n_fp}): {fname}",
-                    )
-
-                    fp = get_or_compute_fingerprint(p, self._fpcalc_path)
-                    if fp is None:
-                        skipped += 1
-                        continue
-
-                    if mapping.get_entries(fp):
-                        # Already on iPod under a different filename/path
-                        already_present_fps.append(fp)
-                        self.progress.emit(
-                            global_i, total,
-                            f"Already on iPod: {fname}",
-                        )
-                        continue
-
-                    # Genuinely new — queue for add
-                    self.progress.emit(
-                        global_i, total,
-                        f"New track, will add: {fname}",
-                    )
-                    lib = PCLibrary(str(Path(p).parent))
-                    pc_track = lib._read_track(Path(p))
-                    if pc_track is None:
-                        skipped += 1
-                        continue
-
-                    to_add.append(SyncItem(
-                        action=SyncAction.ADD_TO_IPOD,
-                        fingerprint=fp,
-                        pc_track=pc_track,
-                    ))
-
-            # ── 5. Execute adds (only for genuinely new PC files) ───────────
-            if to_add:
-                n_add = len(to_add)
-                self.progress.emit(0, n_add, f"Adding {n_add} track(s) to iPod…")
-
-                from SyncEngine.sync_executor import SyncProgress as _SP
-
-                def _prog(p: _SP) -> None:
-                    msg = p.message or ""
-                    if p.current and p.total:
-                        self.progress.emit(p.current, p.total, msg)
-                    else:
-                        # Keep bar determinate at last known position when total is unknown
-                        self.progress.emit(p.current or 0, n_add, msg)
-
-                executor = SyncExecutor(self._ipod_path)
-                fresh_mapping = MappingManager(self._ipod_path).load()
-                result = executor.execute(
-                    plan=SyncPlan(to_add=to_add),
-                    mapping=fresh_mapping,
-                    progress_callback=_prog,
-                )
-                if not result.success:
-                    err = result.errors[0] if result.errors else "Unknown error"
-                    self.failed.emit(f"Sync failed: {err}")
-                    return
-
-            # ── 6. Resolve db_track_ids for fingerprint-matched tracks ──────
-            if already_present_fps or to_add:
-                self.progress.emit(0, 0, "Resolving track IDs…")
-                final_mapping = MappingManager(self._ipod_path).load()
-
-                for fp in already_present_fps:
-                    entries = final_mapping.get_entries(fp)
-                    if entries:
-                        playlist_db_track_ids.append(entries[0].db_track_id)
-
-                for item in to_add:
-                    if item.fingerprint is None:
-                        continue
-                    entries = final_mapping.get_entries(item.fingerprint)
-                    if entries:
-                        playlist_db_track_ids.append(entries[0].db_track_id)
-
-            if not playlist_db_track_ids:
-                self.failed.emit("No tracks could be matched to iPod database IDs.")
-                return
-
-            # ── 7. Write playlist ───────────────────────────────────────────
-            self.progress.emit(0, 0, f"Writing playlist '{playlist_name}'…")
-
-            # Read DB first so we can build the db_track_id → tid map.
-            # _build_regular_playlists expects playlist items to use the
-            # internal track_id (tid), NOT the db_track_id — it then converts
-            # tid → db_track_id via old_tid_to_db_track_id.  Using db_track_ids directly
-            # causes every item to be silently dropped (empty playlist).
-            executor2 = SyncExecutor(self._ipod_path)
-            existing_db = executor2._read_existing_database()
-            existing_tracks_data = existing_db["tracks"]
-            existing_playlists_raw = list(existing_db["playlists"])
-            existing_smart_raw = list(existing_db["smart_playlists"])
-
-            db_track_id_to_tid: dict[int, int] = {}
-            for t in existing_tracks_data:
-                tid = t.get("track_id", 0)
-                db_track_id = t.get("db_track_id", t.get("db_id", 0))
-                if tid and db_track_id:
-                    db_track_id_to_tid[db_track_id] = tid
-
-            playlist_items = []
-            for db_track_id in playlist_db_track_ids:
-                tid = db_track_id_to_tid.get(db_track_id)
-                if tid:
-                    playlist_items.append({"track_id": tid})
-                # If tid not found the track isn't in the DB — skip silently
-
-            playlist_dict = {
-                "Title": playlist_name,
-                "playlist_id": random.getrandbits(64),
-                "_isNew": True,
-                "_source": "regular",
-                "items": playlist_items,
-            }
-
-            ctx = _SyncContext(
-                plan=None,  # type: ignore[arg-type]
-                mapping=MappingFile(),
-                progress_callback=None,
-                dry_run=False,
-                write_back_to_pc=False,
-                _is_cancelled=None,
-            )
-            ctx.existing_tracks_data = existing_tracks_data
-            ctx.existing_playlists_raw = existing_playlists_raw
-            ctx.existing_smart_raw = existing_smart_raw
-
-            existing_playlists_raw.append(playlist_dict)
-            try:
-                for upl in cache.get_user_playlists():
-                    uid = upl.get("playlist_id", 0)
-                    is_new = upl.get("_isNew", False)
-                    if is_new:
-                        existing_playlists_raw.append(upl)
-                    else:
-                        for idx, epl in enumerate(existing_playlists_raw):
-                            if epl.get("playlist_id") == uid:
-                                existing_playlists_raw[idx] = upl
-                                break
-            except Exception:
-                pass
-
-            all_tracks = [executor2._track_dict_to_info(t) for t in existing_tracks_data]
-            _master_name, playlists, smart_playlists = executor2._build_and_evaluate_playlists(
-                ctx, all_tracks,
-            )
-            success = executor2._write_database(
-                all_tracks,
-                playlists=playlists,
-                smart_playlists=smart_playlists,
-                master_playlist_name=_master_name,
-            )
-
-            if not success:
-                self.failed.emit("Database write returned False.")
-                return
-
-            try:
-                cache._user_playlists.clear()
-            except Exception:
-                pass
-
-            # ── 8. Done ─────────────────────────────────────────────────────
-            self.finished_ok.emit(
-                playlist_name,
-                len(to_add),
-                fast_path_count + len(already_present_fps),
-                skipped,
-            )
-
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            self.failed.emit(str(exc))

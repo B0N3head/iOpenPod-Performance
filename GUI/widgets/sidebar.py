@@ -4,6 +4,8 @@ from PyQt6.QtWidgets import (
     QLabel, QWidget, QProgressBar, QLineEdit, QSizePolicy
 )
 from PyQt6.QtGui import QFont, QCursor, QFontMetrics, QRegularExpressionValidator
+from app_core.device_identity import format_checksum_type_name
+
 from .formatters import format_size, format_duration_human as format_duration
 from ..ipod_images import get_ipod_image
 from ..glyphs import glyph_icon, glyph_pixmap
@@ -147,6 +149,7 @@ class DeviceInfoCard(QFrame):
     def __init__(self):
         super().__init__()
         self._rename_edit: QLineEdit | None = None
+        self._device_info = None
         self.setStyleSheet(f"""
             QFrame {{
                 background: {Colors.SURFACE_RAISED};
@@ -496,8 +499,9 @@ class DeviceInfoCard(QFrame):
                 return
         self.name_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD, QFont.Weight.Bold))
 
-    def update_device_info(self, name: str, model: str = ""):
+    def update_device_info(self, name: str, model: str = "", device_info=None):
         """Update device name and model."""
+        self._device_info = device_info
         display = name or "No Device"
         self.name_label.setText(display)
         self._fit_name_font(display)
@@ -508,15 +512,11 @@ class DeviceInfoCard(QFrame):
         family = ""
         generation = ""
         color = ""
-        try:
-            from ipod_device import get_current_device
-            dev = get_current_device()
-            if dev:
-                family = dev.model_family or ""
-                generation = dev.generation or ""
-                color = dev.color or ""
-        except Exception:
-            pass
+        dev = device_info
+        if dev:
+            family = getattr(dev, "model_family", "") or ""
+            generation = getattr(dev, "generation", "") or ""
+            color = getattr(dev, "color", "") or ""
         if not family and model:
             family = model
 
@@ -528,16 +528,11 @@ class DeviceInfoCard(QFrame):
             # Fallback to generic icon when no matching product photo exists.
             self._set_default_icon()
 
-        # Update technical details from centralized store
-        try:
-            from ipod_device import get_current_device
-            dev = get_current_device()
-        except Exception:
-            dev = None
-
         if dev:
+            field_sources = getattr(dev, "_field_sources", {})
+
             def source_tip(field: str, value: str) -> str:
-                source = dev._field_sources.get(field, "")
+                source = field_sources.get(field, "")
                 if source and value != "—":
                     return f"{value}\nSource: {source}"
                 return value
@@ -603,13 +598,7 @@ class DeviceInfoCard(QFrame):
             self.usb_parent_row.setValue(_compact_middle(usb_parent), usb_parent)
             self.id_method_row.setValue(dev.identification_method or '—')
 
-            # Checksum / hashing — derive display name from the canonical enum
-            from ipod_device import ChecksumType
-            try:
-                cs_name = ChecksumType(dev.checksum_type).name
-            except ValueError:
-                cs_name = 'Unknown'
-            self.checksum_row.setValue(cs_name)
+            self.checksum_row.setValue(format_checksum_type_name(dev.checksum_type))
             scheme_names = {-1: '—', 0: 'None', 1: 'Scheme 1', 2: 'Scheme 2'}
             self.hash_scheme_row.setValue(
                 scheme_names.get(dev.hashing_scheme, str(dev.hashing_scheme))
@@ -629,14 +618,14 @@ class DeviceInfoCard(QFrame):
                 _yes_no(dev.uses_sqlite_db or getattr(caps, "uses_sqlite_db", False))
             )
 
-            podcast_known = "podcasts_supported" in dev._field_sources
+            podcast_known = "podcasts_supported" in field_sources
             self.podcast_support_row.setValue(
                 _yes_no(
                     dev.podcasts_supported
                     if podcast_known else caps.supports_podcast
                 )
             )
-            voice_known = "voice_memos_supported" in dev._field_sources
+            voice_known = "voice_memos_supported" in field_sources
             self.voice_memo_row.setValue(
                 _yes_no(dev.voice_memos_supported) if voice_known else "—"
             )
@@ -699,16 +688,16 @@ class DeviceInfoCard(QFrame):
 
     def _refresh_technical_details_from_current_device(self):
         """Refresh rows after background device validation fills richer fields."""
-        try:
-            from ipod_device import get_current_device
-            dev = get_current_device()
-        except Exception:
-            dev = None
+        dev = self._device_info
         if not dev:
             return
         self._refreshing_tech_details = True
         try:
-            self.update_device_info(self.name_label.text(), self.model_label.text())
+            self.update_device_info(
+                self.name_label.text(),
+                self.model_label.text(),
+                device_info=dev,
+            )
         finally:
             self._refreshing_tech_details = False
 
@@ -773,6 +762,7 @@ class DeviceInfoCard(QFrame):
 
     def clear(self):
         """Clear all info (when no device selected)."""
+        self._device_info = None
         self.name_label.setText("No Device")
         self._fit_name_font("No Device")
         self.model_label.setText("Press Select to choose your iPod")
@@ -971,9 +961,10 @@ class Sidebar(QFrame):
                          size_bytes: int, duration_ms: int,
                          db_version_hex: str = "", db_version_name: str = "",
                          db_id: int = 0, videos: int = 0,
-                         podcasts: int = 0, audiobooks: int = 0):
+                         podcasts: int = 0, audiobooks: int = 0,
+                         device_info=None):
         """Update the device info card with current device data."""
-        self.device_card.update_device_info(name, model)
+        self.device_card.update_device_info(name, model, device_info=device_info)
         self.device_card.update_stats(tracks, albums, size_bytes, duration_ms,
                                       videos=videos, podcasts=podcasts, audiobooks=audiobooks)
         if db_version_hex:

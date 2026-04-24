@@ -8,13 +8,35 @@ Supports multi-device: known backup devices are listed in the page sidebar,
 and selecting one shows its snapshot history. Restore is only enabled when
 the connected iPod matches the selected backup device."""
 
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING
+
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QProgressBar, QMessageBox, QStackedWidget,
 )
 from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
+
+from app_core.device_identity import (
+    resolve_ipod_image_color,
+    resolve_ipod_product_image_filename,
+)
+from app_core.jobs import (
+    BackupCreateRequest,
+    BackupCreateWorker,
+    BackupRestoreRequest,
+    BackupRestoreWorker,
+    build_backup_device_context,
+    delete_backup_snapshot,
+    ensure_backup_folder,
+    list_backup_devices_for_view,
+    load_backup_snapshot_catalog,
+)
+from app_core.progress import ETATracker
 
 from ..styles import (
     Colors, FONT_FAMILY, MONO_FONT_FAMILY, Metrics,
@@ -23,12 +45,14 @@ from ..styles import (
 from ..glyphs import glyph_pixmap
 from .browserChrome import chrome_action_btn_css
 from .formatters import format_size
-from SyncEngine.eta import ETATracker
 
-import logging
-import time
-
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        LibraryService,
+        SettingsService,
+    )
 
 
 def _ipod_pixmap_from_meta(meta: dict | None, size: int):
@@ -50,110 +74,15 @@ def _ipod_pixmap_from_meta(meta: dict | None, size: int):
 
 def _ipod_color_from_meta(meta: dict | None) -> tuple[int, int, int] | None:
     """Return the stored accent color for the resolved iPod product image."""
-    from ipod_device import color_for_image, resolve_image_filename
 
     meta = meta or {}
     family = meta.get("family") or meta.get("model_family") or ""
-    filename = resolve_image_filename(
+    filename = resolve_ipod_product_image_filename(
         family,
         meta.get("generation", "") or "",
         meta.get("color", "") or "",
     )
-    return color_for_image(filename)
-
-
-# ── Background workers ──────────────────────────────────────────────────────
-
-class BackupWorker(QThread):
-    """Background worker for creating a backup."""
-    progress = pyqtSignal(str, int, int, str)  # stage, current, total, message
-    finished = pyqtSignal(object)  # SnapshotInfo or None
-    error = pyqtSignal(str)
-
-    def __init__(self, ipod_path: str, device_id: str, device_name: str,
-                 backup_dir: str, max_backups: int,
-                 device_meta: dict | None = None):
-        super().__init__()
-        self.ipod_path = ipod_path
-        self.device_id = device_id
-        self.device_name = device_name
-        self.backup_dir = backup_dir
-        self.max_backups = max_backups
-        self.device_meta = device_meta or {}
-
-    def run(self):
-        try:
-            from SyncEngine.backup_manager import BackupManager
-
-            manager = BackupManager(
-                device_id=self.device_id,
-                backup_dir=self.backup_dir,
-                device_name=self.device_name,
-                device_meta=self.device_meta,
-            )
-
-            def on_progress(prog):
-                self.progress.emit(prog.stage, prog.current, prog.total, prog.message)
-
-            result = manager.create_backup(
-                ipod_path=self.ipod_path,
-                progress_callback=on_progress,
-                is_cancelled=self.isInterruptionRequested,
-                max_backups=self.max_backups,
-            )
-
-            # Clean up orphaned blobs if the backup was cancelled
-            if result is None:
-                try:
-                    manager.garbage_collect()
-                except Exception:
-                    pass
-
-            self.finished.emit(result)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-
-class RestoreWorker(QThread):
-    """Background worker for restoring a backup."""
-    progress = pyqtSignal(str, int, int, str)
-    finished = pyqtSignal(bool)
-    error = pyqtSignal(str)
-
-    def __init__(self, snapshot_id: str, ipod_path: str, device_id: str,
-                 backup_dir: str):
-        super().__init__()
-        self.snapshot_id = snapshot_id
-        self.ipod_path = ipod_path
-        self.device_id = device_id
-        self.backup_dir = backup_dir
-
-    def run(self):
-        try:
-            from SyncEngine.backup_manager import BackupManager
-
-            manager = BackupManager(
-                device_id=self.device_id,
-                backup_dir=self.backup_dir,
-            )
-
-            def on_progress(prog):
-                self.progress.emit(prog.stage, prog.current, prog.total, prog.message)
-
-            success = manager.restore_backup(
-                snapshot_id=self.snapshot_id,
-                ipod_path=self.ipod_path,
-                progress_callback=on_progress,
-                is_cancelled=self.isInterruptionRequested,
-            )
-
-            self.finished.emit(success)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
+    return resolve_ipod_image_color(filename)
 
 
 class BackupDeviceNavItem(QFrame):
@@ -368,9 +297,17 @@ class BackupBrowserWidget(QWidget):
 
     closed = pyqtSignal()  # Back button
 
-    def __init__(self):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        libraries: LibraryService,
+    ):
         super().__init__()
 
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_cache: LibraryCacheLike = libraries.cache()
         self._backup_worker = None
         self._restore_worker = None
         self._eta_tracker = ETATracker()
@@ -647,46 +584,16 @@ class BackupBrowserWidget(QWidget):
         The sidebar always lists known devices.  A connected iPod is included
         even before its first backup so the user can create one immediately.
         """
-        from ..app import DeviceManager
-        from settings import get_settings
-        from SyncEngine.backup_manager import (
-            BackupManager,
-            get_device_display_name,
-            get_device_identifier,
+        settings = self._settings_service.get_effective_settings()
+        device = self._device_sessions.current_session()
+        inventory = list_backup_devices_for_view(
+            settings.backup_dir,
+            connected_ipod_path=device.device_path or "",
+            connected_ipod_info=device.discovered_ipod,
         )
-
-        settings = get_settings()
-        device = DeviceManager.get_instance()
-        devices_by_id = {
-            d["device_id"]: dict(d)
-            for d in BackupManager.list_all_devices(settings.backup_dir)
-        }
-
-        # Determine connected device ID (sanitized for folder-name matching)
-        if device.device_path:
-            self._device_connected = True
-            raw_id = get_device_identifier(device.device_path, device.discovered_ipod)
-            self._connected_device_id = BackupManager._sanitize_id(raw_id)
-            connected_meta = self._device_meta_from_ipod(device.discovered_ipod)
-            connected_info = devices_by_id.get(self._connected_device_id, {})
-            connected_info.update({
-                "device_id": self._connected_device_id,
-                "device_name": get_device_display_name(device.discovered_ipod),
-                "snapshot_count": int(connected_info.get("snapshot_count", 0) or 0),
-                "device_meta": connected_meta or connected_info.get("device_meta", {}),
-            })
-            devices_by_id[self._connected_device_id] = connected_info
-        else:
-            self._device_connected = False
-            self._connected_device_id = ""
-
-        self._devices = sorted(
-            devices_by_id.values(),
-            key=lambda d: (
-                0 if d.get("device_id") == self._connected_device_id else 1,
-                str(d.get("device_name") or d.get("device_id") or "").lower(),
-            ),
-        )
+        self._device_connected = inventory.device_connected
+        self._connected_device_id = inventory.connected_device_id
+        self._devices = inventory.devices
         self._populate_device_sidebar()
 
         if not self._devices:
@@ -715,10 +622,7 @@ class BackupBrowserWidget(QWidget):
 
         Resolves whether restore is allowed (connected device must match).
         """
-        from settings import get_settings
-        from SyncEngine.backup_manager import BackupManager
-
-        settings = get_settings()
+        settings = self._settings_service.get_effective_settings()
         self._current_device_id = device_id
 
         # Find device name for the title
@@ -733,13 +637,9 @@ class BackupBrowserWidget(QWidget):
 
         # Can restore only if connected device matches this device's backups
         can_restore = self._device_connected and self._connected_device_id == device_id
-        manager = BackupManager(
-            device_id=device_id,
-            backup_dir=settings.backup_dir,
-        )
-
-        snapshots = manager.list_snapshots()
-        total_backup_size = manager.get_backup_size()
+        catalog = load_backup_snapshot_catalog(device_id, settings.backup_dir)
+        snapshots = catalog.snapshots
+        total_backup_size = catalog.total_backup_size
         self._update_device_hero(
             self._current_device_info,
             snapshots,
@@ -953,36 +853,12 @@ class BackupBrowserWidget(QWidget):
             self._device_art.setText("Backups")
             self._device_art.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
 
-    @staticmethod
-    def _device_meta_from_ipod(ipod) -> dict:
-        if not ipod:
-            return {}
-        return {
-            "family": getattr(ipod, "model_family", "") or "",
-            "generation": getattr(ipod, "generation", "") or "",
-            "color": getattr(ipod, "color", "") or "",
-            "display_name": getattr(ipod, "display_name", "") or "",
-        }
-
     # ── Open backup folder ──────────────────────────────────────────────
 
     def _on_open_folder(self):
         """Open the backup directory in the OS file manager."""
-        from settings import get_settings
-        from SyncEngine.backup_manager import _DEFAULT_BACKUP_DIR
-
-        settings = get_settings()
-        backup_dir = settings.backup_dir or _DEFAULT_BACKUP_DIR
-
-        # Open device-specific subfolder if we know which device
-        from pathlib import Path
-        folder = Path(backup_dir)
-        if self._current_device_id:
-            device_folder = folder / self._current_device_id
-            if device_folder.exists():
-                folder = device_folder
-
-        folder.mkdir(parents=True, exist_ok=True)
+        settings = self._settings_service.get_effective_settings()
+        folder = ensure_backup_folder(settings.backup_dir, self._current_device_id)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     # ── Stage display labels ────────────────────────────────────────────
@@ -1016,29 +892,16 @@ class BackupBrowserWidget(QWidget):
             )
             return
 
-        from ..app import DeviceManager
-        from settings import get_settings
-        from SyncEngine.backup_manager import get_device_identifier, get_device_display_name
-
-        device = DeviceManager.get_instance()
+        device = self._device_sessions.current_session()
         if not device.device_path:
             QMessageBox.warning(self, "No Device", "Please connect and select an iPod first.")
             return
 
-        settings = get_settings()
-        device_id = get_device_identifier(device.device_path, device.discovered_ipod)
-        device_name = get_device_display_name(device.discovered_ipod)
-
-        # Collect device metadata for the manifest
-        device_meta: dict = {}
-        ipod = device.discovered_ipod
-        if ipod:
-            device_meta = {
-                "family": getattr(ipod, "model_family", ""),
-                "generation": getattr(ipod, "generation", ""),
-                "color": getattr(ipod, "color", ""),
-                "display_name": getattr(ipod, "display_name", ""),
-            }
+        settings = self._settings_service.get_effective_settings()
+        backup_context = build_backup_device_context(
+            device.device_path,
+            device.discovered_ipod,
+        )
 
         # Show progress page
         self._progress_title.setText("Scanning Device")
@@ -1053,13 +916,15 @@ class BackupBrowserWidget(QWidget):
         self._eta_start_time = time.monotonic()
         self._backup_no_changes = False
 
-        self._backup_worker = BackupWorker(
-            ipod_path=device.device_path,
-            device_id=device_id,
-            device_name=device_name,
-            backup_dir=settings.backup_dir,
-            max_backups=settings.max_backups,
-            device_meta=device_meta,
+        self._backup_worker = BackupCreateWorker(
+            BackupCreateRequest(
+                ipod_path=device.device_path,
+                device_id=backup_context.device_id,
+                device_name=backup_context.device_name,
+                backup_dir=settings.backup_dir,
+                max_backups=settings.max_backups,
+                device_meta=backup_context.device_meta,
+            )
         )
         self._backup_worker.progress.connect(self._on_backup_progress)
         self._backup_worker.finished.connect(self._on_backup_finished)
@@ -1163,11 +1028,7 @@ class BackupBrowserWidget(QWidget):
             )
             return
 
-        from ..app import DeviceManager
-        from settings import get_settings
-        from SyncEngine.backup_manager import BackupManager, get_device_identifier
-
-        device = DeviceManager.get_instance()
+        device = self._device_sessions.current_session()
         if not device.device_path:
             QMessageBox.warning(
                 self, "No Device",
@@ -1175,9 +1036,12 @@ class BackupBrowserWidget(QWidget):
             )
             return
 
-        settings = get_settings()
-        raw_id = get_device_identifier(device.device_path, device.discovered_ipod)
-        connected_id = BackupManager._sanitize_id(raw_id)
+        settings = self._settings_service.get_effective_settings()
+        connected_context = build_backup_device_context(
+            device.device_path,
+            device.discovered_ipod,
+        )
+        connected_id = connected_context.device_id
 
         # Safety: only restore to the matching device
         if connected_id != self._current_device_id:
@@ -1217,11 +1081,13 @@ class BackupBrowserWidget(QWidget):
         self._eta_tracker.start()
         self._eta_start_time = time.monotonic()
 
-        self._restore_worker = RestoreWorker(
-            snapshot_id=snapshot_id,
-            ipod_path=device.device_path,
-            device_id=connected_id,
-            backup_dir=settings.backup_dir,
+        self._restore_worker = BackupRestoreWorker(
+            BackupRestoreRequest(
+                snapshot_id=snapshot_id,
+                ipod_path=device.device_path,
+                device_id=connected_id,
+                backup_dir=settings.backup_dir,
+            )
         )
         self._restore_worker.progress.connect(self._on_restore_progress)
         self._restore_worker.finished.connect(self._on_restore_finished)
@@ -1266,8 +1132,7 @@ class BackupBrowserWidget(QWidget):
                 "The library view will now refresh."
             )
             # Reload the iTunesDB cache
-            from ..app import iTunesDBCache
-            cache = iTunesDBCache.get_instance()
+            cache = self._library_cache
             cache.invalidate()
             cache.start_loading()
         elif was_cancelled:
@@ -1323,17 +1188,13 @@ class BackupBrowserWidget(QWidget):
         if not self._current_device_id:
             return
 
-        from settings import get_settings
-        from SyncEngine.backup_manager import BackupManager
+        settings = self._settings_service.get_effective_settings()
 
-        settings = get_settings()
-
-        manager = BackupManager(
+        if delete_backup_snapshot(
             device_id=self._current_device_id,
             backup_dir=settings.backup_dir,
-        )
-
-        if manager.delete_snapshot(snapshot_id):
+            snapshot_id=snapshot_id,
+        ):
             self.refresh()
         else:
             QMessageBox.warning(self, "Delete Failed", "Could not delete the snapshot.")

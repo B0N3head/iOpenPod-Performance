@@ -4,6 +4,7 @@ import copy
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QFont, QPixmap
@@ -33,7 +34,6 @@ from SyncEngine.photos import (
 from ipod_device.artwork import ITHMB_FORMAT_MAP
 
 from ..styles import (
-    Colors,
     FONT_FAMILY,
     Metrics,
     make_scroll_area,
@@ -51,6 +51,14 @@ from .gridHeaderBar import GridHeaderBar
 from .MBGridView import _FlowLayout
 from .photoTile import PhotoGridTile
 from .photoViewer import PhotoViewerPane, pil_to_pixmap
+
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        LibraryService,
+        SettingsService,
+    )
 
 
 class PhotoGridView(QFrame):
@@ -155,6 +163,7 @@ class _PhotoWriteWorker(QThread):
         album_name: str = "",
         old_name: str = "",
         new_name: str = "",
+        sync_settings: dict[str, bool] | None = None,
     ):
         super().__init__()
         self._ipod_path = ipod_path
@@ -164,6 +173,7 @@ class _PhotoWriteWorker(QThread):
         self._album_name = album_name
         self._old_name = old_name
         self._new_name = new_name
+        self._sync_settings = sync_settings
 
     def _delete_photo_fast_path(self) -> PhotoDB:
         if self._image_id is None:
@@ -184,7 +194,11 @@ class _PhotoWriteWorker(QThread):
             except OSError:
                 pass
 
-        write_photo_db_metadata_only(self._ipod_path, photodb)
+        write_photo_db_metadata_only(
+            self._ipod_path,
+            photodb,
+            sync_settings=self._sync_settings,
+        )
         return photodb
 
     def _resolve_photo_for_membership_action(self) -> PhotoEntry:
@@ -224,16 +238,25 @@ class _PhotoWriteWorker(QThread):
             self._device_photos,
             edits,
             ipod_path=self._ipod_path,
+            sync_settings=self._sync_settings,
         )
 
         needs_payload_writes = bool(
             plan.photos_to_add or plan.photos_to_remove or plan.photos_to_update
         )
         if needs_payload_writes:
-            return apply_photo_sync_plan(self._ipod_path, plan)
+            return apply_photo_sync_plan(
+                self._ipod_path,
+                plan,
+                sync_settings=self._sync_settings,
+            )
 
         photodb = merge_photo_sync_plan(copy.deepcopy(self._device_photos), plan)
-        write_photo_db_metadata_only(self._ipod_path, photodb)
+        write_photo_db_metadata_only(
+            self._ipod_path,
+            photodb,
+            sync_settings=self._sync_settings,
+        )
         return photodb
 
     def run(self) -> None:
@@ -252,8 +275,18 @@ class _PhotoWriteWorker(QThread):
 
 
 class PhotoBrowserWidget(QFrame):
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        libraries: LibraryService,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_service = libraries
+        self._library_cache: LibraryCacheLike = libraries.cache()
         self._current_album = ""
         self._device_db: PhotoDB | None = None
         self._filtered_items: list[tuple[str, PhotoEntry]] = []
@@ -283,6 +316,17 @@ class PhotoBrowserWidget(QFrame):
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.timeout.connect(self._process_thumb_batch)
         self._build_ui()
+        self.bind_cache(self._library_cache)
+
+    def _current_device_path(self) -> str:
+        return self._device_sessions.current_session().device_path or ""
+
+    def _photo_sync_settings(self) -> dict[str, bool]:
+        settings = self._settings_service.get_effective_settings()
+        return {
+            "rotate_tall_photos_for_device": settings.rotate_tall_photos_for_device,
+            "fit_photo_thumbnails": settings.fit_photo_thumbnails,
+        }
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -397,12 +441,10 @@ class PhotoBrowserWidget(QFrame):
         self._reload_timer.start(0)
 
     def _reload_now(self):
-        from ..app import DeviceManager, iTunesDBCache
-
-        cache = iTunesDBCache.get_instance()
+        cache = self._library_cache
         photodb = cache.get_photo_db() or PhotoDB()
         self._device_db = photodb
-        device_path = DeviceManager.get_instance().device_path or ""
+        device_path = self._current_device_path()
 
         marker = (device_path, id(photodb), len(photodb.photos))
         if marker != self._cache_marker:
@@ -431,14 +473,12 @@ class PhotoBrowserWidget(QFrame):
 
     def _on_search_changed(self, query: str):
         self._search_query = query.strip().lower()
-        from ..app import DeviceManager
-        self._schedule_grid_reload(DeviceManager.get_instance().device_path or "")
+        self._schedule_grid_reload(self._current_device_path())
 
     def _on_sort_changed(self, key: str, reverse: bool):
         self._sort_key = key
         self._sort_reverse = reverse
-        from ..app import DeviceManager
-        self._schedule_grid_reload(DeviceManager.get_instance().device_path or "")
+        self._schedule_grid_reload(self._current_device_path())
 
     def _matches_search(self, photo: PhotoEntry) -> bool:
         if not self._search_query:
@@ -539,8 +579,6 @@ class PhotoBrowserWidget(QFrame):
         return total
 
     def _preview_pixmap(self, photo: PhotoEntry, *, format_id: int | None = None) -> QPixmap:
-        from ..app import DeviceManager
-
         cache_key = (photo.image_id, int(format_id) if format_id is not None else -1)
         cached = self._preview_pixmap_cache.get(cache_key)
         if cached is not None:
@@ -550,7 +588,7 @@ class PhotoBrowserWidget(QFrame):
         try:
             img = load_photo_preview(
                 photo,
-                DeviceManager.get_instance().device_path or "",
+                self._current_device_path(),
                 format_id=format_id,
             )
             if img is not None:
@@ -851,8 +889,7 @@ class PhotoBrowserWidget(QFrame):
     def _on_album_changed(self, album_name: str):
         self._current_album = album_name
         self._highlight_album_button(album_name)
-        from ..app import DeviceManager
-        self._schedule_grid_reload(DeviceManager.get_instance().device_path or "")
+        self._schedule_grid_reload(self._current_device_path())
         self._update_action_states()
 
     def _on_photo_changed(self, row: int):
@@ -900,8 +937,6 @@ class PhotoBrowserWidget(QFrame):
         old_name: str = "",
         new_name: str = "",
     ) -> None:
-        from ..app import DeviceManager
-
         if self._write_worker is not None and self._write_worker.isRunning():
             QMessageBox.information(self, "Photo Save In Progress", "Please wait for the current photo save to finish.")
             return
@@ -912,7 +947,7 @@ class PhotoBrowserWidget(QFrame):
             QMessageBox.warning(self, "No Photo Database", "The iPod photo database is not loaded yet.")
             return
 
-        ipod_path = DeviceManager.get_instance().device_path or ""
+        ipod_path = self._current_device_path()
         if not ipod_path:
             QMessageBox.warning(self, "No iPod Connected", "Select an iPod before editing device photos.")
             return
@@ -926,6 +961,7 @@ class PhotoBrowserWidget(QFrame):
             album_name=album_name,
             old_name=old_name,
             new_name=new_name,
+            sync_settings=self._photo_sync_settings(),
         )
         self._write_worker.finished_ok.connect(self._on_photo_write_ok)
         self._write_worker.failed.connect(self._on_photo_write_failed)
@@ -935,14 +971,12 @@ class PhotoBrowserWidget(QFrame):
         self._update_action_states()
 
     def _on_photo_write_ok(self, photodb: object) -> None:
-        from ..app import iTunesDBCache
-
         if isinstance(photodb, PhotoDB):
             self._device_db = photodb
             self._tile_pixmap_cache.clear()
             self._preview_pixmap_cache.clear()
             self._cache_marker = None
-            iTunesDBCache.get_instance().replace_photo_db(photodb)
+            self._library_cache.replace_photo_db(photodb)
         self._show_save_indicator("saved")
 
     def _on_photo_write_failed(self, error_msg: str) -> None:

@@ -22,7 +22,7 @@ Select episodes → click "Add to iPod" → automatic download + sync.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QIcon
@@ -66,6 +66,14 @@ from .browserChrome import (
 from .formatters import format_size
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app_core.services import (
+        DeviceSessionService,
+        LibraryCacheLike,
+        LibraryService,
+        SettingsService,
+    )
 
 
 # ── Column definitions ───────────────────────────────────────────────────────
@@ -131,7 +139,12 @@ class _PodcastEpisodeList:
         # Register the podcast-only status column if not already present
         COLUMN_CONFIG.setdefault("ep_status", ("Status", None))
 
-        bl = MusicBrowserList()
+        bl = MusicBrowserList(
+            settings_service=owner._settings_service,
+            device_sessions=owner._device_sessions,
+            library_cache=owner._library_cache,
+            show_art_override=False,
+        )
 
         # Override the music-library defaults with podcast-appropriate columns
         bl._columns = _PODCAST_EPISODE_COLUMNS.copy()
@@ -152,24 +165,12 @@ class _PodcastEpisodeList:
             pass
         bl.table.customContextMenuRequested.connect(owner._on_episode_context_menu)
 
-        _orig_populate = bl._populate_table
         _orig_finish = bl._finish_population
-
-        def _patched_populate():
-            from settings import get_settings
-            s = get_settings()
-            saved = s.show_art_in_tracklist
-            s.show_art_in_tracklist = False
-            try:
-                _orig_populate()
-            finally:
-                s.show_art_in_tracklist = saved
 
         def _patched_finish():
             _orig_finish()
             _colorize_ep_status(bl)
 
-        bl._populate_table = _patched_populate
         bl._finish_population = _patched_finish
 
         return bl
@@ -189,8 +190,17 @@ class PodcastBrowser(QFrame):
     # Emitted when the user confirms podcast sync — carries a SyncPlan
     podcast_sync_requested = pyqtSignal(object)
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        libraries: LibraryService,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._library_cache: LibraryCacheLike = libraries.cache()
         self._device_serial: str = ""
         self._ipod_path: str = ""
         self._store = None          # SubscriptionStore (lazy)
@@ -200,6 +210,14 @@ class PodcastBrowser(QFrame):
         self._episode_dicts: list[dict] = []
 
         self._build_ui()
+
+    def _current_ipod_tracks(self) -> list[dict] | None:
+        try:
+            if not self._library_cache.is_ready():
+                return None
+            return self._library_cache.get_tracks() or []
+        except Exception:
+            return None
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -226,7 +244,11 @@ class PodcastBrowser(QFrame):
         self._ipod_path = normalized_path
 
         from PodcastManager.subscription_store import SubscriptionStore
-        self._store = SubscriptionStore(ipod_path)
+        settings = self._settings_service.get_effective_settings()
+        self._store = SubscriptionStore(
+            ipod_path,
+            download_cache_dir=settings.transcode_cache_dir,
+        )
         self._store.load()
 
         # Apply any deferred reconciliation captured before the Podcasts
@@ -276,14 +298,10 @@ class PodcastBrowser(QFrame):
             return
 
         if ipod_tracks is None:
-            try:
-                from ..app import iTunesDBCache
-                cache = iTunesDBCache.get_instance()
-                if not cache.is_ready():
-                    return
-                ipod_tracks = cache.get_tracks() or []
-            except Exception:
+            current_tracks = self._current_ipod_tracks()
+            if current_tracks is None:
                 return
+            ipod_tracks = current_tracks
 
         from PodcastManager.podcast_sync import PodcastTrackMatcher
 
@@ -1063,7 +1081,7 @@ class PodcastBrowser(QFrame):
         if not feeds:
             return
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.feed_parser import fetch_feed
 
         store = self._store
@@ -1095,7 +1113,7 @@ class PodcastBrowser(QFrame):
         self._refresh_btn.setEnabled(False)
         self._set_status(f"Refreshing {len(feeds)} feeds…")
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.feed_parser import fetch_feed
 
         store = self._store
@@ -1160,7 +1178,7 @@ class PodcastBrowser(QFrame):
         self._sync_btn.setEnabled(False)
         self._set_status("Refreshing feeds for sync…", timeout_ms=0)
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.feed_parser import fetch_feed
 
         store = self._store
@@ -1194,13 +1212,7 @@ class PodcastBrowser(QFrame):
         self._refresh_feed_list()
 
         # Get iPod tracks for plan building
-        ipod_tracks: list[dict] = []
-        try:
-            from ..app import iTunesDBCache
-            cache = iTunesDBCache.get_instance()
-            ipod_tracks = cache.get_tracks() or []
-        except Exception:
-            pass
+        ipod_tracks = self._current_ipod_tracks() or []
 
         # Reconcile episode statuses against actual iPod tracks before
         # building the plan.  This ensures episodes synced in a prior run
@@ -1250,7 +1262,7 @@ class PodcastBrowser(QFrame):
 
         self._set_status("Fetching feed…")
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.feed_parser import fetch_feed
 
         worker = Worker(fetch_feed, feed_url)
@@ -1289,7 +1301,7 @@ class PodcastBrowser(QFrame):
         """Refresh a single feed in the background."""
         self._set_status(f"Refreshing {feed.title}…")
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         from PodcastManager.feed_parser import fetch_feed
 
         def _do():
@@ -1394,13 +1406,7 @@ class PodcastBrowser(QFrame):
             return
 
         # Get current iPod tracks for dedup
-        ipod_tracks: list[dict] = []
-        try:
-            from ..app import iTunesDBCache
-            cache = iTunesDBCache.get_instance()
-            ipod_tracks = cache.get_tracks() or []
-        except Exception:
-            pass
+        ipod_tracks = self._current_ipod_tracks() or []
 
         from PodcastManager.podcast_sync import build_podcast_sync_plan
         plan = build_podcast_sync_plan(episodes_for_plan, ipod_tracks, self._store)
@@ -1451,45 +1457,20 @@ class PodcastBrowser(QFrame):
         if not self._selected_feed or not self._ipod_path:
             return
 
-        from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction, StorageSummary
+        from app_core.sync_plan_builder import build_podcast_removal_sync_plan
 
-        ipod_tracks: list[dict] = []
-        try:
-            from ..app import iTunesDBCache
-            cache = iTunesDBCache.get_instance()
-            ipod_tracks = cache.get_tracks() or []
-        except Exception:
-            pass
+        ipod_tracks = self._current_ipod_tracks() or []
+        plan = build_podcast_removal_sync_plan(
+            episodes,
+            ipod_tracks,
+            self._selected_feed.title,
+        )
 
-        tracks_by_db_track_id = {
-            t.get("db_track_id", t.get("db_id", 0)): t
-            for t in ipod_tracks
-            if t.get("db_track_id", t.get("db_id", 0))
-        }
-
-        to_remove: list[SyncItem] = []
-        bytes_to_remove = 0
-        for ep in episodes:
-            ipod_track = tracks_by_db_track_id.get(ep.ipod_db_track_id)
-            if not ipod_track:
-                continue
-            to_remove.append(SyncItem(
-                action=SyncAction.REMOVE_FROM_IPOD,
-                db_track_id=ep.ipod_db_track_id,
-                ipod_track=ipod_track,
-                description=f"\U0001f399 {self._selected_feed.title} \u2014 {ep.title}",
-            ))
-            bytes_to_remove += ipod_track.get("size", 0)
-
-        if not to_remove:
+        if plan is None:
             self._set_action_status("Episodes not found on iPod")
             return
 
-        plan = SyncPlan(
-            to_remove=to_remove,
-            storage=StorageSummary(bytes_to_remove=bytes_to_remove),
-        )
-        n = len(to_remove)
+        n = len(plan.to_remove)
         self._set_action_status(
             f"Sending {n} removal{'s' if n != 1 else ''} to sync\u2026")
         self.podcast_sync_requested.emit(plan)
@@ -1752,7 +1733,7 @@ class PodcastBrowser(QFrame):
             self._apply_hero_color_from_pixmap(_artwork_cache[url])
             return
 
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
 
         target_url = url
@@ -1799,7 +1780,7 @@ class PodcastBrowser(QFrame):
 
     def _load_feed_list_artwork(self, url: str, row: int) -> None:
         """Load a feed's artwork for its list item thumbnail."""
-        from ..app import Worker, ThreadPoolSingleton
+        from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
 
         target_url = url

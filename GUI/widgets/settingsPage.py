@@ -6,6 +6,9 @@ on the left, scrollable card-based content on the right.
 """
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QUrl
 
 from PyQt6.QtWidgets import (
@@ -14,13 +17,15 @@ from PyQt6.QtWidgets import (
     QLineEdit, QStackedWidget, QProgressDialog, QSpinBox,
 )
 from PyQt6.QtGui import QFont, QDesktopServices
-from pathlib import Path
 from ..styles import (
     Colors, FONT_FAMILY, Metrics, btn_css, danger_btn_css,
     sidebar_nav_css, sidebar_nav_selected_css,
     back_btn_css, input_css, combo_css, link_btn_css, make_scroll_area,
     resolve_accent_color,
 )
+
+if TYPE_CHECKING:
+    from app_core.services import DeviceSessionService, SettingsService
 
 
 # ── Reusable row widgets ────────────────────────────────────────────────────
@@ -156,11 +161,11 @@ class SpinRow(SettingRow):
         self.spin.setValue(current)
         self.spin.setFixedWidth(80)
         self.spin.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
-        self.spin.setStyleSheet(input_css() + f"""
-            QSpinBox {{
+        self.spin.setStyleSheet(input_css() + """
+            QSpinBox {
                 padding: 4px 8px;
                 border-radius: 6px;
-            }}
+            }
         """)
         self.spin.valueChanged.connect(self.changed.emit)
         self.add_control(self.spin)
@@ -720,8 +725,9 @@ class _TokenRow(SettingRow):
 class _CacheSizeRow(SettingRow):
     """Setting row showing live transcode-cache usage with a Clear button."""
 
-    def __init__(self):
+    def __init__(self, settings_service: SettingsService):
         super().__init__("Cache Status", "Calculating…")
+        self._settings_service = settings_service
         self._clear_btn = QPushButton("Clear Cache")
         self._clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self._clear_btn.setFixedWidth(110)
@@ -735,10 +741,12 @@ class _CacheSizeRow(SettingRow):
         """Update the displayed size from the cache index (fast — no disk scan)."""
         try:
             from SyncEngine.transcode_cache import TranscodeCache
-            from settings import get_settings
-            s = get_settings()
+            s = self._settings_service.get_effective_settings()
             cache_dir = Path(s.transcode_cache_dir) if s.transcode_cache_dir else None
-            stats = TranscodeCache.get_instance(cache_dir).stats()
+            stats = TranscodeCache.get_instance(
+                cache_dir,
+                max_cache_size_gb=s.max_cache_size_gb,
+            ).stats()
             gb = stats["total_size_gb"]
             count = stats["total_files"]
             max_gb = stats.get("max_size_gb", 0.0)
@@ -753,7 +761,6 @@ class _CacheSizeRow(SettingRow):
     def _on_clear(self) -> None:
         from PyQt6.QtWidgets import QMessageBox
         from SyncEngine.transcode_cache import TranscodeCache
-        from settings import get_settings
         reply = QMessageBox.question(
             self,
             "Clear Transcode Cache",
@@ -764,9 +771,12 @@ class _CacheSizeRow(SettingRow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         try:
-            s = get_settings()
+            s = self._settings_service.get_effective_settings()
             cache_dir = Path(s.transcode_cache_dir) if s.transcode_cache_dir else None
-            n = TranscodeCache.get_instance(cache_dir).clear()
+            n = TranscodeCache.get_instance(
+                cache_dir,
+                max_cache_size_gb=s.max_cache_size_gb,
+            ).clear()
             self.desc_label.setText(f"Cleared — {n:,} files removed")
             self._clear_btn.setEnabled(False)
         except Exception as exc:
@@ -844,8 +854,14 @@ class SettingsPage(QWidget):
     closed = pyqtSignal()  # Emitted when user closes settings
     theme_changed = pyqtSignal()  # Emitted when theme or contrast changes
 
-    def __init__(self):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+    ):
         super().__init__()
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
         self._pending_lb_result: tuple[str, str, str, str, str, bool] = ("", "", "global", "", "", False)
         self._update_checker: object | None = None
         self._update_downloader: object | None = None
@@ -1101,7 +1117,7 @@ class SettingsPage(QWidget):
             checked=True,
         )
 
-        from settings import get_version
+        from infrastructure.version import get_version
         self.version_row = ActionRow(
             f"iOpenPod v{get_version()}",
             "Check for a newer version of iOpenPod.",
@@ -1401,7 +1417,7 @@ class SettingsPage(QWidget):
         )
 
     def _build_storage_page(self) -> QScrollArea:
-        from settings import default_cache_dir
+        from infrastructure.settings_paths import default_cache_dir
         self.transcode_cache_dir = ResettableFolderRow(
             "Cache Location",
             "Where transcoded files are cached to avoid re-encoding "
@@ -1416,8 +1432,8 @@ class SettingsPage(QWidget):
             options=["Unlimited", "1 GB", "2 GB", "5 GB", "10 GB", "20 GB", "50 GB"],
             current="5 GB",
         )
-        self.cache_status = _CacheSizeRow()
-        from settings import get_settings_dir, default_data_dir
+        self.cache_status = _CacheSizeRow(self._settings_service)
+        from infrastructure.settings_paths import get_settings_dir, default_data_dir
         import os as _os
         self.settings_dir = ResettableFolderRow(
             "Settings Location",
@@ -1450,7 +1466,7 @@ class SettingsPage(QWidget):
         )
 
     def _build_backups_page(self) -> QScrollArea:
-        from settings import default_data_dir as _ddd
+        from infrastructure.settings_paths import default_data_dir as _ddd
         import os as _os2
         self.backup_dir = FolderRow(
             "Backup Location",
@@ -1488,13 +1504,14 @@ class SettingsPage(QWidget):
     def _current_device_context(self) -> tuple[str, str] | None:
         """Return (iPod root, settings key) for the selected device."""
         try:
-            from ..app import DeviceManager
-            from settings import device_settings_key
-            device = DeviceManager.get_instance()
-            root = device.device_path or ""
+            session = self._device_sessions.current_session()
+            root = session.device_path or ""
             if not root:
                 return None
-            return root, device_settings_key(root, device.discovered_ipod)
+            return root, self._settings_service.device_settings_key(
+                root,
+                session.discovered_ipod,
+            )
         except Exception:
             return None
 
@@ -1503,8 +1520,9 @@ class SettingsPage(QWidget):
         loading_device_settings = False
         if has_device:
             try:
-                from ..app import DeviceManager
-                loading_device_settings = DeviceManager.get_instance().device_settings_loading
+                loading_device_settings = (
+                    self._device_sessions.current_session().device_settings_loading
+                )
             except Exception:
                 loading_device_settings = False
         if hasattr(self, "_scope_device_btn"):
@@ -1590,8 +1608,6 @@ class SettingsPage(QWidget):
 
     def load_from_settings(self):
         """Populate UI controls from the current AppSettings."""
-        from settings import get_device_settings_for_edit, get_global_settings
-
         self._sync_scope_availability()
         self._device_settings_pending = False
         state = None
@@ -1599,18 +1615,19 @@ class SettingsPage(QWidget):
         if ctx:
             root, key = ctx
             try:
-                from ..app import DeviceManager
-                self._device_settings_pending = DeviceManager.get_instance().device_settings_loading
+                self._device_settings_pending = (
+                    self._device_sessions.current_session().device_settings_loading
+                )
             except Exception:
                 self._device_settings_pending = False
             if self._device_settings_pending:
-                s = get_global_settings()
+                s = self._settings_service.get_global_settings()
             else:
-                state = get_device_settings_for_edit(root, key)
+                state = self._settings_service.get_device_settings_for_edit(root, key)
                 s = state.settings
         else:
             self._settings_scope = "global"
-            s = get_global_settings()
+            s = self._settings_service.get_global_settings()
         self._loading_settings = True
         self.use_global_settings.value = bool(state.use_global_settings) if state else False
 
@@ -1831,8 +1848,9 @@ class SettingsPage(QWidget):
         """
         try:
             from SyncEngine.transcoder import available_aac_encoders, find_ffmpeg
-            ffmpeg_ok = bool(find_ffmpeg())
-            available = available_aac_encoders() if ffmpeg_ok else set()
+            settings = self._settings_service.get_effective_settings()
+            ffmpeg_ok = bool(find_ffmpeg(settings.ffmpeg_path))
+            available = available_aac_encoders(settings.ffmpeg_path) if ffmpeg_ok else set()
         except Exception:
             available = set()
 
@@ -2065,8 +2083,7 @@ class SettingsPage(QWidget):
             s.font_scale = scale_keys.get(self.font_scale.value, "100%")
 
     def _apply_theme_change_if_needed(self, before) -> None:
-        from settings import get_settings
-        s = get_settings()
+        s = self._settings_service.get_effective_settings()
         after = (s.theme, s.high_contrast, s.accent_color, s.font_scale)
         if after != before:
             accent_hex = resolve_accent_color(
@@ -2084,9 +2101,7 @@ class SettingsPage(QWidget):
         if not ctx:
             return
 
-        from settings import get_settings, reset_device_settings_to_global
-
-        effective_before = get_settings()
+        effective_before = self._settings_service.get_effective_settings()
         theme_before = (
             effective_before.theme,
             effective_before.high_contrast,
@@ -2095,7 +2110,7 @@ class SettingsPage(QWidget):
         )
 
         root, key = ctx
-        reset_device_settings_to_global(
+        self._settings_service.reset_device_settings_to_global(
             root,
             key,
             use_global_settings=self.use_global_settings.value,
@@ -2108,14 +2123,7 @@ class SettingsPage(QWidget):
         if self._loading_settings or self._device_settings_pending:
             return
 
-        from settings import (
-            get_device_settings_for_edit,
-            get_global_settings,
-            get_settings,
-            save_device_settings,
-        )
-
-        effective_before = get_settings()
+        effective_before = self._settings_service.get_effective_settings()
         theme_before = (
             effective_before.theme,
             effective_before.high_contrast,
@@ -2126,10 +2134,10 @@ class SettingsPage(QWidget):
         ctx = self._current_device_context() if self._settings_scope == "device" else None
         if ctx:
             root, key = ctx
-            state = get_device_settings_for_edit(root, key)
+            state = self._settings_service.get_device_settings_for_edit(root, key)
             s = state.settings
             self._read_controls_into_settings(s, include_global_only=False)
-            save_device_settings(
+            self._settings_service.save_device_settings(
                 root,
                 s,
                 use_global_settings=self.use_global_settings.value,
@@ -2139,21 +2147,24 @@ class SettingsPage(QWidget):
             self._apply_theme_change_if_needed(theme_before)
             return
 
-        s = get_global_settings()
+        s = self._settings_service.get_global_settings()
         old_cache_limit = s.max_cache_size_gb
         self._read_controls_into_settings(s, include_global_only=True)
         limit_lowered = (
             old_cache_limit > 0
             and (s.max_cache_size_gb == 0 or s.max_cache_size_gb < old_cache_limit)
         )
-        s.save()
+        self._settings_service.save_global_settings(s)
 
         # If limit was lowered, evict immediately so cache stays within bounds.
         if limit_lowered:
             try:
                 from SyncEngine.transcode_cache import TranscodeCache
                 cache_dir = Path(s.transcode_cache_dir) if s.transcode_cache_dir else None
-                TranscodeCache.get_instance(cache_dir).trim_to_limit()
+                TranscodeCache.get_instance(
+                    cache_dir,
+                    max_cache_size_gb=s.max_cache_size_gb,
+                ).trim_to_limit()
                 self.cache_status.refresh()
             except Exception:
                 pass
@@ -2357,9 +2368,10 @@ class SettingsPage(QWidget):
         from SyncEngine.transcoder import find_ffmpeg, available_aac_encoders
         from SyncEngine.audio_fingerprint import find_fpcalc
 
-        ffmpeg = find_ffmpeg()
+        settings = self._settings_service.get_effective_settings()
+        ffmpeg = find_ffmpeg(settings.ffmpeg_path)
         self.ffmpeg_tool.set_status(bool(ffmpeg), ffmpeg or "")
-        enc = available_aac_encoders() if ffmpeg else set()
+        enc = available_aac_encoders(settings.ffmpeg_path) if ffmpeg else set()
         self.ffmpeg_tool.set_aac_encoder_statuses(
             {
                 "base": "aac" in enc,
@@ -2368,7 +2380,7 @@ class SettingsPage(QWidget):
             }
         )
 
-        fpcalc = find_fpcalc()
+        fpcalc = find_fpcalc(settings.fpcalc_path)
         self.fpcalc_tool.set_status(bool(fpcalc), fpcalc or "")
 
     def _download_ffmpeg(self):
@@ -2428,12 +2440,6 @@ class SettingsPage(QWidget):
         key: str | None = None,
         use_global: bool | None = None,
     ) -> None:
-        from settings import (
-            get_device_settings_for_edit,
-            get_global_settings,
-            save_device_settings,
-        )
-
         if scope is None:
             ctx = self._current_device_context() if self._settings_scope == "device" else None
             if ctx:
@@ -2443,11 +2449,11 @@ class SettingsPage(QWidget):
                 scope = "global"
 
         if scope == "device" and root and key:
-            state = get_device_settings_for_edit(root, key)
+            state = self._settings_service.get_device_settings_for_edit(root, key)
             s = state.settings
             s.listenbrainz_token = token
             s.listenbrainz_username = username
-            save_device_settings(
+            self._settings_service.save_device_settings(
                 root,
                 s,
                 use_global_settings=self.use_global_settings.value if use_global is None else use_global,
@@ -2455,10 +2461,10 @@ class SettingsPage(QWidget):
             )
             return
 
-        s = get_global_settings()
+        s = self._settings_service.get_global_settings()
         s.listenbrainz_token = token
         s.listenbrainz_username = username
-        s.save()
+        self._settings_service.save_global_settings(s)
 
     def _on_listenbrainz_token_changed(self, token: str):
         """Handle ListenBrainz token save/clear."""

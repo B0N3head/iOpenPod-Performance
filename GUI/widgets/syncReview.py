@@ -8,23 +8,31 @@ Shows the diff between PC library and iPod with:
 - New iPod plays to scrobble
 """
 
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRectF
+from __future__ import annotations
+
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QFrame, QStackedWidget, QMessageBox,
     QFileDialog, QDialog, QCheckBox,
 )
 from PyQt6.QtGui import QFont, QColor, QPainter
-from pathlib import Path
 import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import io
-import re
 
-from SyncEngine.fingerprint_diff_engine import SyncPlan, SyncItem, SyncAction, FingerprintDiffEngine
-from SyncEngine.pc_library import PCLibrary
-from SyncEngine.eta import ETATracker
+from app_core.progress import ETATracker
+from app_core.sync_review_model import (
+    ACTION_ADD_TO_IPOD,
+    ACTION_REMOVE_FROM_IPOD,
+    ACTION_SYNC_PLAYCOUNT,
+    ACTION_SYNC_RATING,
+    ACTION_UPDATE_ARTWORK,
+    ACTION_UPDATE_FILE,
+    ACTION_UPDATE_METADATA,
+    count_sync_actions,
+    group_by_media_type,
+    is_sync_action,
+    sync_item_size_delta,
+)
 
 from .formatters import format_size as _format_size, format_duration_mmss as _format_duration
 from ..glyphs import glyph_pixmap
@@ -33,724 +41,18 @@ from ..styles import Colors, FONT_FAMILY, Metrics, btn_css, make_scroll_area
 import html
 import os
 import logging
-from typing import Callable, Optional
-import copy
+from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app_core.services import DeviceSessionService, SettingsService
 
 # Cap the number of per-worker lines rendered in the sync progress detail.
 # Beyond this, an overflow indicator is shown. Without a cap, rich-text
 # `<br>` lines cause the QLabel to grow vertically and push the window
 # taller than the screen during busy multi-worker stages.
 _MAX_DETAIL_LINES = 8
-
-
-class SyncWorker(QThread):
-    """Background worker for computing sync diff."""
-    progress = pyqtSignal(str, int, int, str)  # stage, current, total, message
-    finished = pyqtSignal(object)  # SyncPlan
-    error = pyqtSignal(str)
-
-    def __init__(self, pc_folder: str, ipod_tracks: list, ipod_path: str = "",
-                 supports_video: bool = True, supports_podcast: bool = True,
-                 *, track_edits: dict | None = None,
-                 photo_edits=None,
-                 sync_workers: int = 0, rating_strategy: str = "ipod_wins",
-                 allowed_paths: frozenset[str] | None = None):
-        super().__init__()
-        self.pc_folder = pc_folder
-        self.ipod_tracks = ipod_tracks
-        self.ipod_path = ipod_path
-        self.supports_video = supports_video
-        self.supports_podcast = supports_podcast
-        self.track_edits = track_edits
-        self.photo_edits = photo_edits
-        self.sync_workers = sync_workers
-        self.rating_strategy = rating_strategy
-        self.allowed_paths = allowed_paths
-
-    def run(self):
-        try:
-            # Initialize PC library scanner
-            pc_library = PCLibrary(self.pc_folder)
-
-            # Create fingerprint-based diff engine
-            diff_engine = FingerprintDiffEngine(
-                pc_library, self.ipod_path,
-                supports_video=self.supports_video,
-                supports_podcast=self.supports_podcast,
-            )
-
-            # Compute diff with progress callback and cancellation support
-            plan = diff_engine.compute_diff(
-                self.ipod_tracks,
-                progress_callback=lambda stage, cur, tot, msg: self.progress.emit(stage, cur, tot, msg),
-                is_cancelled=self.isInterruptionRequested,
-                track_edits=self.track_edits,
-                photo_edits=self.photo_edits,
-                sync_workers=self.sync_workers,
-                rating_strategy=self.rating_strategy,
-                allowed_paths=self.allowed_paths,
-            )
-
-            if not self.isInterruptionRequested():
-                self.finished.emit(plan)
-        except Exception as e:
-            if self.isInterruptionRequested():
-                return  # Suppressed — user cancelled
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-
-class BackSyncWorker(QThread):
-    """Background worker for Back Sync (iPod → PC for missing tracks)."""
-
-    progress = pyqtSignal(str, int, int, str)  # stage, current, total, message
-    finished = pyqtSignal(object)  # dict result
-    error = pyqtSignal(str)
-
-    def __init__(self, pc_folder: str, ipod_tracks: list, ipod_path: str):
-        super().__init__()
-        self.pc_folder = pc_folder
-        self.ipod_tracks = ipod_tracks
-        self.ipod_path = ipod_path
-
-    @staticmethod
-    def _short_label(value: str, limit: int = 72) -> str:
-        text = str(value or "").replace("\n", " ").strip()
-        if len(text) <= limit:
-            return text
-        keep = max(limit - 3, 8)
-        return text[:keep] + "..."
-
-    def run(self):
-        try:
-            from SyncEngine._formats import MEDIA_EXTENSIONS
-            from SyncEngine.audio_fingerprint import get_or_compute_fingerprint
-
-            # 1) Scan PC library and fingerprint all tracks.
-            self.progress.emit(
-                "backsync_scan_pc",
-                0,
-                0,
-                "Looking through your PC library for tracks that are already here.",
-            )
-            pc_library = PCLibrary(self.pc_folder)
-            pc_tracks = list(pc_library.scan(include_video=True))
-            total_pc = len(pc_tracks)
-
-            self.progress.emit(
-                "backsync_pc_fingerprint",
-                0,
-                total_pc,
-                f"Building fingerprints for {total_pc:,} PC track{'s' if total_pc != 1 else ''}.",
-            )
-            pc_fps: set[str] = set()
-            pc_fingerprint_errors: list[str] = []
-            workers = min(os.cpu_count() or 4, 8)
-
-            def _fp_pc(path: str) -> str | None:
-                return get_or_compute_fingerprint(path, write_to_file=False)
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_fp_pc, t.path): t for t in pc_tracks}
-                done = 0
-                for fut in as_completed(futures):
-                    if self.isInterruptionRequested():
-                        for f in futures:
-                            f.cancel()
-                        return
-                    done += 1
-                    pc_track = futures[fut]
-                    try:
-                        fp = fut.result()
-                    except Exception as exc:
-                        fp = None
-                        pc_fingerprint_errors.append(f"{pc_track.filename}: {exc}")
-                    if fp:
-                        pc_fps.add(fp)
-                    if done == total_pc or done % 25 == 0:
-                        self.progress.emit(
-                            "backsync_pc_fingerprint",
-                            done,
-                            total_pc,
-                            (
-                                f"{done:,}/{total_pc:,} checked · "
-                                f"{len(pc_fps):,} usable fingerprints · "
-                                f"{self._short_label(pc_track.filename)}"
-                            ),
-                        )
-
-            # 2) Fingerprint iPod tracks and find tracks not present on PC.
-            ipod_candidates: list[tuple[dict, Path]] = []
-            unresolved_ipod_tracks = 0
-            unsupported_ipod_tracks = 0
-            for track in self.ipod_tracks:
-                location = track.get("Location")
-                if not location:
-                    unresolved_ipod_tracks += 1
-                    continue
-                ipod_file = self._resolve_location_to_path(location)
-                if ipod_file is None:
-                    unresolved_ipod_tracks += 1
-                    continue
-                if ipod_file.suffix.lower() not in MEDIA_EXTENSIONS:
-                    unsupported_ipod_tracks += 1
-                    continue
-                ipod_candidates.append((track, ipod_file))
-
-            total_ipod = len(ipod_candidates)
-            self.progress.emit(
-                "backsync_ipod_fingerprint",
-                0,
-                total_ipod,
-                (
-                    f"Comparing {total_ipod:,} iPod media file"
-                    f"{'s' if total_ipod != 1 else ''} against your PC library."
-                ),
-            )
-
-            to_export: list[tuple[dict, Path]] = []
-            ipod_fingerprint_errors: list[str] = []
-            for idx, (track, ipod_file) in enumerate(ipod_candidates, start=1):
-                if self.isInterruptionRequested():
-                    return
-                title = track.get("Title") or ipod_file.name
-                try:
-                    fp = get_or_compute_fingerprint(ipod_file, write_to_file=False)
-                except Exception as exc:
-                    fp = None
-                    ipod_fingerprint_errors.append(f"{title}: {exc}")
-                if fp and fp not in pc_fps:
-                    to_export.append((track, ipod_file))
-                self.progress.emit(
-                    "backsync_ipod_fingerprint",
-                    idx,
-                    total_ipod,
-                    (
-                        f"{idx:,}/{total_ipod:,} checked · "
-                        f"{len(to_export):,} missing so far · "
-                        f"{self._short_label(title)}"
-                    ),
-                )
-
-            # 3) Export iPod-only tracks to "iOpenPod Back Sync".
-            output_root = Path(self.pc_folder) / "iOpenPod Back Sync"
-            output_root.mkdir(parents=True, exist_ok=True)
-
-            artwork_ctx = self._load_artwork_context()
-
-            exported = 0
-            metadata_hydrated = 0
-            artwork_hydrated = 0
-            errors: list[str] = []
-            total_export = len(to_export)
-
-            self.progress.emit(
-                "backsync_copy",
-                0,
-                total_export,
-                (
-                    f"Exporting {total_export:,} missing track"
-                    f"{'s' if total_export != 1 else ''} to iOpenPod Back Sync."
-                ),
-            )
-
-            for idx, (track, src_path) in enumerate(to_export, start=1):
-                if self.isInterruptionRequested():
-                    return
-                try:
-                    dest_path = self._build_destination_path(output_root, track, src_path)
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_path, dest_path)
-
-                    art_bytes = self._extract_artwork_bytes(track, artwork_ctx)
-                    wrote_meta, wrote_art = self._hydrate_file_metadata(dest_path, track, art_bytes)
-                    if wrote_meta:
-                        metadata_hydrated += 1
-                    if wrote_art:
-                        artwork_hydrated += 1
-
-                    exported += 1
-                    self.progress.emit(
-                        "backsync_copy",
-                        idx,
-                        total_export,
-                        (
-                            f"{idx:,}/{total_export:,} exported · "
-                            f"{metadata_hydrated:,} tagged · "
-                            f"{artwork_hydrated:,} with artwork · "
-                            f"{self._short_label(dest_path.name)}"
-                        ),
-                    )
-                except Exception as exc:
-                    errors.append(f"{src_path.name}: {exc}")
-                    self.progress.emit(
-                        "backsync_copy",
-                        idx,
-                        total_export,
-                        (
-                            f"{idx:,}/{total_export:,} processed · "
-                            f"{exported:,} exported · "
-                            f"{len(errors):,} warning"
-                            f"{'s' if len(errors) != 1 else ''} · "
-                            f"{self._short_label(src_path.name)}"
-                        ),
-                    )
-
-            self.finished.emit({
-                "pc_scanned": total_pc,
-                "pc_fingerprint_count": len(pc_fps),
-                "pc_fingerprint_errors": pc_fingerprint_errors,
-                "ipod_scanned": total_ipod,
-                "unresolved_ipod_tracks": unresolved_ipod_tracks,
-                "unsupported_ipod_tracks": unsupported_ipod_tracks,
-                "ipod_fingerprint_errors": ipod_fingerprint_errors,
-                "missing_on_pc": total_export,
-                "exported": exported,
-                "metadata_hydrated": metadata_hydrated,
-                "artwork_hydrated": artwork_hydrated,
-                "output_folder": str(output_root),
-                "errors": errors,
-            })
-        except Exception as e:
-            if self.isInterruptionRequested():
-                return
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-    def _resolve_location_to_path(self, location: str) -> Path | None:
-        """Resolve iPod Location field to an on-disk file path."""
-        if not location:
-            return None
-
-        loc = str(location).strip()
-        direct = Path(loc)
-        if direct.exists() and direct.is_file():
-            return direct
-
-        unified = loc.replace("\\", "/")
-        marker = "ipod_control"
-        marker_idx = unified.lower().find(marker)
-        if marker_idx >= 0:
-            rel = unified[marker_idx:].lstrip("/")
-            candidate = Path(self.ipod_path) / rel
-            if candidate.exists() and candidate.is_file():
-                return candidate
-
-        is_windows_abs = len(loc) >= 3 and loc[1] == ":" and loc[2] in ("\\", "/")
-        if not is_windows_abs and ":" in loc:
-            rel = loc.replace(":", "/").lstrip("/")
-            candidate = Path(self.ipod_path) / rel
-            if candidate.exists() and candidate.is_file():
-                return candidate
-
-        fallback = Path(self.ipod_path) / unified.lstrip("/")
-        if fallback.exists() and fallback.is_file():
-            return fallback
-        return None
-
-    @staticmethod
-    def _safe_component(value: str, fallback: str) -> str:
-        text = (value or "").strip() or fallback
-        text = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", text)
-        text = text.strip(" .")
-        return (text or fallback)[:120]
-
-    def _build_destination_path(self, output_root: Path, track: dict, src_path: Path) -> Path:
-        artist = self._safe_component(track.get("Artist", "Unknown Artist"), "Unknown Artist")
-        album = self._safe_component(track.get("Album", "Unknown Album"), "Unknown Album")
-        title = self._safe_component(track.get("Title", src_path.stem), src_path.stem)
-
-        track_num = track.get("track_number", 0) or 0
-        if track_num > 0:
-            base_name = f"{track_num:02d} - {title}"
-        else:
-            base_name = title
-
-        ext = src_path.suffix.lower()
-        dest_dir = output_root / artist / album
-        dest = dest_dir / f"{base_name}{ext}"
-
-        if not dest.exists():
-            return dest
-
-        i = 2
-        while True:
-            alt = dest_dir / f"{base_name} ({i}){ext}"
-            if not alt.exists():
-                return alt
-            i += 1
-
-    def _load_artwork_context(self):
-        """Load ArtworkDB context once for album-art extraction."""
-        try:
-            artworkdb_path = Path(self.ipod_path) / "iPod_Control" / "Artwork" / "ArtworkDB"
-            artwork_folder = Path(self.ipod_path) / "iPod_Control" / "Artwork"
-            if not artworkdb_path.exists() or not artwork_folder.exists():
-                return None
-
-            from GUI.imgMaker import get_artworkdb_cached
-
-            db, idx = get_artworkdb_cached(str(artworkdb_path))
-            return (db, idx, str(artwork_folder))
-        except Exception:
-            return None
-
-    def _extract_artwork_bytes(self, track: dict, artwork_ctx) -> bytes | None:
-        if not artwork_ctx:
-            return None
-
-        img_id = (
-            track.get("artwork_id_ref")
-            or track.get("mhii_link")
-            or track.get("mhiiLink")
-            or 0
-        )
-        if not img_id:
-            return None
-
-        db, idx, artwork_folder = artwork_ctx
-        try:
-            from GUI.imgMaker import find_image_by_img_id
-
-            result = find_image_by_img_id(db, artwork_folder, int(img_id), img_id_index=idx)
-            if not result:
-                return None
-            img = result[0].convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            return buf.getvalue()
-        except Exception:
-            return None
-
-    def _hydrate_file_metadata(self, file_path: Path, track: dict, art_bytes: bytes | None) -> tuple[bool, bool]:
-        """Apply iPod metadata + artwork tags to copied file.
-
-        Returns: (metadata_written, artwork_written)
-        """
-        ext = file_path.suffix.lower()
-        wrote_meta = False
-        wrote_art = False
-
-        title = track.get("Title")
-        artist = track.get("Artist")
-        album = track.get("Album")
-        album_artist = track.get("Album Artist")
-        genre = track.get("Genre")
-        composer = track.get("Composer")
-        comment = track.get("Comment")
-        year = track.get("year", 0) or 0
-        track_number = track.get("track_number", 0) or 0
-        total_tracks = track.get("total_tracks", 0) or 0
-        disc_number = track.get("disc_number", 0) or 0
-        total_discs = track.get("total_discs", 0) or 0
-
-        try:
-            if ext in (".mp3", ".aif", ".aiff", ".wav"):
-                from mutagen.id3 import ID3
-                from mutagen.id3._frames import (
-                    APIC,
-                    COMM,
-                    TALB,
-                    TCOM,
-                    TCON,
-                    TDRC,
-                    TIT2,
-                    TPE1,
-                    TPE2,
-                    TPOS,
-                    TRCK,
-                )
-                from mutagen.id3._util import ID3NoHeaderError
-
-                try:
-                    tags = ID3(str(file_path))
-                except ID3NoHeaderError:
-                    tags = ID3()
-
-                def _set_text(fid: str, frame):
-                    tags.delall(fid)
-                    tags.add(frame)
-
-                if title:
-                    _set_text("TIT2", TIT2(encoding=3, text=[str(title)]))
-                if artist:
-                    _set_text("TPE1", TPE1(encoding=3, text=[str(artist)]))
-                if album:
-                    _set_text("TALB", TALB(encoding=3, text=[str(album)]))
-                if album_artist:
-                    _set_text("TPE2", TPE2(encoding=3, text=[str(album_artist)]))
-                if genre:
-                    _set_text("TCON", TCON(encoding=3, text=[str(genre)]))
-                if composer:
-                    _set_text("TCOM", TCOM(encoding=3, text=[str(composer)]))
-                if year:
-                    _set_text("TDRC", TDRC(encoding=3, text=[str(year)]))
-                if track_number:
-                    trk = f"{track_number}/{total_tracks}" if total_tracks else str(track_number)
-                    _set_text("TRCK", TRCK(encoding=3, text=[trk]))
-                if disc_number:
-                    dsk = f"{disc_number}/{total_discs}" if total_discs else str(disc_number)
-                    _set_text("TPOS", TPOS(encoding=3, text=[dsk]))
-                if comment:
-                    tags.delall("COMM")
-                    tags.add(COMM(encoding=3, lang="eng", desc="", text=[str(comment)]))
-
-                if art_bytes:
-                    tags.delall("APIC")
-                    tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=art_bytes))
-                    wrote_art = True
-
-                tags.save(str(file_path))
-                wrote_meta = True
-
-            elif ext in (".m4a", ".m4p", ".aac", ".m4b", ".mp4", ".m4v", ".mov"):
-                from mutagen.mp4 import MP4, MP4Cover
-
-                audio = MP4(str(file_path))
-                tags = audio.tags
-                if tags is None:
-                    audio.add_tags()
-                    tags = audio.tags
-                if tags is None:
-                    return False, False
-
-                if title:
-                    tags["\xa9nam"] = [str(title)]
-                if artist:
-                    tags["\xa9ART"] = [str(artist)]
-                if album:
-                    tags["\xa9alb"] = [str(album)]
-                if album_artist:
-                    tags["aART"] = [str(album_artist)]
-                if genre:
-                    tags["\xa9gen"] = [str(genre)]
-                if composer:
-                    tags["\xa9wrt"] = [str(composer)]
-                if comment:
-                    tags["\xa9cmt"] = [str(comment)]
-                if year:
-                    tags["\xa9day"] = [str(year)]
-
-                if track_number:
-                    tags["trkn"] = [(int(track_number), int(total_tracks or 0))]
-                if disc_number:
-                    tags["disk"] = [(int(disc_number), int(total_discs or 0))]
-
-                if art_bytes:
-                    tags["covr"] = [MP4Cover(art_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
-                    wrote_art = True
-
-                audio.save()
-                wrote_meta = True
-
-        except Exception:
-            return False, False
-
-        return wrote_meta, wrote_art
-
-
-class SyncExecuteWorker(QThread):
-    """Background worker for executing sync plan."""
-    progress = pyqtSignal(object)  # SyncProgress
-    finished = pyqtSignal(object)  # SyncResult
-    error = pyqtSignal(str)
-    # Emitted when the sync is cancelled mid-way with partial results.
-    # Carries (n_added, n_skipped).  The UI must respond by calling
-    # respond_to_partial_save(True/False) to unblock the worker thread.
-    confirm_partial_save = pyqtSignal(int, int)
-
-    def __init__(self, ipod_path: str, plan, *, skip_backup: bool = False,
-                 user_playlists: list | None = None,
-                 on_sync_complete: Callable[[], None] | None = None):
-        super().__init__()
-        self.ipod_path = ipod_path
-        self.plan = plan
-        self.skip_backup = skip_backup
-        self._skip_backup_requested = False
-        self.user_playlists = user_playlists
-        self.on_sync_complete = on_sync_complete
-        self._give_up_scrobble_requested = False
-        self._partial_save_event: "threading.Event | None" = None
-        self._partial_save_decision: list[bool] = [True]
-
-    def respond_to_partial_save(self, save: bool) -> None:
-        """Called from the UI thread to unblock the worker with the user's decision."""
-        self._partial_save_decision[0] = save
-        if self._partial_save_event:
-            self._partial_save_event.set()
-
-    def request_skip_backup(self):
-        """Signal the worker to skip the in-progress backup and proceed to sync."""
-        self._skip_backup_requested = True
-
-    def request_give_up_scrobble(self):
-        """Signal the worker to stop retrying ListenBrainz scrobbles."""
-        self._give_up_scrobble_requested = True
-
-    def run(self):
-        try:
-            from SyncEngine.sync_executor import SyncExecutor, SyncProgress
-            from SyncEngine.mapping import MappingManager
-            from settings import get_settings
-
-            settings = get_settings()
-
-            # Callback that blocks the worker thread until the UI responds
-            self._partial_save_event = threading.Event()
-
-            def _on_cancel_with_partial(n_added: int, n_skipped: int) -> bool:
-                evt = self._partial_save_event
-                if evt is None:
-                    return True
-                self._partial_save_decision[0] = True  # default: save
-                evt.clear()
-                self.confirm_partial_save.emit(n_added, n_skipped)
-                evt.wait()  # blocks until respond_to_partial_save() is called
-                return self._partial_save_decision[0]
-
-            # ── Pre-sync backup ───────────────────────────────────────
-            if not self.skip_backup:
-                try:
-                    self.progress.emit(SyncProgress("backup", 0, 0, message="Creating pre-sync backup…"))
-                    from SyncEngine.backup_manager import (
-                        BackupManager, get_device_identifier,
-                        get_device_display_name,
-                    )
-                    from ..app import DeviceManager
-
-                    device = DeviceManager.get_instance()
-                    device_id = get_device_identifier(
-                        self.ipod_path, device.discovered_ipod,
-                    )
-                    device_name = get_device_display_name(device.discovered_ipod)
-
-                    ipod = device.discovered_ipod
-                    device_meta = {}
-                    if ipod:
-                        device_meta = {
-                            "family": getattr(ipod, "model_family", ""),
-                            "generation": getattr(ipod, "generation", ""),
-                            "color": getattr(ipod, "color", ""),
-                            "display_name": getattr(ipod, "display_name", ""),
-                        }
-
-                    manager = BackupManager(
-                        device_id=device_id,
-                        backup_dir=settings.backup_dir,
-                        device_name=device_name,
-                        device_meta=device_meta,
-                    )
-
-                    def on_backup_progress(prog):
-                        self.progress.emit(SyncProgress(
-                            "backup", prog.current, prog.total, message=prog.message,
-                        ))
-
-                    snap = manager.create_backup(
-                        ipod_path=self.ipod_path,
-                        progress_callback=on_backup_progress,
-                        is_cancelled=lambda: self.isInterruptionRequested() or self._skip_backup_requested,
-                        max_backups=settings.max_backups,
-                    )
-
-                    if snap is None and self.isInterruptionRequested():
-                        return  # Cancelled entire operation
-
-                    # If snap is None due to skip/no-changes, GC orphaned blobs
-                    if snap is None:
-                        try:
-                            manager.garbage_collect()
-                        except Exception:
-                            pass
-                    else:
-                        logger.info("Pre-sync backup created: %s", snap.id)
-                except Exception as e:
-                    logger.warning("Pre-sync backup failed (continuing sync): %s", e)
-                    import traceback as _tb
-                    _tb.print_exc()
-
-            # ── Execute sync ──────────────────────────────────────────
-
-            # Use custom transcode cache dir if configured
-            cache_dir = Path(settings.transcode_cache_dir) if settings.transcode_cache_dir else None
-
-            # Initialize executor
-            executor = SyncExecutor(self.ipod_path, cache_dir=cache_dir,
-                                    max_workers=settings.sync_workers)
-
-            # Reuse the mapping loaded during compute_diff (avoids duplicate
-            # load / "No mapping file found" log).  Falls back to fresh load
-            # if the plan somehow doesn't carry one.
-            if self.plan.mapping is not None:
-                mapping = self.plan.mapping
-            else:
-                mapping_manager = MappingManager(self.ipod_path)
-                mapping = mapping_manager.load()
-
-            # Progress callback
-            def on_progress(prog: SyncProgress):
-                self.progress.emit(prog)
-
-            # Execute sync — executor saves mapping internally on success
-            result = executor.execute(
-                plan=self.plan,
-                mapping=mapping,
-                progress_callback=on_progress,
-                dry_run=False,
-                is_cancelled=self.isInterruptionRequested,
-                write_back_to_pc=settings.write_back_to_pc,
-                user_playlists=self.user_playlists,
-                on_sync_complete=self.on_sync_complete,
-                compute_sound_check=settings.compute_sound_check,
-                scrobble_on_sync=settings.scrobble_on_sync,
-                listenbrainz_token=settings.listenbrainz_token or "",
-                is_scrobble_cancelled=lambda: self._give_up_scrobble_requested,
-                on_cancel_with_partial=_on_cancel_with_partial,
-            )
-
-            self.finished.emit(result)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-
-class QuickPlaylistSyncWorker(QThread):
-    """Background worker for instant playlist-only database rewrite."""
-    progress = pyqtSignal(str)   # status message
-    completed = pyqtSignal(object)  # SyncResult
-    error = pyqtSignal(str)
-
-    def __init__(self, ipod_path: str, user_playlists: list[dict],
-                 on_complete: Callable[[], None] | None = None):
-        super().__init__()
-        self.ipod_path = ipod_path
-        self.user_playlists = user_playlists
-        self.on_complete = on_complete
-
-    def run(self):
-        try:
-            from SyncEngine.sync_executor import SyncExecutor, SyncProgress
-
-            executor = SyncExecutor(self.ipod_path)
-
-            def on_progress(prog: SyncProgress):
-                self.progress.emit(prog.message)
-
-            result = executor.quick_write_playlists(
-                user_playlists=self.user_playlists,
-                progress_callback=on_progress,
-                on_complete=self.on_complete,
-            )
-            self.completed.emit(result)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
 
 
 # ── Category color palette ──────────────────────────────────────────────────
@@ -769,7 +71,7 @@ _CAT_COLORS = {
     "duplicate": Colors.SYNC_ORANGE,
 }
 
-# ── Media type classification for sync items ────────────────────────────────
+# ── Media type labels for sync item grouping ────────────────────────────────
 
 # Map from media type bitmask to (label, svg_icon_name) for sync review grouping
 _MEDIA_TYPE_LABELS: dict[str, tuple[str, str]] = {
@@ -781,67 +83,6 @@ _MEDIA_TYPE_LABELS: dict[str, tuple[str, str]] = {
     "tv_show": ("TV Shows", "monitor"),
     "other": ("Other", "music"),
 }
-
-
-def _classify_media_type(item: SyncItem) -> str:
-    """Classify a SyncItem into a media type bucket.
-
-    Uses pc_track for ADD actions, ipod_track for REMOVE actions.
-    Returns a key from _MEDIA_TYPE_LABELS.
-    """
-    track = item.pc_track
-    ipod = item.ipod_track
-
-    # From PC track — check high-level flags first
-    if track:
-        if track.is_podcast:
-            return "podcast"
-        if track.is_audiobook:
-            return "audiobook"
-        if track.is_video:
-            if track.video_kind == "tv_show":
-                return "tv_show"
-            if track.video_kind == "music_video":
-                return "music_video"
-            return "video"
-        return "music"
-
-    # From iPod track dict — use media_type bitmask
-    if ipod:
-        mt = ipod.get("media_type", 1)
-        if mt & 0x04:
-            return "podcast"
-        if mt & 0x08:
-            return "audiobook"
-        if mt & 0x40:
-            return "tv_show"
-        if mt & 0x20:
-            return "music_video"
-        if mt & 0x02:
-            return "video"
-        if mt == 0 or mt & 0x01:
-            return "music"
-
-    return "music"  # default
-
-
-def _group_by_media_type(items: list[SyncItem]) -> list[tuple[str, list[SyncItem]]]:
-    """Group sync items by media type, returning (type_key, items) pairs.
-
-    Returns groups in a stable display order, only including non-empty groups.
-    """
-    groups: dict[str, list[SyncItem]] = {}
-    for item in items:
-        key = _classify_media_type(item)
-        groups.setdefault(key, []).append(item)
-
-    # Return in preferred display order
-    order = ["music", "podcast", "audiobook", "video", "music_video", "tv_show", "other"]
-    result = []
-    for key in order:
-        if key in groups:
-            result.append((key, groups[key]))
-    return result
 
 
 def _rating_to_stars(rating: int) -> str:
@@ -963,7 +204,7 @@ class SyncTrackRow(QFrame):
 
     toggled = pyqtSignal()  # emitted when the checkbox changes
 
-    def __init__(self, item: SyncItem, accent: str, checkable: bool = True, parent=None):
+    def __init__(self, item: Any, accent: str, checkable: bool = True, parent=None):
         super().__init__(parent)
         self.sync_item = item
         self._accent = accent
@@ -1039,11 +280,11 @@ class SyncTrackRow(QFrame):
 
         self._populate(item)
 
-    def _populate(self, item: SyncItem):
+    def _populate(self, item: Any):
         track = item.pc_track
         ipod = item.ipod_track
 
-        if item.action == SyncAction.ADD_TO_IPOD and track:
+        if is_sync_action(item, ACTION_ADD_TO_IPOD) and track:
             self.title_label.setText(track.title or track.filename)
             parts = [track.artist or "Unknown", track.album or "Unknown"]
             if track.size:
@@ -1063,7 +304,7 @@ class SyncTrackRow(QFrame):
             self.detail_label.setText(" · ".join(parts))
             self.badge_label.setText(_format_duration(track.duration_ms))
 
-        elif item.action == SyncAction.REMOVE_FROM_IPOD:
+        elif is_sync_action(item, ACTION_REMOVE_FROM_IPOD):
             if ipod:
                 self.title_label.setText(ipod.get("Title", "Unknown"))
                 parts = [ipod.get("Artist", "Unknown"), ipod.get("Album", "Unknown")]
@@ -1093,7 +334,7 @@ class SyncTrackRow(QFrame):
                 self.title_label.setText(item.description or "Unknown track")
                 self.detail_label.setText(f"Orphaned mapping (db_track_id={item.db_track_id})")
 
-        elif item.action == SyncAction.UPDATE_FILE and track:
+        elif is_sync_action(item, ACTION_UPDATE_FILE) and track:
             self.title_label.setText(track.title or track.filename)
             parts = [track.artist or "Unknown", track.album or "Unknown"]
             if track.size:
@@ -1103,7 +344,7 @@ class SyncTrackRow(QFrame):
             self.detail_label.setText(" · ".join(parts))
             self.badge_label.setText(_format_duration(track.duration_ms))
 
-        elif item.action == SyncAction.UPDATE_METADATA:
+        elif is_sync_action(item, ACTION_UPDATE_METADATA):
             is_gui_edit = track is None  # GUI edits have no pc_track
             if track:
                 self.title_label.setText(track.title or track.filename)
@@ -1119,7 +360,7 @@ class SyncTrackRow(QFrame):
             prefix = f"[{source}]  " if diff_parts else ""
             self.detail_label.setText(prefix + ("  |  ".join(diff_parts) if diff_parts else "metadata changed"))
 
-        elif item.action == SyncAction.UPDATE_ARTWORK and track:
+        elif is_sync_action(item, ACTION_UPDATE_ARTWORK) and track:
             self.title_label.setText(track.title or track.filename)
             new_h, old_h = item.new_art_hash, item.old_art_hash
             if not new_h and old_h:
@@ -1131,7 +372,7 @@ class SyncTrackRow(QFrame):
             self.detail_label.setText(f"{track.artist or 'Unknown'} · {track.album or 'Unknown'} · {art_lbl}")
             self.badge_label.setText(_format_duration(track.duration_ms))
 
-        elif item.action == SyncAction.SYNC_PLAYCOUNT and track:
+        elif is_sync_action(item, ACTION_SYNC_PLAYCOUNT) and track:
             self.title_label.setText(track.title or track.filename)
             stats = []
             if item.play_count_delta > 0:
@@ -1147,7 +388,7 @@ class SyncTrackRow(QFrame):
             )
             self.badge_label.setText(_format_duration(track.duration_ms))
 
-        elif item.action == SyncAction.SYNC_RATING:
+        elif is_sync_action(item, ACTION_SYNC_RATING):
             is_gui_edit = track is None
             ipod_stars = _rating_to_stars(item.ipod_rating)
             pc_stars = _rating_to_stars(item.pc_rating)
@@ -1469,7 +710,7 @@ class SyncCategoryCard(QFrame):
 
     # ── public API ──────────────────────────────────────────────
 
-    def add_track_row(self, item: SyncItem) -> SyncTrackRow:
+    def add_track_row(self, item: Any) -> SyncTrackRow:
         row = SyncTrackRow(item, self._accent, checkable=self._checkable, parent=self)
         if not self._start_checked:
             row.set_checked(False)
@@ -1481,7 +722,7 @@ class SyncCategoryCard(QFrame):
     def add_info_row(self, title: str, detail: str = "", badge: str = ""):
         self._body_layout.addWidget(_InfoRow(title, detail, self._accent, badge, parent=self))
 
-    def get_checked_items(self) -> list[SyncItem]:
+    def get_checked_items(self) -> list[Any]:
         return [r.sync_item for r in self._track_rows if r.is_checked()]
 
     def set_all_checked(self, state: bool):
@@ -1508,14 +749,21 @@ class SyncReviewWidget(QWidget):
     with checkboxes to include/exclude individual items.
     """
 
-    sync_requested = pyqtSignal(object)  # Emits list[SyncItem]
+    sync_requested = pyqtSignal(object)  # Emits selected sync items
     skip_backup_signal = pyqtSignal()     # Skip the in-progress pre-sync backup
     give_up_scrobble_signal = pyqtSignal()  # Stop retrying scrobble timeouts
     cancelled = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        settings_service: SettingsService,
+        device_sessions: DeviceSessionService,
+        parent=None,
+    ):
         super().__init__(parent)
-        self._plan: Optional[SyncPlan] = None
+        self._settings_service = settings_service
+        self._device_sessions = device_sessions
+        self._plan: Any | None = None
         self._cancelled = False
         self._ipod_tracks_cache: list = []
         self._eta_tracker = ETATracker()
@@ -2103,7 +1351,7 @@ class SyncReviewWidget(QWidget):
             self.progress_bar.setRange(0, 0)  # Indeterminate
             self.eta_label.setText("")
 
-    def show_plan(self, plan: SyncPlan):
+    def show_plan(self, plan: Any):
         """Display the sync plan as styled category cards."""
         self._plan = plan
         self._category_cards.clear()
@@ -2149,13 +1397,13 @@ class SyncReviewWidget(QWidget):
         self._set_footer_for_state("plan")
 
         # ── Summary stats pills ─────────────────────────────────────
-        def _track_add_bytes(items: list[SyncItem]) -> int:
+        def _track_add_bytes(items: list[Any]) -> int:
             return sum(
                 (it.estimated_size if it.estimated_size is not None else (it.pc_track.size if it.pc_track else 0))
                 for it in items
             )
 
-        def _track_remove_bytes(items: list[SyncItem]) -> int:
+        def _track_remove_bytes(items: list[Any]) -> int:
             return sum((it.ipod_track.get("size", 0) if it.ipod_track else 0) for it in items)
 
         def _add_pill(text: str, color: str):
@@ -2246,7 +1494,7 @@ class SyncReviewWidget(QWidget):
 
         # ── Add to iPod ─────────────────────────────────────────────
         if plan.to_add:
-            groups = _group_by_media_type(plan.to_add)
+            groups = group_by_media_type(plan.to_add)
             use_subgroups = len(groups) > 1  # Only sub-group when multiple types exist
 
             if use_subgroups:
@@ -2281,7 +1529,7 @@ class SyncReviewWidget(QWidget):
         # ── Remove from iPod ────────────────────────────────────────
         if plan.to_remove:
             _rm_checked = plan.removals_pre_checked
-            groups = _group_by_media_type(plan.to_remove)
+            groups = group_by_media_type(plan.to_remove)
             use_subgroups = len(groups) > 1
 
             if use_subgroups:
@@ -2378,8 +1626,11 @@ class SyncReviewWidget(QWidget):
                 "average": "Ratings are averaged",
             }
             try:
-                from settings import get_settings
-                strat = get_settings().rating_conflict_strategy
+                strat = (
+                    self._settings_service
+                    .get_effective_settings()
+                    .rating_conflict_strategy
+                )
             except Exception:
                 strat = "ipod_wins"
             subtitle = _strat_subtitles.get(strat, "Rating differs between PC and iPod")
@@ -2567,15 +1818,13 @@ class SyncReviewWidget(QWidget):
 
     # ── Storage bar helper ──────────────────────────────────────────────
 
-    def _update_storage_bar(self, plan: SyncPlan):
+    def _update_storage_bar(self, plan: Any):
         """Update the iPod storage bar with model image, name, and segmented bar."""
         try:
-            from ..app import DeviceManager
             from ..ipod_images import get_ipod_image
-            from SyncEngine.backup_manager import get_device_display_name
 
-            device_manager = DeviceManager.get_instance()
-            ipod_path = device_manager.device_path
+            session = self._device_sessions.current_session()
+            ipod_path = session.device_path
             if not ipod_path:
                 self._storage_frame.setVisible(False)
                 return
@@ -2593,17 +1842,24 @@ class SyncReviewWidget(QWidget):
             )
 
             # iPod model image and name
-            ipod = device_manager.discovered_ipod
+            ipod = session.discovered_ipod
             if ipod:
+                model_family = str(getattr(ipod, "model_family", "") or "")
+                generation = str(getattr(ipod, "generation", "") or "")
+                color = str(getattr(ipod, "color", "") or "")
                 pix = get_ipod_image(
-                    ipod.model_family, ipod.generation,
-                    size=(32), color=ipod.color,
+                    model_family, generation,
+                    size=(32), color=color,
                 )
                 if pix and not pix.isNull():
                     self._storage_ipod_img.setPixmap(pix)
-                self._storage_name.setText(
-                    get_device_display_name(ipod)
+                identity = session.identity
+                display_name = (
+                    identity.display_name
+                    if identity and identity.display_name
+                    else str(getattr(ipod, "display_name", "") or "")
                 )
+                self._storage_name.setText(display_name or "iPod")
             else:
                 self._storage_name.setText("iPod")
 
@@ -3175,19 +2431,9 @@ class SyncReviewWidget(QWidget):
                 if row.is_checked():
                     selected += 1
                     item = row.sync_item
-                    if item.action == SyncAction.ADD_TO_IPOD:
-                        if item.estimated_size is not None:
-                            bytes_to_add += item.estimated_size
-                        elif item.pc_track:
-                            bytes_to_add += item.pc_track.size
-                    elif item.action == SyncAction.REMOVE_FROM_IPOD:
-                        if item.ipod_track:
-                            bytes_to_remove += item.ipod_track.get("size", 0)
-                    elif item.action == SyncAction.UPDATE_FILE:
-                        if item.estimated_size is not None:
-                            bytes_to_add += item.estimated_size
-                        elif item.pc_track:
-                            bytes_to_add += item.pc_track.size
+                    add_delta, remove_delta = sync_item_size_delta(item)
+                    bytes_to_add += add_delta
+                    bytes_to_remove += remove_delta
 
         for _key, card in self._photo_card_meta:
             total += 1
@@ -3228,41 +2474,25 @@ class SyncReviewWidget(QWidget):
         if self._disk_total > 0:
             self._render_storage(net_change)
 
-    def _get_selected_items(self) -> list[SyncItem]:
+    def _get_selected_items(self) -> list[Any]:
         """Get all checked sync items from category cards."""
-        selected_items: list[SyncItem] = []
+        selected_items: list[Any] = []
         for card in self._category_cards:
             selected_items.extend(card.get_checked_items())
         return selected_items
 
     def get_selected_photo_plan(self):
-        from SyncEngine.photos import PhotoSyncPlan
+        from app_core.sync_plan_builder import build_selected_photo_plan
 
         if self._plan is None or self._plan.photo_plan is None:
             return None
 
-        original = self._plan.photo_plan
-        selected = PhotoSyncPlan(
-            skipped_files=list(original.skipped_files),
-            current_db=original.current_db,
-            desired_library=original.desired_library,
-        )
-        selected.photos_to_update = list(original.photos_to_update)
-
-        included = {key for key, card in self._photo_card_meta if card._select_all_cb.isChecked()}
-        for key in (
-            "albums_to_add",
-            "albums_to_remove",
-            "photos_to_add",
-            "photos_to_remove",
-            "photos_to_update",
-            "album_membership_adds",
-            "album_membership_removes",
-        ):
-            setattr(selected, key, copy.deepcopy(getattr(original, key)) if key in included else [])
-        selected.thumb_bytes_to_add = original.thumb_bytes_to_add if "photos_to_add" in included else 0
-        selected.thumb_bytes_to_remove = original.thumb_bytes_to_remove if "photos_to_remove" in included else 0
-        return selected if selected.has_changes else None
+        included = {
+            key
+            for key, card in self._photo_card_meta
+            if card._select_all_cb.isChecked()
+        }
+        return build_selected_photo_plan(self._plan.photo_plan, included)
 
     def _apply_sync(self):
         """Show confirmation, then pre-sync backup prompt before syncing."""
@@ -3288,13 +2518,14 @@ class SyncReviewWidget(QWidget):
             return
 
         # Confirm
-        add_count = sum(1 for s in selected_items if s.action == SyncAction.ADD_TO_IPOD)
-        remove_count = sum(1 for s in selected_items if s.action == SyncAction.REMOVE_FROM_IPOD)
-        meta_count = sum(1 for s in selected_items if s.action == SyncAction.UPDATE_METADATA)
-        file_count = sum(1 for s in selected_items if s.action == SyncAction.UPDATE_FILE)
-        art_count = sum(1 for s in selected_items if s.action == SyncAction.UPDATE_ARTWORK)
-        playcount_count = sum(1 for s in selected_items if s.action == SyncAction.SYNC_PLAYCOUNT)
-        rating_count = sum(1 for s in selected_items if s.action == SyncAction.SYNC_RATING)
+        action_counts = count_sync_actions(selected_items)
+        add_count = action_counts.add_to_ipod
+        remove_count = action_counts.remove_from_ipod
+        meta_count = action_counts.update_metadata
+        file_count = action_counts.update_file
+        art_count = action_counts.update_artwork
+        playcount_count = action_counts.sync_playcount
+        rating_count = action_counts.sync_rating
         photo_add_count = len(selected_photo_plan.photos_to_add) if selected_photo_plan else 0
         photo_remove_count = len(selected_photo_plan.photos_to_remove) if selected_photo_plan else 0
         photo_update_count = len(selected_photo_plan.photos_to_update) if selected_photo_plan else 0
@@ -3410,8 +2641,7 @@ class SyncReviewWidget(QWidget):
             return
 
         # Decide backup strategy based on setting
-        from settings import get_settings
-        settings = get_settings()
+        settings = self._settings_service.get_effective_settings()
 
         self._pending_sync_items = selected_items
 

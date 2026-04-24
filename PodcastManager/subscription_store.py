@@ -29,8 +29,9 @@ class SubscriptionStore:
                    ``"/Volumes/iPod"``).
     """
 
-    def __init__(self, ipod_path: str):
+    def __init__(self, ipod_path: str, download_cache_dir: str = ""):
         self._ipod_path = ipod_path
+        self._download_cache_dir = download_cache_dir
         self._podcast_dir = os.path.join(
             ipod_path, "iPod_Control", "iOpenPodPodcasts",
         )
@@ -185,12 +186,8 @@ class SubscriptionStore:
         """
         import hashlib
         url_hash = hashlib.sha256(feed.feed_url.encode()).hexdigest()[:16]
-        try:
-            from settings import get_settings
-            base = get_settings().transcode_cache_dir
-        except Exception:
-            base = ""
+        base = self._download_cache_dir
         if not base:
-            from settings import default_cache_dir
+            from infrastructure.settings_paths import default_cache_dir
             base = default_cache_dir()
         return os.path.join(base, "podcasts", url_hash)
