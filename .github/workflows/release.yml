@@ -254,7 +254,8 @@ jobs:
   pypi-publish:
     needs: release
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
     permissions:
       id-token: write
     steps:
