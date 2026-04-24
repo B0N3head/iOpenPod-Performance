@@ -74,16 +74,16 @@ class PodcastTrackMatcher:
                 )
 
             if matched_track:
-                new_db_id = matched_track.get("db_id", 0)
-                if ep.ipod_db_id != new_db_id or ep.status != STATUS_ON_IPOD:
-                    ep.ipod_db_id = new_db_id
+                new_db_track_id = matched_track.get("db_track_id", matched_track.get("db_id", 0))
+                if ep.ipod_db_track_id != new_db_track_id or ep.status != STATUS_ON_IPOD:
+                    ep.ipod_db_track_id = new_db_track_id
                     ep.status = STATUS_ON_IPOD
                     changed = True
                 continue
 
             # No longer present on iPod: clear stale db link and derive local status.
-            if ep.ipod_db_id != 0:
-                ep.ipod_db_id = 0
+            if ep.ipod_db_track_id != 0:
+                ep.ipod_db_track_id = 0
                 changed = True
 
             # Keep transient download state if a transfer is currently running.
@@ -458,7 +458,7 @@ def build_podcast_managed_plan(
         # Find this feed's episodes currently on the iPod
         on_ipod: list[tuple[PodcastEpisode, dict]] = []
         for ep in feed.episodes:
-            if ep.status != STATUS_ON_IPOD or not ep.ipod_db_id:
+            if ep.status != STATUS_ON_IPOD or not ep.ipod_db_track_id:
                 continue
             # Look up the iPod track dict for metadata (play count, date_added)
             ipod_track = None
@@ -508,7 +508,7 @@ def build_podcast_managed_plan(
                 ep, track = to_clear[i]
                 feed_removes.append(SyncItem(
                     action=SyncAction.REMOVE_FROM_IPOD,
-                    db_id=ep.ipod_db_id,
+                    db_track_id=ep.ipod_db_track_id,
                     ipod_track=track,
                     description=(
                         f"\U0001f399 {feed.title} \u2014 {ep.title} "
@@ -535,7 +535,7 @@ def build_podcast_managed_plan(
             for ep, track in to_clear:
                 feed_removes.append(SyncItem(
                     action=SyncAction.REMOVE_FROM_IPOD,
-                    db_id=ep.ipod_db_id,
+                    db_track_id=ep.ipod_db_track_id,
                     ipod_track=track,
                     description=(
                         f"\U0001f399 {feed.title} \u2014 {ep.title} "
@@ -573,7 +573,7 @@ def build_podcast_managed_plan(
             for ep, track in staying_sorted[:overflow]:
                 feed_removes.append(SyncItem(
                     action=SyncAction.REMOVE_FROM_IPOD,
-                    db_id=ep.ipod_db_id,
+                    db_track_id=ep.ipod_db_track_id,
                     ipod_track=track,
                     description=(
                         f"\U0001f399 {feed.title} \u2014 {ep.title} "
@@ -615,7 +615,7 @@ def match_ipod_tracks(
     """Match existing iPod tracks to feed episodes.
 
     Scans the iPod's parsed track list for podcast tracks matching this
-    feed (by enclosure URL or title+album).  Updates episode.ipod_db_id
+    feed (by enclosure URL or title+album).  Updates episode.ipod_db_track_id
     and episode.status for matched episodes.
 
     Args:

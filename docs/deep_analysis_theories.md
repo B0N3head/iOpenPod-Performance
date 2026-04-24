@@ -69,7 +69,7 @@ Cross-database matching proves this is NOT device-specific — it's the source i
 | `0x98896694925F58B8` | Nano2 |
 | `0x7EA5E9BAE9084443` | Nano6 |
 
-Multiple iPods synced from the same iTunes library share identical `db_id_2`. In Nano6, every track's `mhbd_id_ref` field matches `db_id_2` exactly, confirming this is a library back-reference.
+Multiple iPods synced from the same iTunes library share identical `db_id_2`. In Nano6, every track's `db_id_2_ref` field matches `db_id_2` exactly, confirming this is a library back-reference.
 
 ### A5. Byte 0x93 — "Purchased / AAC" Flag (Confirmed Split from `explicit` u16)
 

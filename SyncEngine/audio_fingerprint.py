@@ -17,6 +17,7 @@ import subprocess
 import sys
 import logging
 import threading
+import re
 from pathlib import Path
 from typing import Optional, Any
 import shutil
@@ -395,21 +396,44 @@ def get_or_compute_fingerprint(
     Returns:
         Fingerprint string, or None if unavailable
     """
+
+    def _is_raw_fingerprint(value: str) -> bool:
+        """Return True when fingerprint is fpcalc -raw integer CSV format.
+
+        Historical iOpenPod builds may have cached/stored fingerprints in the
+        compressed/default fpcalc format.  Those won't compare equal to current
+        raw CSV fingerprints, so we treat them as legacy and recompute.
+        """
+        v = (value or "").strip()
+        if not v:
+            return False
+        return bool(re.fullmatch(r"-?\d+(,-?\d+)*", v))
+
     filepath = Path(filepath)
     cache = FingerprintCache.get_instance()
 
     # 1. Check filesystem cache (no file I/O needed)
     cached = cache.lookup(filepath)
     if cached:
-        logger.debug(f"Cache hit for {filepath.name}")
-        return cached
+        if _is_raw_fingerprint(cached):
+            logger.debug(f"Cache hit for {filepath.name}")
+            return cached
+        logger.debug(
+            "Legacy cached fingerprint format for %s; recomputing raw fingerprint",
+            filepath.name,
+        )
 
     # 2. Try to read existing fingerprint from file tags
     fingerprint = read_fingerprint(filepath)
     if fingerprint:
-        logger.debug(f"Read existing fingerprint for {filepath.name}")
-        cache.store(filepath, fingerprint)
-        return fingerprint
+        if _is_raw_fingerprint(fingerprint):
+            logger.debug(f"Read existing fingerprint for {filepath.name}")
+            cache.store(filepath, fingerprint)
+            return fingerprint
+        logger.debug(
+            "Legacy tagged fingerprint format for %s; recomputing raw fingerprint",
+            filepath.name,
+        )
 
     # 3. Compute new fingerprint
     logger.debug(f"Computing fingerprint for {filepath.name}")

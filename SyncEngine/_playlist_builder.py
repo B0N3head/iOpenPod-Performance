@@ -121,20 +121,20 @@ def _sort_key_for_trackinfo(ti: TrackInfo, keys: list[tuple[str, bool, str | Non
 def sort_trackinfos_by_order(
     track_ids: list[int],
     sort_order: int,
-    db_id_to_info: dict[int, TrackInfo],
+    db_track_id_to_info: dict[int, TrackInfo],
 ) -> list[int]:
     """Return *track_ids* sorted according to *sort_order*.
 
-    Looks up each db_id in *db_id_to_info* to read sort fields.
-    Unknown db_ids are appended at the end.
+    Looks up each db_track_id in *db_track_id_to_info* to read sort fields.
+    Unknown db_track_ids are appended at the end.
     """
     keys = _SORT_ORDER_KEYS.get(sort_order)
     if not keys:
         return track_ids  # Manual / Default / unknown → preserve order
 
     # Partition into known and unknown
-    known = [(tid, db_id_to_info[tid]) for tid in track_ids if tid in db_id_to_info]
-    unknown = [tid for tid in track_ids if tid not in db_id_to_info]
+    known = [(tid, db_track_id_to_info[tid]) for tid in track_ids if tid in db_track_id_to_info]
+    unknown = [tid for tid in track_ids if tid not in db_track_id_to_info]
 
     known.sort(key=lambda pair: _sort_key_for_trackinfo(pair[1], keys))
     return [tid for tid, _ in known] + unknown
@@ -174,37 +174,37 @@ def build_and_evaluate_playlists(
     from .spl_evaluator import spl_update
     from ._track_conversion import trackinfo_to_eval_dict
 
-    old_tid_to_db_id: dict[int, int] = {}
+    old_tid_to_db_track_id: dict[int, int] = {}
     for t in existing_tracks_data:
         tid = t.get("track_id", 0)
-        db_id = t.get("db_id", 0)
-        if tid and db_id:
-            old_tid_to_db_id[tid] = db_id
+        db_track_id = t.get("db_track_id", t.get("db_id", 0))
+        if tid and db_track_id:
+            old_tid_to_db_track_id[tid] = db_track_id
 
-    valid_db_ids: set[int] = {t.db_id for t in all_track_infos if t.db_id}
+    valid_db_track_ids: set[int] = {t.db_track_id for t in all_track_infos if t.db_track_id}
     eval_tracks = [trackinfo_to_eval_dict(t) for t in all_track_infos]
 
     master_name, master_id, playlists = _build_regular_playlists(
-        existing_playlists_raw, old_tid_to_db_id,
-        valid_db_ids, eval_tracks, spl_update,
+        existing_playlists_raw, old_tid_to_db_track_id,
+        valid_db_track_ids, eval_tracks, spl_update,
     )
     _sanitize_playlists(playlists, master_id)
     _rebuild_podcast_playlist(playlists, all_track_infos)
 
     smart_playlists = _build_smart_playlists(
-        existing_smart_raw, valid_db_ids, eval_tracks, spl_update,
+        existing_smart_raw, valid_db_track_ids, eval_tracks, spl_update,
     )
 
     _reevaluate_live_update(
-        playlists, smart_playlists, valid_db_ids, eval_tracks, spl_update,
+        playlists, smart_playlists, valid_db_track_ids, eval_tracks, spl_update,
     )
 
     # ── Apply sort order to all playlists ─────────────────────
-    db_id_to_info = {t.db_id: t for t in all_track_infos if t.db_id}
+    db_track_id_to_info = {t.db_track_id: t for t in all_track_infos if t.db_track_id}
     for pl in playlists + smart_playlists:
         if pl.sortorder not in (0, 1) and pl.track_ids:
             pl.track_ids = sort_trackinfos_by_order(
-                pl.track_ids, pl.sortorder, db_id_to_info,
+                pl.track_ids, pl.sortorder, db_track_id_to_info,
             )
             # Item metadata is positional — clear it when we re-sort so
             # the writer generates fresh positional MHODs.
@@ -215,8 +215,8 @@ def build_and_evaluate_playlists(
 
 def _build_regular_playlists(
     existing_playlists_raw: list[dict],
-    old_tid_to_db_id: dict[int, int],
-    valid_db_ids: set[int],
+    old_tid_to_db_track_id: dict[int, int],
+    valid_db_track_ids: set[int],
     eval_tracks: list[dict],
     spl_update,
 ) -> tuple[str, int | None, list[PlaylistInfo]]:
@@ -236,9 +236,9 @@ def _build_regular_playlists(
         item_meta = []
         for item in items:
             tid = item.get("track_id", 0)
-            db_id = old_tid_to_db_id.get(tid, 0)
-            if db_id in valid_db_ids:
-                track_ids.append(db_id)
+            db_track_id = old_tid_to_db_track_id.get(tid, 0)
+            if db_track_id in valid_db_track_ids:
+                track_ids.append(db_track_id)
                 item_meta.append(PlaylistItemMeta(
                     podcast_group_flag=item.get("podcast_group_flag", 0),
                     group_id=item.get("group_id", 0),
@@ -263,10 +263,10 @@ def _build_regular_playlists(
         if prefs_data and rules_data:
             info.smart_prefs = prefs_from_parsed(prefs_data)
             info.smart_rules = rules_from_parsed(rules_data)
-            matched_db_ids = spl_update(
+            matched_db_track_ids = spl_update(
                 info.smart_prefs, info.smart_rules, eval_tracks,
             )
-            info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
+            info.track_ids = [d for d in matched_db_track_ids if d in valid_db_track_ids]
             info.item_metadata = None
             logger.debug("SPL (ds2) '%s': %d tracks matched",
                          info.name, len(info.track_ids))
@@ -300,25 +300,25 @@ def _sanitize_playlists(playlists: list[PlaylistInfo],
 def _rebuild_podcast_playlist(playlists: list[PlaylistInfo],
                               all_track_infos: list[TrackInfo]) -> None:
     """Ensure the Podcasts playlist reflects all current podcast tracks."""
-    podcast_db_ids = [t.db_id for t in all_track_infos if t.media_type & 0x04]
+    podcast_db_track_ids = [t.db_track_id for t in all_track_infos if t.media_type & 0x04]
     existing_podcast_pl = next((p for p in playlists if p.podcast_flag), None)
 
-    if podcast_db_ids:
+    if podcast_db_track_ids:
         if existing_podcast_pl is not None:
-            existing_podcast_pl.track_ids = podcast_db_ids
+            existing_podcast_pl.track_ids = podcast_db_track_ids
             existing_podcast_pl.item_metadata = None
             logger.info("Rebuilt 'Podcasts' playlist with %d tracks",
-                        len(podcast_db_ids))
+                        len(podcast_db_track_ids))
         else:
             from iTunesDB_Writer.mhyp_writer import generate_playlist_id
             playlists.append(PlaylistInfo(
                 name="Podcasts",
-                track_ids=podcast_db_ids,
+                track_ids=podcast_db_track_ids,
                 playlist_id=generate_playlist_id(),
                 podcast_flag=1,
             ))
             logger.info("Auto-created 'Podcasts' playlist with %d tracks",
-                        len(podcast_db_ids))
+                        len(podcast_db_track_ids))
     elif existing_podcast_pl is not None:
         playlists.remove(existing_podcast_pl)
         logger.info("Removed empty 'Podcasts' playlist (no podcast tracks)")
@@ -326,7 +326,7 @@ def _rebuild_podcast_playlist(playlists: list[PlaylistInfo],
 
 def _build_smart_playlists(
     existing_smart_raw: list[dict],
-    valid_db_ids: set[int],
+    valid_db_track_ids: set[int],
     eval_tracks: list[dict],
     spl_update,
 ) -> list[PlaylistInfo]:
@@ -349,24 +349,24 @@ def _build_smart_playlists(
         if prefs_data and rules_data:
             info.smart_prefs = prefs_from_parsed(prefs_data)
             info.smart_rules = rules_from_parsed(rules_data)
-            matched_db_ids = spl_update(
+            matched_db_track_ids = spl_update(
                 info.smart_prefs, info.smart_rules, eval_tracks,
             )
 
             if info.mhsd5_type:
-                info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
+                info.track_ids = [d for d in matched_db_track_ids if d in valid_db_track_ids]
                 info.item_metadata = None
                 logger.debug("SPL (ds5) '%s': %d tracks matched and assigned",
                              info.name, len(info.track_ids))
             elif info.smart_prefs.live_update:
-                info.track_ids = [d for d in matched_db_ids if d in valid_db_ids]
+                info.track_ids = [d for d in matched_db_track_ids if d in valid_db_track_ids]
                 info.item_metadata = None
                 logger.debug("SPL (ds5) '%s': %d tracks matched (live_update)",
                              info.name, len(info.track_ids))
             else:
                 logger.debug("SPL (ds5) '%s': %d tracks would match "
                              "(live_update=False, keeping existing)",
-                             info.name, len(matched_db_ids))
+                             info.name, len(matched_db_track_ids))
 
         smart_playlists.append(info)
 
@@ -378,17 +378,17 @@ def _build_smart_playlists(
 def _reevaluate_live_update(
     playlists: list[PlaylistInfo],
     smart_playlists: list[PlaylistInfo],
-    valid_db_ids: set[int],
+    valid_db_track_ids: set[int],
     eval_tracks: list[dict],
     spl_update,
 ) -> None:
     """Re-evaluate all live-update SPLs against the final track list."""
     for info in list(playlists) + [s for s in smart_playlists if not s.mhsd5_type]:
         if info.smart_prefs and info.smart_rules and info.smart_prefs.live_update:
-            matched_db_ids = spl_update(
+            matched_db_track_ids = spl_update(
                 info.smart_prefs, info.smart_rules, eval_tracks,
             )
-            new_ids = [d for d in matched_db_ids if d in valid_db_ids]
+            new_ids = [d for d in matched_db_track_ids if d in valid_db_track_ids]
             if new_ids != info.track_ids:
                 logger.info("SPL live-update '%s': %d → %d tracks after "
                             "final re-evaluation",

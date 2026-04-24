@@ -89,7 +89,7 @@ def track_dict_to_info(t: dict) -> TrackInfo:
         last_played=t.get("last_played", 0),
         last_skipped=t.get("last_skipped", 0),
         last_modified=t.get("last_modified", 0),
-        db_id=t.get("db_id", 0),
+        db_track_id=t.get("db_track_id", t.get("db_id", 0)),
         media_type=t.get("media_type", 1),
         movie_file_flag=t.get("movie_flag", 0),
         season_number=t.get("season_number", 0),
@@ -335,12 +335,12 @@ def trackinfo_to_eval_dict(t: TrackInfo) -> dict:
     """Convert a TrackInfo to a dict the SPL evaluator can consume.
 
     The evaluator expects parsed-track-style dicts with keys matching
-    the accessor maps in spl_evaluator.py.  We use db_id as the
-    track_id so that spl_update() returns db_ids directly.
+    the accessor maps in spl_evaluator.py.  We use db_track_id as the
+    track_id so that spl_update() returns db_track_ids directly.
     """
     return {
-        # Use db_id as track_id so evaluator returns db_ids
-        "track_id": t.db_id,
+        # Use db_track_id as track_id so evaluator returns db_track_ids.
+        "track_id": t.db_track_id,
         # String fields
         "Title": t.title or "",
         "Album": t.album or "",

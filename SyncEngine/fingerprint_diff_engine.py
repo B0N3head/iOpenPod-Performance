@@ -12,7 +12,7 @@ True duplicates (same fingerprint AND same album) are deduplicated silently.
 
 Handles fingerprint collisions (same song on multiple albums) via disambiguation:
   1. source_path_hint matches → unique
-  2. Claimed-db_id filtering → prevents double-matching
+  2. Claimed-db_track_id filtering → prevents double-matching
   3. Unresolved → surfaced to user
 
 Change detection uses size+mtime as a fast gate:
@@ -32,6 +32,7 @@ from typing import Optional, Callable
 from enum import Enum, auto
 from pathlib import Path
 import logging
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -101,7 +102,7 @@ class SyncItem:
     estimated_size: Optional[int] = None
 
     # For REMOVE/matched actions — iPod-side info
-    db_id: Optional[int] = None
+    db_track_id: Optional[int] = None
     ipod_track: Optional[dict] = None
 
     # For UPDATE_METADATA: which fields changed  {field: (pc_val, ipod_val)}
@@ -123,6 +124,15 @@ class SyncItem:
 
     # Human-readable description
     description: str = ""
+
+    @property
+    def db_id(self) -> Optional[int]:
+        """Backward-compatible alias for the iPod track persistent ID."""
+        return self.db_track_id
+
+    @db_id.setter
+    def db_id(self, value: Optional[int]) -> None:
+        self.db_track_id = value
 
 
 @dataclass
@@ -165,7 +175,7 @@ class SyncPlan:
     to_sync_playcount: list[SyncItem] = field(default_factory=list)
     to_sync_rating: list[SyncItem] = field(default_factory=list)
 
-    # PC file paths for ALL matched tracks (db_id → absolute PC path)
+    # PC file paths for ALL matched tracks (db_track_id → absolute PC path)
     # Used by artwork writer to extract embedded art for *every* track
     matched_pc_paths: dict[int, str] = field(default_factory=dict)
 
@@ -180,7 +190,7 @@ class SyncPlan:
     # Same song on different albums is NOT a duplicate (greatest hits case).
     duplicates: dict[str, list[PCTrack]] = field(default_factory=dict)
 
-    # Stale mapping entries: (fingerprint, db_id) pairs where db_id is not in iTunesDB.
+    # Stale mapping entries: (fingerprint, db_track_id) pairs where db_track_id is not in iTunesDB.
     # Cleaned from mapping during execution, not shown to user.
     _stale_mapping_entries: list[tuple[str, int]] = field(default_factory=list)
 
@@ -426,7 +436,7 @@ class FingerprintDiffEngine:
             write_fingerprints: Store computed fingerprints in PC file metadata
             is_cancelled: Optional callable returning True when the caller
                           wants to abort early.  Checked between stages.
-            track_edits: Pending GUI track edits: db_id → {field: (original, new)}.
+            track_edits: Pending GUI track edits: db_track_id → {field: (original, new)}.
                          When provided, in-memory track dicts are reverted to
                          originals before comparison, then edits are overlaid.
             sync_workers: Number of parallel fingerprint workers (0 = auto).
@@ -444,6 +454,7 @@ class FingerprintDiffEngine:
         plan = SyncPlan()
 
         # Load mapping
+        mapping_file_exists = self.mapping_manager.exists()
         if progress_callback:
             progress_callback("load_mapping", 0, 0, "Loading iPod mapping...")
         mapping = self.mapping_manager.load()
@@ -451,7 +462,7 @@ class FingerprintDiffEngine:
         # ===== Pre-flight: Integrity check =====
         # Validate consistency between filesystem, iTunesDB, and mapping.
         # This mutates ipod_tracks (removes entries with missing files)
-        # and mapping (removes stale db_ids), and deletes orphan files.
+        # and mapping (removes stale db_track_ids), and deletes orphan files.
         from .integrity import check_integrity
         if progress_callback:
             progress_callback("integrity", 0, 0, "Checking iPod integrity…")
@@ -467,9 +478,17 @@ class FingerprintDiffEngine:
             return plan
         if not integrity_report.is_clean:
             logger.info(integrity_report.summary)
-            # Save cleaned mapping immediately so stale entries don't persist
             if integrity_report.stale_mappings:
-                self.mapping_manager.save(mapping)
+                if self.mapping_manager.save(mapping):
+                    logger.info(
+                        "Integrity preflight removed %d stale mapping entries and saved iOpenPod.json",
+                        len(integrity_report.stale_mappings),
+                    )
+                else:
+                    logger.warning(
+                        "Integrity preflight removed %d stale mapping entries but failed to save iOpenPod.json",
+                        len(integrity_report.stale_mappings),
+                    )
 
         plan.integrity_report = integrity_report
 
@@ -479,11 +498,11 @@ class FingerprintDiffEngine:
         # re-reads the full iTunesDB from disk — so without a REMOVE action
         # they'd be written straight back.
         for ghost_track in integrity_report.missing_files:
-            ghost_db_id = ghost_track.get("db_id")
+            ghost_db_track_id = ghost_track.get("db_track_id", ghost_track.get("db_id"))
             plan._integrity_removals.append(SyncItem(
                 action=SyncAction.REMOVE_FROM_IPOD,
                 fingerprint=None,
-                db_id=ghost_db_id,
+                db_track_id=ghost_db_track_id,
                 ipod_track=ghost_track,
                 description=(
                     f"File missing on iPod: "
@@ -492,23 +511,23 @@ class FingerprintDiffEngine:
                 ),
             ))
 
-        # Rebuild db_id lookup in case integrity check removed some tracks
-        ipod_by_db_id = {}
+        # Rebuild db_track_id lookup in case integrity check removed some tracks
+        ipod_by_db_track_id = {}
         for track in ipod_tracks:
-            db_id = track.get("db_id")
-            if db_id:
-                ipod_by_db_id[db_id] = track
-        plan.total_ipod_tracks = len(ipod_by_db_id)
+            db_track_id = track.get("db_track_id", track.get("db_id"))
+            if db_track_id:
+                ipod_by_db_track_id[db_track_id] = track
+        plan.total_ipod_tracks = len(ipod_by_db_track_id)
 
         # ── Revert GUI edits so ipod_tracks reflect the true iPod state ──
         # update_track_flags() modifies the in-memory dicts for instant UI
         # feedback, but we need the originals for accurate PC-vs-iPod comparison.
-        # Edits are stored as {db_id: {key: (original, new)}} — revert to originals.
+        # Edits are stored as {db_track_id: {key: (original, new)}} — revert to originals.
         gui_edits = track_edits or {}
 
         if gui_edits:
-            for db_id, field_edits in gui_edits.items():
-                ipod_track = ipod_by_db_id.get(db_id)
+            for db_track_id, field_edits in gui_edits.items():
+                ipod_track = ipod_by_db_track_id.get(db_track_id)
                 if ipod_track is None:
                     continue
                 for edit_key, (orig_val, _new_val) in field_edits.items():
@@ -589,6 +608,75 @@ class FingerprintDiffEngine:
         from SyncEngine.audio_fingerprint import FingerprintCache
         FingerprintCache.get_instance().save()
 
+        # Bootstrap unmapped iPod tracks:
+        # Fingerprint any iPod tracks that are not yet represented in mapping
+        # and seed entries for those that match the PC library.
+        bootstrap_protected_db_track_ids: set[int] = set()
+        mapped_db_track_ids = mapping.all_db_track_ids()
+        unmapped_db_count = sum(
+            1
+            for db_track_id, ipod_track in ipod_by_db_track_id.items()
+            if db_track_id not in mapped_db_track_ids and not (ipod_track.get("media_type", 0) & 0x04)
+        )
+
+        logger.info(
+            "Bootstrap precheck: mapping_exists=%s, mapped_db_track_ids=%d, unmapped_ipod_tracks=%d",
+            mapping_file_exists,
+            len(mapped_db_track_ids),
+            unmapped_db_count,
+        )
+
+        if unmapped_db_count > 0:
+            if progress_callback:
+                progress_callback(
+                    "bootstrap_mapping",
+                    0,
+                    unmapped_db_count,
+                    f"Bootstrapping {unmapped_db_count} unmapped iPod tracks...",
+                )
+
+            (
+                boot_added,
+                boot_scanned,
+                bootstrap_protected_db_track_ids,
+            ) = self._bootstrap_mapping_from_existing_ipod_tracks(
+                mapping,
+                ipod_by_db_track_id,
+                pc_by_fp,
+                progress_callback=progress_callback,
+                is_cancelled=is_cancelled,
+            )
+
+            if boot_added > 0:
+                if self.mapping_manager.save(mapping):
+                    logger.info(
+                        "Bootstrap seeded %d mapping entries from %d unmapped iPod tracks and saved iOpenPod.json",
+                        boot_added,
+                        boot_scanned,
+                    )
+                else:
+                    logger.warning(
+                        "Bootstrap seeded %d mapping entries from %d unmapped iPod tracks but failed to save iOpenPod.json",
+                        boot_added,
+                        boot_scanned,
+                    )
+            else:
+                logger.info(
+                    "Bootstrap scanned %d unmapped iPod tracks and found 0 PC matches",
+                    boot_scanned,
+                )
+        elif not mapping_file_exists:
+            logger.info(
+                "No mapping reconciliation was needed during preflight; iOpenPod.json remains absent",
+            )
+        elif False:  # Preview must not write mapping files.
+            # No unmapped tracks means nothing to bootstrap, but still create
+            # the initial mapping file so logs and on-disk state agree.
+            if self.mapping_manager.save(mapping):
+                logger.info("No unmapped iPod tracks; wrote initial empty mapping file")
+            else:
+                logger.warning("No unmapped iPod tracks; failed to write initial empty mapping file")
+
         # ===== Phase 2: Group by identity (fingerprint + album) =====
         # Same fingerprint + same album = true duplicate (pick one, report rest)
         # Same fingerprint + different album = independent tracks (greatest hits)
@@ -617,7 +705,7 @@ class FingerprintDiffEngine:
 
         # For fingerprints with multiple album groups, we need to track which
         # mapping entries have already been claimed so each PC track gets its own.
-        claimed_db_ids: set[int] = set()
+        claimed_db_track_ids: set[int] = set()
 
         # Sort identity groups so that groups whose album matches an existing
         # iPod mapping entry process first.  Without this, iteration order is
@@ -627,7 +715,7 @@ class FingerprintDiffEngine:
         def _album_match_priority(item):
             (fp, album_key), _tracks = item
             for entry in mapping.get_entries(fp):
-                ipod_track = ipod_by_db_id.get(entry.db_id)
+                ipod_track = ipod_by_db_track_id.get(entry.db_track_id)
                 if ipod_track:
                     ipod_album = (ipod_track.get("Album", "") or "").strip().lower()
                     if ipod_album == album_key:
@@ -655,7 +743,7 @@ class FingerprintDiffEngine:
                 continue
 
             # Filter out mapping entries already claimed by another album group
-            available_entries = [e for e in mapping_entries if e.db_id not in claimed_db_ids]
+            available_entries = [e for e in mapping_entries if e.db_track_id not in claimed_db_track_ids]
 
             if not available_entries:
                 # All mapping entries for this fingerprint are claimed by other
@@ -672,21 +760,21 @@ class FingerprintDiffEngine:
                 continue
 
             # MATCHED: Resolve which mapping entry this PC track matches
-            matched_entry = self._resolve_collision(pc_track, available_entries, ipod_by_db_id)
+            matched_entry = self._resolve_collision(pc_track, available_entries, ipod_by_db_track_id)
 
             if matched_entry is None:
                 # Collision couldn't be resolved
                 plan.unresolved_collisions.append((fp, pc_tracks_for_group))
                 continue
 
-            claimed_db_ids.add(matched_entry.db_id)
+            claimed_db_track_ids.add(matched_entry.db_track_id)
 
-            db_id = matched_entry.db_id
-            ipod_track = ipod_by_db_id.get(db_id)
+            db_track_id = matched_entry.db_track_id
+            ipod_track = ipod_by_db_track_id.get(db_track_id)
 
             if ipod_track is None:
                 # Mapping exists but track missing from iTunesDB (stale mapping)
-                logger.warning(f"Mapping for {fp} points to missing db_id {db_id}")
+                logger.warning(f"Mapping for {fp} points to missing db_track_id {db_track_id}")
                 estimated_size = estimate_transcode_size(pc_track)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
@@ -701,7 +789,7 @@ class FingerprintDiffEngine:
             plan.matched_tracks += 1
 
             # Record PC path for artwork extraction (all matched tracks)
-            plan.matched_pc_paths[db_id] = str(pc_track.path)
+            plan.matched_pc_paths[db_track_id] = str(pc_track.path)
 
             # ── Change detection ──
 
@@ -712,7 +800,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.UPDATE_FILE,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     estimated_size=estimated_size,
                     description=f"File changed: {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename}",
@@ -726,7 +814,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.UPDATE_METADATA,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     metadata_changes=metadata_changes,
                     description=f"Metadata: {pc_track.artist or 'Unknown'} - {pc_track.title or pc_track.filename} ({', '.join(metadata_changes.keys())})",
@@ -740,7 +828,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.UPDATE_ARTWORK,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     old_art_hash=mapping_art_hash,
                     new_art_hash=pc_art_hash,
@@ -754,7 +842,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.UPDATE_ARTWORK,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     old_art_hash=None,
                     new_art_hash=pc_art_hash,
@@ -782,7 +870,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.SYNC_PLAYCOUNT,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     play_count_delta=ipod_play_delta,
                     skip_count_delta=ipod_skip_delta,
@@ -813,7 +901,7 @@ class FingerprintDiffEngine:
                     action=SyncAction.SYNC_RATING,
                     fingerprint=fp,
                     pc_track=pc_track,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     ipod_rating=ipod_rating,
                     pc_rating=pc_rating,
@@ -832,11 +920,13 @@ class FingerprintDiffEngine:
 
         for fp in orphaned_fps:
             for entry in mapping.get_entries(fp):
-                db_id = entry.db_id
-                ipod_track = ipod_by_db_id.get(db_id)
+                db_track_id = entry.db_track_id
+                if db_track_id in bootstrap_protected_db_track_ids:
+                    continue
+                ipod_track = ipod_by_db_track_id.get(db_track_id)
 
                 if not ipod_track:
-                    plan._stale_mapping_entries.append((fp, db_id))
+                    plan._stale_mapping_entries.append((fp, db_track_id))
                     continue
 
                 # Skip podcast tracks — managed by PodcastManager, not
@@ -848,7 +938,7 @@ class FingerprintDiffEngine:
                 plan.to_remove.append(SyncItem(
                     action=SyncAction.REMOVE_FROM_IPOD,
                     fingerprint=fp,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     description=(
                         f"Removed from PC: "
@@ -863,13 +953,15 @@ class FingerprintDiffEngine:
         # Greatest Hits but kept on original album).
         for fp in seen_fps & mapping_fps:
             for entry in mapping.get_entries(fp):
-                if entry.db_id in claimed_db_ids:
+                if entry.db_track_id in claimed_db_track_ids:
                     continue
-                db_id = entry.db_id
-                ipod_track = ipod_by_db_id.get(db_id)
+                db_track_id = entry.db_track_id
+                if db_track_id in bootstrap_protected_db_track_ids:
+                    continue
+                ipod_track = ipod_by_db_track_id.get(db_track_id)
 
                 if not ipod_track:
-                    plan._stale_mapping_entries.append((fp, db_id))
+                    plan._stale_mapping_entries.append((fp, db_track_id))
                     continue
 
                 # Skip podcast tracks (same reason as 4a).
@@ -879,7 +971,7 @@ class FingerprintDiffEngine:
                 plan.to_remove.append(SyncItem(
                     action=SyncAction.REMOVE_FROM_IPOD,
                     fingerprint=fp,
-                    db_id=db_id,
+                    db_track_id=db_track_id,
                     ipod_track=ipod_track,
                     description=(
                         f"Album variant removed: "
@@ -893,16 +985,17 @@ class FingerprintDiffEngine:
         # 4c: Unmapped iPod tracks — tracks in iTunesDB that have NO mapping
         # entry at all (e.g., put there by iTunes, not by iOpenPod).
         # These are invisible to 4a/4b which only iterate mapping entries.
-        # Collect all db_ids already accounted for by matches or removals.
-        accounted_db_ids = claimed_db_ids.copy()
+        # Collect all db_track_ids already accounted for by matches or removals.
+        accounted_db_track_ids = claimed_db_track_ids.copy()
+        accounted_db_track_ids.update(bootstrap_protected_db_track_ids)
         for item in plan.to_remove:
-            if item.db_id:
-                accounted_db_ids.add(item.db_id)
-        for fp, db_id in plan._stale_mapping_entries:
-            accounted_db_ids.add(db_id)
+            if item.db_track_id:
+                accounted_db_track_ids.add(item.db_track_id)
+        for fp, db_track_id in plan._stale_mapping_entries:
+            accounted_db_track_ids.add(db_track_id)
 
-        for db_id, ipod_track in ipod_by_db_id.items():
-            if db_id in accounted_db_ids:
+        for db_track_id, ipod_track in ipod_by_db_track_id.items():
+            if db_track_id in accounted_db_track_ids:
                 continue
             # Skip podcast tracks — they are managed by the podcast
             # subsystem (PodcastManager), not the PC-folder sync.
@@ -913,7 +1006,7 @@ class FingerprintDiffEngine:
             plan.to_remove.append(SyncItem(
                 action=SyncAction.REMOVE_FROM_IPOD,
                 fingerprint=None,
-                db_id=db_id,
+                db_track_id=db_track_id,
                 ipod_track=ipod_track,
                 description=(
                     f"Not in PC library: "
@@ -947,20 +1040,20 @@ class FingerprintDiffEngine:
             # Reverse lookup: iPod dict key → PC field name (for METADATA_FIELDS)
             _ipod_key_to_pc = {v: k for k, v in METADATA_FIELDS.items()}
 
-            # Index existing UPDATE_METADATA items by db_id for merge
-            meta_by_db_id: dict[int, SyncItem] = {}
+            # Index existing UPDATE_METADATA items by db_track_id for merge
+            meta_by_db_track_id: dict[int, SyncItem] = {}
             for item in plan.to_update_metadata:
-                if item.db_id:
-                    meta_by_db_id[item.db_id] = item
+                if item.db_track_id:
+                    meta_by_db_track_id[item.db_track_id] = item
 
-            # Index existing SYNC_RATING items by db_id to replace them
-            rating_by_db_id: dict[int, int] = {}
+            # Index existing SYNC_RATING items by db_track_id to replace them
+            rating_by_db_track_id: dict[int, int] = {}
             for idx, item in enumerate(plan.to_sync_rating):
-                if item.db_id:
-                    rating_by_db_id[item.db_id] = idx
+                if item.db_track_id:
+                    rating_by_db_track_id[item.db_track_id] = idx
 
-            for db_id, field_edits in gui_edits.items():
-                ipod_track = ipod_by_db_id.get(db_id)
+            for db_track_id, field_edits in gui_edits.items():
+                ipod_track = ipod_by_db_track_id.get(db_track_id)
                 if ipod_track is None:
                     continue  # track no longer on iPod
 
@@ -976,9 +1069,9 @@ class FingerprintDiffEngine:
 
                     # ── Rating ──
                     if edit_key == "rating":
-                        if db_id in rating_by_db_id:
+                        if db_track_id in rating_by_db_track_id:
                             # Replace existing rating item — GUI always wins
-                            idx = rating_by_db_id[db_id]
+                            idx = rating_by_db_track_id[db_track_id]
                             plan.to_sync_rating[idx].new_rating = new_val
                             plan.to_sync_rating[idx].pc_rating = new_val
                             plan.to_sync_rating[idx].description = (
@@ -987,7 +1080,7 @@ class FingerprintDiffEngine:
                         else:
                             plan.to_sync_rating.append(SyncItem(
                                 action=SyncAction.SYNC_RATING,
-                                db_id=db_id,
+                                db_track_id=db_track_id,
                                 ipod_track=ipod_track,
                                 ipod_rating=orig_val if orig_val else 0,
                                 pc_rating=new_val,
@@ -1001,28 +1094,28 @@ class FingerprintDiffEngine:
                     # raw track-dict key (for iPod-only fields).
                     pc_field = _ipod_key_to_pc.get(edit_key, edit_key)
 
-                    if db_id in meta_by_db_id:
+                    if db_track_id in meta_by_db_track_id:
                         # Merge into existing UPDATE_METADATA item
-                        meta_by_db_id[db_id].metadata_changes[pc_field] = (
+                        meta_by_db_track_id[db_track_id].metadata_changes[pc_field] = (
                             new_val, orig_val
                         )
                         # Update description
                         fields_str = ", ".join(
-                            meta_by_db_id[db_id].metadata_changes.keys()
+                            meta_by_db_track_id[db_track_id].metadata_changes.keys()
                         )
-                        meta_by_db_id[db_id].description = (
+                        meta_by_db_track_id[db_track_id].description = (
                             f"Metadata: {track_name} ({fields_str})"
                         )
                     else:
                         new_item = SyncItem(
                             action=SyncAction.UPDATE_METADATA,
-                            db_id=db_id,
+                            db_track_id=db_track_id,
                             ipod_track=ipod_track,
                             metadata_changes={pc_field: (new_val, orig_val)},
                             description=f"Metadata (edited in iOpenPod): {track_name} ({pc_field})",
                         )
                         plan.to_update_metadata.append(new_item)
-                        meta_by_db_id[db_id] = new_item
+                        meta_by_db_track_id[db_track_id] = new_item
 
             logger.info("GUI edit overlay: processed %d edited tracks", len(gui_edits))
 
@@ -1030,8 +1123,8 @@ class FingerprintDiffEngine:
         # Phase 3 ran against the true iPod values; now put the GUI values
         # back so the UI still shows what the user set.
         if gui_edits:
-            for db_id, field_edits in gui_edits.items():
-                ipod_track = ipod_by_db_id.get(db_id)
+            for db_track_id, field_edits in gui_edits.items():
+                ipod_track = ipod_by_db_track_id.get(db_track_id)
                 if ipod_track is None:
                     continue
                 for edit_key, (_orig_val, new_val) in field_edits.items():
@@ -1077,7 +1170,7 @@ class FingerprintDiffEngine:
         self,
         pc_track: PCTrack,
         entries: list[TrackMapping],
-        ipod_by_db_id: Optional[dict] = None,
+        ipod_by_db_track_id: Optional[dict] = None,
     ) -> Optional[TrackMapping]:
         """
         Resolve a fingerprint collision (multiple mapping entries).
@@ -1098,43 +1191,317 @@ class FingerprintDiffEngine:
             if entry.source_path_hint and entry.source_path_hint == pc_track.relative_path:
                 return entry
 
-        # Try album-based disambiguation using iPod track data
-        if ipod_by_db_id:
-            pc_album = (pc_track.album or "").strip().lower()
-            pc_track_num = pc_track.track_number or 0
-
-            # Step 3: Match by album name
-            album_matches = []
+        # Score-based resolution against iPod-side metadata.
+        if ipod_by_db_track_id:
+            scored: list[tuple[int, int, TrackMapping]] = []
             for entry in entries:
-                ipod_track = ipod_by_db_id.get(entry.db_id)
-                if ipod_track:
-                    ipod_album = (ipod_track.get("Album", "") or "").strip().lower()
-                    if ipod_album == pc_album:
-                        album_matches.append(entry)
+                ipod_track = ipod_by_db_track_id.get(entry.db_track_id)
+                if not ipod_track:
+                    continue
+                score = self._score_pc_to_ipod_track(pc_track, ipod_track)
+                scored.append((score, entry.db_track_id, entry))
 
-            if len(album_matches) == 1:
-                return album_matches[0]
-
-            # Step 4: Narrow further by track number if album matched multiple
-            if len(album_matches) > 1 and pc_track_num > 0:
-                tn_matches = []
-                for entry in album_matches:
-                    ipod_track = ipod_by_db_id.get(entry.db_id)
-                    if ipod_track and ipod_track.get("track_number", 0) == pc_track_num:
-                        tn_matches.append(entry)
-                if len(tn_matches) == 1:
-                    return tn_matches[0]
+            if scored:
+                scored.sort(key=lambda x: (-x[0], x[1]))
+                if len(scored) > 1 and scored[0][0] == scored[1][0]:
+                    logger.info(
+                        "Collision tie for '%s' (%d entries, score=%d); selecting lowest db_track_id",
+                        pc_track.relative_path,
+                        len(scored),
+                        scored[0][0],
+                    )
+                return scored[0][2]
 
         # Single entry with no album data to verify — accept it on faith.
-        # (No ipod_by_db_id, or ipod track missing from DB.)
+        # (No ipod_by_db_track_id, or ipod track missing from DB.)
         if len(entries) == 1:
             return entries[0]
 
-        logger.warning(
-            f"Unresolved collision: {len(entries)} entries for same fingerprint, "
-            f"could not disambiguate for '{pc_track.relative_path}'"
+        # Last resort: deterministic selection instead of unresolved None.
+        entries_sorted = sorted(entries, key=lambda e: e.db_track_id)
+        logger.info(
+            "Deterministic fallback for '%s' (%d entries) using lowest db_track_id",
+            pc_track.relative_path,
+            len(entries_sorted),
         )
+        return entries_sorted[0] if entries_sorted else None
+
+    def _bootstrap_mapping_from_existing_ipod_tracks(
+        self,
+        mapping: MappingFile,
+        ipod_by_db_track_id: dict[int, dict],
+        pc_by_fp: dict[str, list[PCTrack]],
+        *,
+        progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, int, set[int]]:
+        """Seed mapping entries by fingerprinting unmapped iPod tracks.
+
+        Used for first sync and for repairing partial/legacy mappings. It
+        fingerprints iPod files without writing tags back to the device, then
+        links confident fingerprint matches to PC tracks.
+
+        Returns:
+            (entries_added, tracks_scanned, protected_db_track_ids)
+        """
+        existing_db_track_ids = mapping.all_db_track_ids()
+        bootstrap_candidates: list[tuple[int, dict]] = []
+        protected_db_track_ids: set[int] = set()
+        claimed_pc_paths_by_fp: dict[str, set[str]] = {}
+
+        for db_track_id, ipod_track in ipod_by_db_track_id.items():
+            if db_track_id in existing_db_track_ids:
+                continue
+            # Podcast tracks are managed by PodcastManager and are excluded
+            # from normal PC-folder matching/removal logic.
+            if ipod_track.get("media_type", 0) & 0x04:
+                continue
+            bootstrap_candidates.append((db_track_id, ipod_track))
+
+        total = len(bootstrap_candidates)
+        if total == 0:
+            return 0, 0, protected_db_track_ids
+
+        added = 0
+        skipped_no_path = 0
+        skipped_no_fp = 0
+        skipped_no_pc_match = 0
+        sample_no_match_fp: Optional[str] = None
+        for index, (db_track_id, ipod_track) in enumerate(bootstrap_candidates, start=1):
+            if is_cancelled and is_cancelled():
+                break
+
+            if progress_callback:
+                label = ipod_track.get("Title") or ipod_track.get("Location") or str(db_track_id)
+                progress_callback("bootstrap_mapping", index, total, str(label))
+
+            ipod_path = self._ipod_track_file_path(ipod_track)
+            if ipod_path is None:
+                skipped_no_path += 1
+                continue
+
+            fp = get_or_compute_fingerprint(ipod_path, write_to_file=False)
+            if not fp:
+                skipped_no_fp += 1
+                continue
+
+            pc_candidates = pc_by_fp.get(fp)
+            if not pc_candidates:
+                skipped_no_pc_match += 1
+                if sample_no_match_fp is None:
+                    sample_no_match_fp = fp[:120]
+                continue
+            # Protect any iPod track whose fingerprint exists on PC from
+            # first-sync removals, even when exact disambiguation is ambiguous.
+            protected_db_track_ids.add(db_track_id)
+
+            used_paths = claimed_pc_paths_by_fp.setdefault(fp, set())
+
+            pc_track = self._select_bootstrap_pc_candidate(
+                ipod_track,
+                pc_candidates,
+                used_paths=used_paths,
+            )
+            if pc_track is None:
+                continue
+            used_paths.add(pc_track.relative_path)
+
+            source_size, source_mtime = self._current_pc_track_stat(pc_track)
+            source_ext = Path(pc_track.path).suffix.lstrip(".").lower()
+            ipod_ext = ipod_path.suffix.lstrip(".").lower()
+            mapping.add_track(
+                fingerprint=fp,
+                db_track_id=db_track_id,
+                source_format=source_ext,
+                ipod_format=ipod_ext,
+                source_size=source_size,
+                source_mtime=source_mtime,
+                was_transcoded=(source_ext != ipod_ext),
+                source_path_hint=pc_track.relative_path,
+                art_hash=pc_track.art_hash,
+            )
+            added += 1
+
+        if progress_callback:
+            progress_callback(
+                "bootstrap_mapping",
+                total,
+                total,
+                f"Bootstrap matched {added}/{total} unmapped iPod tracks",
+            )
+
+        logger.info(
+            "Bootstrap summary: scanned=%d matched=%d skipped_no_path=%d skipped_no_fingerprint=%d skipped_no_pc_match=%d",
+            total,
+            added,
+            skipped_no_path,
+            skipped_no_fp,
+            skipped_no_pc_match,
+        )
+        if sample_no_match_fp:
+            logger.info("Bootstrap sample unmatched fingerprint prefix: %s", sample_no_match_fp)
+
+        return added, total, protected_db_track_ids
+
+    def _ipod_track_file_path(self, ipod_track: dict) -> Optional[Path]:
+        """Resolve a track Location field to an on-disk path on the iPod.
+
+        Supports:
+          - iTunes colon paths: :iPod_Control:Music:F00:FILE.mp3
+          - Absolute Windows paths: X:\\iPod_Control\\Music\\F00\\FILE.mp3
+          - Absolute/relative POSIX-style paths with iPod_Control segment
+        """
+        location = ipod_track.get("Location")
+        if not location:
+            return None
+
+        loc = str(location).strip()
+
+        # Absolute path (Windows/POSIX) — use as-is when it exists.
+        direct = Path(loc)
+        if direct.exists() and direct.is_file():
+            return direct
+
+        # If iPod_Control appears anywhere, join from that segment.
+        unified = loc.replace("\\", "/")
+        lower = unified.lower()
+        marker = "ipod_control"
+        marker_idx = lower.find(marker)
+        if marker_idx >= 0:
+            rel_from_marker = unified[marker_idx:].lstrip("/")
+            candidate = self.ipod_path / rel_from_marker
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+        # iTunesDB legacy colon-delimited path (not a Windows drive path).
+        is_windows_abs = len(loc) >= 3 and loc[1] == ":" and loc[2] in ("\\", "/")
+        if not is_windows_abs and ":" in loc:
+            rel_colon = loc.replace(":", "/").lstrip("/")
+            candidate = self.ipod_path / rel_colon
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+        # Final conservative fallback: treat it as already-relative.
+        fallback = self.ipod_path / unified.lstrip("/")
+        if fallback.exists() and fallback.is_file():
+            return fallback
+
         return None
+
+    def _select_bootstrap_pc_candidate(
+        self,
+        ipod_track: dict,
+        pc_candidates: list[PCTrack],
+        *,
+        used_paths: Optional[set[str]] = None,
+    ) -> Optional[PCTrack]:
+        """Pick one PC candidate for a matched iPod fingerprint.
+
+        Uses score-based disambiguation and deterministic tie-breaking.
+        If prior picks exist for this fingerprint, prefer unclaimed paths.
+        """
+        if not pc_candidates:
+            return None
+
+        pool = pc_candidates
+        if used_paths:
+            unclaimed = [t for t in pc_candidates if t.relative_path not in used_paths]
+            if unclaimed:
+                pool = unclaimed
+
+        if len(pool) == 1:
+            return pool[0]
+
+        scored = [
+            (
+                self._score_pc_to_ipod_track(pc_track, ipod_track),
+                (pc_track.relative_path or "").lower(),
+                pc_track,
+            )
+            for pc_track in pool
+        ]
+        scored.sort(key=lambda x: (-x[0], x[1]))
+
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            logger.info(
+                "Bootstrap tie for iPod track '%s' (score=%d); selecting lexicographically first path",
+                ipod_track.get("Title", "?"),
+                scored[0][0],
+            )
+
+        return scored[0][2]
+
+    @staticmethod
+    def _norm_text(value: Optional[str]) -> str:
+        """Normalize text for robust metadata comparison."""
+        if not value:
+            return ""
+        return re.sub(r"\W+", "", value).lower()
+
+    def _score_pc_to_ipod_track(self, pc_track: PCTrack, ipod_track: dict) -> int:
+        """Score how well a PC track matches an iPod track's metadata."""
+        score = 0
+
+        pc_album = self._norm_text(pc_track.album)
+        ip_album = self._norm_text(ipod_track.get("Album"))
+        if pc_album and ip_album and pc_album == ip_album:
+            score += 40
+
+        pc_title = self._norm_text(pc_track.title)
+        ip_title = self._norm_text(ipod_track.get("Title"))
+        if pc_title and ip_title and pc_title == ip_title:
+            score += 30
+
+        pc_artist = self._norm_text(pc_track.artist)
+        ip_artist = self._norm_text(ipod_track.get("Artist"))
+        if pc_artist and ip_artist and pc_artist == ip_artist:
+            score += 25
+
+        pc_track_num = pc_track.track_number or 0
+        ip_track_num = ipod_track.get("track_number", 0) or 0
+        if pc_track_num > 0 and ip_track_num > 0 and pc_track_num == ip_track_num:
+            score += 15
+
+        pc_disc_num = pc_track.disc_number or 0
+        ip_disc_num = ipod_track.get("disc_number", 0) or 0
+        if pc_disc_num > 0 and ip_disc_num > 0 and pc_disc_num == ip_disc_num:
+            score += 8
+
+        pc_year = pc_track.year or 0
+        ip_year = ipod_track.get("year", 0) or 0
+        if pc_year > 0 and ip_year > 0 and pc_year == ip_year:
+            score += 4
+
+        pc_len = pc_track.duration_ms or 0
+        ip_len = ipod_track.get("length", 0) or 0
+        if pc_len > 0 and ip_len > 0:
+            delta = abs(pc_len - ip_len)
+            if delta <= 1500:
+                score += 12
+            elif delta <= 5000:
+                score += 7
+            elif delta <= 12000:
+                score += 3
+
+        pc_bitrate = pc_track.bitrate or 0
+        ip_bitrate = ipod_track.get("bitrate", 0) or 0
+        if pc_bitrate > 0 and ip_bitrate > 0 and abs(pc_bitrate - ip_bitrate) <= 16:
+            score += 3
+
+        pc_sr = pc_track.sample_rate or 0
+        ip_sr = ipod_track.get("sample_rate_1", 0) or 0
+        if pc_sr > 0 and ip_sr > 0 and abs(pc_sr - ip_sr) <= 1000:
+            score += 2
+
+        return score
+
+    def _current_pc_track_stat(self, pc_track: PCTrack) -> tuple[int, float]:
+        """Return current source size/mtime, falling back to scan-time values."""
+        try:
+            st = Path(pc_track.path).stat()
+            return st.st_size, st.st_mtime
+        except OSError:
+            return pc_track.size, pc_track.mtime
 
     def _compare_metadata(self, pc_track: PCTrack, ipod_track: dict) -> dict:
         """Compare metadata between PC and iPod track.

@@ -35,7 +35,16 @@ class PodcastEpisode:
     # Local state (not from RSS — managed by the app)
     status: str = STATUS_NOT_DOWNLOADED
     downloaded_path: str = ""          # Absolute path on disk when downloaded
-    ipod_db_id: int = 0                 # iTunesDB db_id when synced to iPod
+    ipod_db_track_id: int = 0           # MHIT db_track_id when synced to iPod
+
+    @property
+    def ipod_db_id(self) -> int:
+        """Backward-compatible alias for the stored iPod track ID."""
+        return self.ipod_db_track_id
+
+    @ipod_db_id.setter
+    def ipod_db_id(self, value: int) -> None:
+        self.ipod_db_track_id = value
 
     def to_dict(self) -> dict:
         """Full serialization — used for in-memory transfer and RSS merge."""
@@ -51,7 +60,7 @@ class PodcastEpisode:
             "season_number": self.season_number,
             "status": self.status,
             "downloaded_path": self.downloaded_path,
-            "ipod_db_id": self.ipod_db_id,
+            "ipod_db_track_id": self.ipod_db_track_id,
         }
 
     def to_dict_stored(self) -> dict:
@@ -68,7 +77,7 @@ class PodcastEpisode:
             "duration_seconds": self.duration_seconds,
             "status": self.status,
             "downloaded_path": self.downloaded_path,
-            "ipod_db_id": self.ipod_db_id,
+            "ipod_db_track_id": self.ipod_db_track_id,
         }
 
     @classmethod
@@ -85,7 +94,7 @@ class PodcastEpisode:
             season_number=d.get("season_number"),
             status=d.get("status", STATUS_NOT_DOWNLOADED),
             downloaded_path=d.get("downloaded_path", ""),
-            ipod_db_id=d.get("ipod_db_id", 0),
+            ipod_db_track_id=d.get("ipod_db_track_id", d.get("ipod_db_id", 0)),
         )
 
 
