@@ -1342,15 +1342,15 @@ class SyncExecutor:
                 base = str(self.transcode_cache.cache_dir)
                 dest_dir = str(Path(base) / "podcasts" / url_hash)
 
-            # Look up feed artwork URL from the subscription store
-            artwork_url = ""
+            # Look up cached feed artwork from the subscription store.
+            artwork_source = ""
             try:
                 from PodcastManager.subscription_store import SubscriptionStore
                 if self.ipod_path:
                     _store = SubscriptionStore(str(self.ipod_path))
                     _feed = _store.get_feed(feed_url)
-                    if _feed and _feed.artwork_url:
-                        artwork_url = _feed.artwork_url
+                    if _feed:
+                        artwork_source = _feed.artwork_path or _feed.artwork_url
             except Exception:
                 pass
 
@@ -1359,7 +1359,7 @@ class SyncExecutor:
                     audio_url=enc_url,
                     title=title,
                     dest_dir=dest_dir,
-                    artwork_url=artwork_url,
+                    artwork_url=artwork_source,
                 )
 
                 # Update the PCTrack with real file info

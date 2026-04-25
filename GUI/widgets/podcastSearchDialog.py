@@ -43,11 +43,11 @@ log = logging.getLogger(__name__)
 class PodcastSearchDialog(QDialog):
     """Modal dialog for searching and subscribing to podcasts.
 
-    Emits ``subscribed(str)`` with the RSS feed URL when the user
-    clicks Subscribe on a search result.
+    Emits ``subscribed(str, str)`` with the RSS feed URL and artwork URL
+    when the user clicks Subscribe on a search result.
     """
 
-    subscribed = pyqtSignal(str)  # feed_url
+    subscribed = pyqtSignal(str, str)  # feed_url, artwork_url
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -213,13 +213,13 @@ class PodcastSearchDialog(QDialog):
         self._status_label.setText(f"Search failed: {value}")
         self._search_btn.setEnabled(True)
 
-    def _on_subscribe(self, feed_url: str):
-        self.subscribed.emit(feed_url)
+    def _on_subscribe(self, feed_url: str, artwork_url: str):
+        self.subscribed.emit(feed_url, artwork_url)
 
     def _on_add_rss(self):
         url = self._rss_input.text().strip()
         if url and (url.startswith("http://") or url.startswith("https://")):
-            self.subscribed.emit(url)
+            self.subscribed.emit(url, "")
             self._rss_input.clear()
 
     def _clear_results(self):
@@ -234,7 +234,7 @@ class PodcastSearchDialog(QDialog):
 class _SearchResultCard(QFrame):
     """A single search result row with podcast info and Subscribe button."""
 
-    subscribe_clicked = pyqtSignal(str)  # feed_url
+    subscribe_clicked = pyqtSignal(str, str)  # feed_url, artwork_url
 
     def __init__(self, result, parent=None):
         super().__init__(parent)
@@ -311,7 +311,12 @@ class _SearchResultCard(QFrame):
         sub_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_SM)))
         sub_btn.setStyleSheet(accent_btn_css())
         sub_btn.setFixedSize((90), (32))
-        sub_btn.clicked.connect(lambda: self.subscribe_clicked.emit(result.feed_url))
+        sub_btn.clicked.connect(
+            lambda: self.subscribe_clicked.emit(
+                result.feed_url,
+                result.artwork_url or result.artwork_url_small,
+            )
+        )
         layout.addWidget(sub_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
 
     def _load_artwork(self, url: str):

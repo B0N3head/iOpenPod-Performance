@@ -21,11 +21,15 @@ Select episodes → click "Add to iPod" → automatic download + sync.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse
 
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QIcon
+from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QIcon, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -177,7 +181,7 @@ class _PodcastEpisodeList:
 
 
 # ── Feed artwork cache ───────────────────────────────────────────────────────
-# Maps artwork URL → QPixmap so that repeated list refreshes don't re-download.
+# Maps artwork source path/URL → QPixmap so that repeated list refreshes don't re-download.
 _artwork_cache: dict[str, QPixmap] = {}
 
 
@@ -769,9 +773,11 @@ class PodcastBrowser(QFrame):
             item.setSizeHint(QSize(0, (44)))
 
             # Feed artwork thumbnail in list
-            if feed.artwork_url and feed.artwork_url in _artwork_cache:
+            artwork_source = self._feed_artwork_source(feed)
+            item.setIcon(QIcon(self._artwork_placeholder_pixmap(36)))
+            if artwork_source and artwork_source in _artwork_cache:
                 icon_pm = scale_pixmap_for_display(
-                    _artwork_cache[feed.artwork_url],
+                    _artwork_cache[artwork_source],
                     36,
                     36,
                     widget=self._feed_list,
@@ -779,8 +785,8 @@ class PodcastBrowser(QFrame):
                     transform_mode=Qt.TransformationMode.SmoothTransformation,
                 )
                 item.setIcon(QIcon(icon_pm))
-            elif feed.artwork_url:
-                self._load_feed_list_artwork(feed.artwork_url, i)
+            elif artwork_source:
+                self._load_feed_list_artwork(artwork_source, i)
 
             self._feed_list.addItem(item)
             if feed.feed_url == prev_url:
@@ -1019,10 +1025,10 @@ class PodcastBrowser(QFrame):
         self._load_feed_settings(feed)
 
         # Load header artwork
-        if feed.artwork_url:
-            self._load_feed_artwork(feed.artwork_url)
-        else:
-            self._set_feed_art_placeholder()
+        self._set_feed_art_placeholder()
+        artwork_source = self._feed_artwork_source(feed)
+        if artwork_source:
+            self._load_feed_artwork(artwork_source)
 
         # Populate episodes (newest first)
         episodes = sorted(feed.episodes, key=lambda e: e.pub_date, reverse=True)
@@ -1250,7 +1256,7 @@ class PodcastBrowser(QFrame):
 
     # ── Subscribe / unsubscribe ──────────────────────────────────────────
 
-    def _subscribe_to_feed(self, feed_url: str) -> None:
+    def _subscribe_to_feed(self, feed_url: str, artwork_url: str = "") -> None:
         """Subscribe to a feed by URL (called from search dialog)."""
         if not self._store:
             return
@@ -1263,12 +1269,54 @@ class PodcastBrowser(QFrame):
         self._set_status("Fetching feed…")
 
         from app_core.runtime import ThreadPoolSingleton, Worker
-        from PodcastManager.feed_parser import fetch_feed
 
-        worker = Worker(fetch_feed, feed_url)
+        worker = Worker(self._fetch_subscribed_feed, feed_url, artwork_url)
         worker.signals.result.connect(self._on_feed_fetched)
         worker.signals.error.connect(self._on_subscribe_error)
         ThreadPoolSingleton.get_instance().start(worker)
+
+    def _fetch_subscribed_feed(self, feed_url: str, artwork_url: str = ""):
+        from PodcastManager.feed_parser import fetch_feed
+
+        feed = fetch_feed(feed_url)
+        if artwork_url and self._store:
+            cached_path = self._cache_artwork_file(feed_url, artwork_url)
+            if cached_path:
+                feed.artwork_path = cached_path
+        return feed
+
+    def _cache_artwork_file(self, feed_url: str, artwork_url: str) -> str:
+        if not self._store or not artwork_url:
+            return ""
+
+        cache_dir = os.path.join(self._store.podcast_dir, "artwork-cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        suffix = Path(urlparse(artwork_url).path).suffix.lower() or ".jpg"
+        key = hashlib.sha256(f"{feed_url}|{artwork_url}".encode("utf-8")).hexdigest()[:24]
+        cache_path = os.path.join(cache_dir, f"{key}{suffix}")
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+            return cache_path
+
+        try:
+            import requests
+
+            resp = requests.get(
+                artwork_url,
+                timeout=15,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Referer": "https://www.buzzsprout.com/",
+                },
+            )
+            resp.raise_for_status()
+            with open(cache_path, "wb") as f:
+                f.write(resp.content)
+            return cache_path
+        except Exception as exc:
+            log.debug("Failed to cache podcast artwork from %s: %s", artwork_url, exc)
+            return ""
 
     def _on_feed_fetched(self, feed) -> None:
         if not self._store:
@@ -1284,6 +1332,9 @@ class PodcastBrowser(QFrame):
             if item and item.data(Qt.ItemDataRole.UserRole) == feed.feed_url:
                 self._feed_list.setCurrentRow(i)
                 break
+
+        self._selected_feed = self._store.get_feed(feed.feed_url) or feed
+        self._show_episodes(self._selected_feed)
 
     def _on_subscribe_error(self, error_tuple) -> None:
         _, value, _ = error_tuple
@@ -1598,21 +1649,30 @@ class PodcastBrowser(QFrame):
 
     def _set_feed_art_placeholder(self) -> None:
         """Set a crisp HiDPI-safe placeholder icon in the feed artwork slot."""
-        placeholder = glyph_pixmap("broadcast", (52), Colors.TEXT_TERTIARY)
+        placeholder = self._artwork_placeholder_pixmap(52)
         if placeholder:
-            pm = scale_pixmap_for_display(
-                placeholder,
-                52,
-                52,
-                widget=self._feed_art,
-                aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
-                transform_mode=Qt.TransformationMode.SmoothTransformation,
-            )
-            self._feed_art.setPixmap(pm)
+            self._feed_art.setPixmap(placeholder)
             self._feed_art.setText("")
         else:
             self._feed_art.setText("◎")
         self._reset_feed_hero_color()
+
+    def _artwork_placeholder_pixmap(self, size: int) -> QPixmap | None:
+        """Create the gray square placeholder used when artwork is missing."""
+        glyph = glyph_pixmap("broadcast", max(16, int(size * 0.52)), Colors.TEXT_TERTIARY)
+        if glyph is None:
+            return None
+
+        px = QPixmap(size, size)
+        px.fill(QColor(Colors.SURFACE_ALT))
+        painter = QPainter(px)
+        try:
+            x = (size - glyph.width()) // 2
+            y = (size - glyph.height()) // 2
+            painter.drawPixmap(x, y, glyph)
+        finally:
+            painter.end()
+        return px
 
     def _apply_hero_color_from_pixmap(self, pixmap: QPixmap) -> None:
         """Extract average color from pixmap using Qt only (no PIL, no encode)."""
@@ -1715,13 +1775,16 @@ class PodcastBrowser(QFrame):
         for btn in self._hero_btns:
             btn.setStyleSheet(_default_css)
 
-    def _load_feed_artwork(self, url: str) -> None:
+    def _feed_artwork_source(self, feed) -> str:
+        return getattr(feed, "artwork_path", "") or getattr(feed, "artwork_url", "")
+
+    def _load_feed_artwork(self, source: str) -> None:
         """Load feed artwork for the header panel in background."""
-        if url in _artwork_cache:
+        if source in _artwork_cache:
             art_w = max(1, self._feed_art.width())
             art_h = max(1, self._feed_art.height())
             pm = scale_pixmap_for_display(
-                _artwork_cache[url],
+                _artwork_cache[source],
                 art_w,
                 art_h,
                 widget=self._feed_art,
@@ -1730,13 +1793,26 @@ class PodcastBrowser(QFrame):
             )
             self._feed_art.setPixmap(pm)
             self._feed_art.setText("")
-            self._apply_hero_color_from_pixmap(_artwork_cache[url])
+            self._apply_hero_color_from_pixmap(_artwork_cache[source])
+            return
+
+        if source and os.path.exists(source):
+            try:
+                with open(source, "rb") as f:
+                    data = f.read()
+            except OSError:
+                data = b""
+            if data:
+                self._on_feed_artwork_loaded(data, source)
+                return
+
+        if not source:
             return
 
         from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
 
-        target_url = url
+        target_url = source
 
         def _fetch():
             resp = requests.get(target_url, timeout=10)
@@ -1744,9 +1820,7 @@ class PodcastBrowser(QFrame):
             return resp.content
 
         worker = Worker(_fetch)
-        worker.signals.result.connect(
-            lambda data, u=target_url: self._on_feed_artwork_loaded(data, u)
-        )
+        worker.signals.result.connect(lambda data, u=target_url: self._on_feed_artwork_loaded(data, u))
         worker.signals.error.connect(
             lambda _: log.debug("Failed to load artwork: %s", target_url)
         )
@@ -1760,7 +1834,7 @@ class PodcastBrowser(QFrame):
         _artwork_cache[url] = full_pm
 
         # Update header art if still showing the same feed
-        if self._selected_feed and self._selected_feed.artwork_url == url:
+        if self._selected_feed and self._feed_artwork_source(self._selected_feed) == url:
             art_w = max(1, self._feed_art.width())
             art_h = max(1, self._feed_art.height())
             pm = scale_pixmap_for_display(
@@ -1778,12 +1852,22 @@ class PodcastBrowser(QFrame):
         # Update feed list item icon too
         self._update_feed_list_icon(url, full_pm)
 
-    def _load_feed_list_artwork(self, url: str, row: int) -> None:
+    def _load_feed_list_artwork(self, source: str, row: int) -> None:
         """Load a feed's artwork for its list item thumbnail."""
+        if source and os.path.exists(source):
+            try:
+                with open(source, "rb") as f:
+                    data = f.read()
+            except OSError:
+                data = b""
+            if data:
+                self._on_list_artwork_loaded(data, source)
+                return
+
         from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
 
-        target_url = url
+        target_url = source
 
         def _fetch():
             resp = requests.get(target_url, timeout=10)
@@ -1791,9 +1875,7 @@ class PodcastBrowser(QFrame):
             return resp.content
 
         worker = Worker(_fetch)
-        worker.signals.result.connect(
-            lambda data, u=target_url: self._on_list_artwork_loaded(data, u)
-        )
+        worker.signals.result.connect(lambda data, u=target_url: self._on_list_artwork_loaded(data, u))
         worker.signals.error.connect(
             lambda _: log.debug("Failed to load list artwork: %s", target_url)
         )
@@ -1822,7 +1904,7 @@ class PodcastBrowser(QFrame):
         icon = QIcon(icon_pm)
         feeds = self._store.get_feeds()
         for i, feed in enumerate(feeds):
-            if feed.artwork_url == url:
+            if self._feed_artwork_source(feed) == url:
                 item = self._feed_list.item(i)
                 if item:
                     item.setIcon(icon)

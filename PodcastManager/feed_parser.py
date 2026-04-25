@@ -13,7 +13,7 @@ import calendar
 import feedparser
 import requests
 
-from .models import PodcastEpisode, PodcastFeed
+from .models import PodcastEpisode, PodcastFeed, normalize_artwork_url
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def fetch_feed(url: str, existing: PodcastFeed | None = None) -> PodcastFeed:
                     or _get_itunes(feed_info, "author", "")),
             description=(_get_text(feed_info, "subtitle")
                          or _get_text(feed_info, "summary", "")),
-            artwork_url=_get_artwork_url(feed_info),
+            artwork_url=normalize_artwork_url(_get_artwork_url(feed_info)),
             category=_get_itunes_category(feed_info),
             language=_get_text(feed_info, "language", ""),
             last_refreshed=time.time(),
@@ -111,7 +111,10 @@ def _merge_feed(
     existing.description = (_get_text(feed_info, "subtitle")
                             or _get_text(feed_info, "summary", "")
                             or existing.description)
-    existing.artwork_url = _get_artwork_url(feed_info) or existing.artwork_url
+    existing.artwork_url = (
+        normalize_artwork_url(_get_artwork_url(feed_info))
+        or existing.artwork_url
+    )
     existing.category = _get_itunes_category(feed_info) or existing.category
     existing.language = _get_text(feed_info, "language", "") or existing.language
     existing.last_refreshed = time.time()

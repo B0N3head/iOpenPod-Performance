@@ -8,6 +8,7 @@ can be tested without PyQt6.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 from typing import Optional
 
 
@@ -16,6 +17,29 @@ STATUS_NOT_DOWNLOADED = "not_downloaded"
 STATUS_DOWNLOADING = "downloading"
 STATUS_DOWNLOADED = "downloaded"
 STATUS_ON_IPOD = "on_ipod"
+
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp")
+
+
+def normalize_artwork_url(url: str) -> str:
+    """Normalize feed artwork URLs that use a stray extension-only query."""
+    raw = (url or "").strip()
+    if not raw or "?" not in raw:
+        return raw
+
+    parsed = urlsplit(raw)
+    query = parsed.query.strip().lower()
+    if not query:
+        return raw
+
+    normalized_ext = query if query.startswith(".") else f".{query}"
+    if normalized_ext not in _IMAGE_EXTENSIONS:
+        return raw
+
+    if parsed.path.lower().endswith(_IMAGE_EXTENSIONS):
+        return raw
+
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{parsed.path}{normalized_ext}", "", parsed.fragment))
 
 
 @dataclass
@@ -164,6 +188,7 @@ class PodcastFeed:
             "title": self.title,
             "author": self.author,
             "artwork_url": self.artwork_url,
+            "artwork_path": self.artwork_path,
             "category": self.category,
             "language": self.language,
             "last_refreshed": self.last_refreshed,
@@ -189,7 +214,7 @@ class PodcastFeed:
             title=d.get("title", ""),
             author=d.get("author", ""),
             description=d.get("description", ""),
-            artwork_url=d.get("artwork_url", ""),
+            artwork_url=normalize_artwork_url(d.get("artwork_url", "")),
             artwork_path=d.get("artwork_path", ""),
             category=d.get("category", ""),
             language=d.get("language", ""),
@@ -231,11 +256,11 @@ class SearchResult:
             title=entry.get("collectionName", ""),
             artist=entry.get("artistName", ""),
             feed_url=entry.get("feedUrl", ""),
-            artwork_url=(
+            artwork_url=normalize_artwork_url(
                 entry.get("artworkUrl600", "")
                 or entry.get("artworkUrl100", "")
             ),
-            artwork_url_small=entry.get("artworkUrl100", ""),
+            artwork_url_small=normalize_artwork_url(entry.get("artworkUrl100", "")),
             genre=entry.get("primaryGenreName", ""),
             track_count=entry.get("trackCount", 0),
         )

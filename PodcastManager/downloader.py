@@ -147,13 +147,17 @@ def embed_feed_artwork(file_path: str, artwork_url: str) -> bool:
         elif hasattr(audio, "tags") and audio.tags and "covr" in audio.tags:
             return False
 
-        # Download the artwork image
-        resp = requests.get(
-            artwork_url, timeout=15,
-            headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
-        )
-        resp.raise_for_status()
-        art_data = resp.content
+        if os.path.exists(artwork_url):
+            with open(artwork_url, "rb") as f:
+                art_data = f.read()
+        else:
+            # Download the artwork image
+            resp = requests.get(
+                artwork_url, timeout=15,
+                headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
+            )
+            resp.raise_for_status()
+            art_data = resp.content
         if len(art_data) < 256:
             return False
 

@@ -22,6 +22,15 @@
 - Seed a real `tests/` tree with fixture folders for SysInfo, device metadata, iTunesDB, ArtworkDB, and sync-plan samples.
 - Exit criteria: every PR gets health feedback, and new debt is blocked even before old debt is fully removed.
 
+### Phase 0 Gap Scan
+- Current CI exists and runs the intended health gates, but it is an Ubuntu-only baseline. Keep that as the fast gate, then add a tiny Windows/macOS import and path-resolution smoke once the platform backends are split enough to test without hardware.
+- The architecture checker now guards import cycles, GUI cross-layer imports, runtime singleton access, settings runtime reach-through, sync-review workers, private `SyncExecutor` usage, and growth in `except Exception: pass`. It still needs a general layer dependency matrix so all first-party imports are either allowed by design or explicitly grandfathered.
+- The allowlists in `scripts/architecture_rules.json` should become a debt ledger: each exception needs an owner/phase target or at least a short reason. Right now the counts block growth, but they do not explain which migration will remove each allowance.
+- The plan says "no new module-level singleton state" and "no new raw `dict`/`list` boundary payloads"; neither rule is fully enforceable yet. Phase 0 should add a lightweight scanner for obvious module state and a typed-boundary inventory for GUI/app_core/sync/device DTOs before Phase 1 leans on those contracts.
+- The fixture directories exist, but the useful fixture content is still missing. Minimum Phase 0 fixtures should include representative SysInfo files, device metadata snapshots, one tiny iTunesDB/ArtworkDB pair, and serialized sync-plan cases for add/remove/update/integrity repair.
+- Ruff and mypy are intentionally scoped to the new typed island. Treat that as a ratchet: touched `app_core`, `infrastructure`, contract, and test files stay in the typed/linted set, and each migration phase expands the scope rather than trying to clean the whole repo in one pass.
+- Add one documented local health command that mirrors CI. The workflow is real, but contributors should not have to read YAML to know the Phase 0 gate.
+
 ## Phase 1 — Establish the Composition Root
 - Create `app_core` and move app wiring out of `GUI/app.py` and into `main.py` plus `AppContext`.
 - Wrap existing globals instead of rewriting them first: put `settings.py`, `DeviceManager`, and `iTunesDBCache` behind services so callers can migrate without a flag day.
@@ -29,6 +38,17 @@
 - Break the 12-module GUI cycle by moving shared commands, state, and events into `app_core`, leaving widgets as consumers.
 - Standardize one background job abstraction for progress, cancellation, result delivery, and error propagation; stop inventing new worker patterns inside UI modules.
 - Exit criteria: `GUI/app.py` is a shell/composition module, not the owner of settings, device session, cache, sync, updater, and thread policy.
+
+### Phase 1 Gap Scan
+- The composition root exists (`main.py` -> `app_core.bootstrap` -> `AppContext`), but its ownership boundary is still fuzzy. Declare `app_core.bootstrap` as the only app-core module allowed to import concrete GUI classes, and keep all other `app_core` modules GUI-free.
+- `AppContext` wraps settings, device sessions, and library cache, but the services still expose `manager()` and `cache()`, which hands mutable singleton-style objects back to the UI. Treat those as compatibility seams and replace them with command/query methods plus immutable snapshots.
+- `GUI/app.py` is smaller than the original hotspot but still owns the main sync, back-sync, podcast-plan, execute, eject, rename, tool-download, and drop-scan worker lifecycles. Phase 1 needs explicit shell controllers for sync orchestration, device commands, drop/import, startup restore, and update checks.
+- Some worker classes moved to `app_core.jobs`, but widget-local threading still exists (`_DriveWatcher`, `_PCLibScanWorker`, `_PhotoWriteWorker`) and widgets still use `ThreadPoolSingleton`/`Worker` directly. The missing concept is a `JobRunner`/`BackgroundTaskService` facade with a single cancellation/progress/result contract.
+- `app_core.jobs` is becoming the next large coordination module. Split it by workflow before it hardens: sync jobs, device jobs, backup jobs, playlist jobs, podcast jobs, and tool/update jobs.
+- Main-window dependency injection is started, but page creation is still centralized in `MainWindow`. Add a page factory or navigation controller so `MainWindow` wires pages at a high level instead of knowing every widget constructor and service combination.
+- Shared events are still mostly raw Qt signals carrying `object`, `str`, `dict`, or lists. Add typed command/event DTOs for device-selected, library-loaded, sync-requested, sync-plan-ready, sync-finished, settings-changed, and page-navigation events.
+- The architecture checker should gain Phase 1 ratchets: no new direct `app_core.runtime` imports from widgets, no new GUI-local `QThread` worker classes, no new `MainWindow` worker ownership, and no `app_core` imports from `GUI` except the bootstrap/composition root allowance.
+- Define measurable exit criteria for this phase: `GUI/app.py` line/import/worker-count caps, zero widget-owned operational workers outside temporary allowlists, and every page receiving services or controllers rather than reaching through globals.
 
 ## Phase 2 — Make Runtime State Strict
 - Split `settings.py` into schema, persistence, secret codec, and active-session runtime pieces.
