@@ -131,6 +131,7 @@ def pc_track_to_info(
     was_transcoded: bool,
     ipod_file_path: Optional[Path] = None,
     existing_media_type: Optional[int] = None,
+    transcode_options=None,
 ) -> TrackInfo:
     """Convert PCTrack to TrackInfo for writing.
 
@@ -228,6 +229,46 @@ def pc_track_to_info(
             skip_when_shuffling = True
             remember_position = True
 
+    # ── Encoding flags ───────────────────────────────────────────
+    # For direct copies read flags from the source (mutagen was accurate).
+    # For transcoded files derive them from the actual encoder used, because
+    # the output format/VBR mode may differ completely from the source.
+    if was_transcoded and transcode_options is not None:
+        from .transcoder import resolve_effective_encoder
+        _target, _actual_encoder = resolve_effective_encoder(transcode_options)
+        _is_manual = (transcode_options.lossy_encoder or "auto").lower() not in {"auto", ""}
+
+        if filetype == "mp3":
+            # encoder_flag=1 tells the iPod to look for a LAME gapless header.
+            # libshine doesn't write one, so set 0 to avoid false gapless probing.
+            encoder_flag = 1 if _actual_encoder == "libmp3lame" else 0
+            # VBR: libmp3lame auto mode uses -q:a (VBR); libshine is always CBR.
+            if _actual_encoder == "libshine":
+                vbr = False
+            elif _is_manual:
+                vbr = transcode_options.bitrate_mode == "vbr"
+            else:
+                vbr = True  # auto libmp3lame always uses -q:a VBR for music
+        elif filetype == "m4a":
+            encoder_flag = 0  # AAC/ALAC do not use LAME headers
+            # libfdk_aac -vbr and aac_at -aac_at_mode vbr produce genuine VBR output.
+            vbr = (
+                _is_manual
+                and _actual_encoder in {"libfdk_aac", "aac_at"}
+                and transcode_options.bitrate_mode == "vbr"
+            )
+        else:
+            encoder_flag = 0
+            vbr = False
+    elif was_transcoded:
+        # Options not available (dry-run / legacy call). Use format-safe defaults.
+        encoder_flag = 1 if filetype == "mp3" else 0
+        vbr = False if filetype == "m4a" else pc_track.vbr
+    else:
+        # Direct copy — source flags are correct.
+        encoder_flag = 1 if filetype == "mp3" else 0
+        vbr = pc_track.vbr
+
     # ── Gapless & encoder flags ──────────────────────────────────
     pregap = pc_track.pregap or 0
     postgap = pc_track.postgap or 0
@@ -263,10 +304,6 @@ def pc_track_to_info(
     # Gapless playback flag is OFF by default.
     # Only enable it when explicitly provided by metadata/user intent.
     gapless_track_flag = pc_track.gapless_track_flag or 0
-    # encoder_flag: set to 1 for MP3 (iPod needs this for LAME gapless)
-    encoder_flag = 1 if filetype == "mp3" else 0
-    # VBR detection from mutagen bitrate_mode
-    vbr = pc_track.vbr
 
     return TrackInfo(
         title=pc_track.title or Path(pc_track.path).stem,

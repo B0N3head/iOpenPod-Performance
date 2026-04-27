@@ -40,7 +40,7 @@ from .pc_library import PCLibrary, PCTrack
 from .audio_fingerprint import get_or_compute_fingerprint, is_fpcalc_available
 from .mapping import MappingManager, MappingFile, TrackMapping
 from .integrity import IntegrityReport
-from .transcoder import resolve_transcode_plan
+from .transcoder import TranscodeOptions, resolve_transcode_plan
 from .photos import (
     PCPhotoLibrary,
     PhotoEditState,
@@ -55,7 +55,10 @@ logger = logging.getLogger(__name__)
 
 # ─── Storage Estimation ───────────────────────────────────────────────────────
 
-def estimate_transcode_size(pc_track: PCTrack) -> int:
+def estimate_transcode_size(
+    pc_track: PCTrack,
+    options: TranscodeOptions | None = None,
+) -> int:
     """Estimate the size of a file after transcode, based on metadata and settings.
 
     For files that don't need transcoding (native COPY), returns the actual file size.
@@ -64,7 +67,7 @@ def estimate_transcode_size(pc_track: PCTrack) -> int:
 
     Returns the estimated bytes on the iPod after transcode.
     """
-    plan = resolve_transcode_plan(pc_track.path)
+    plan = resolve_transcode_plan(pc_track.path, options=options)
     return plan.estimate_output_size(
         source_size=pc_track.size,
         duration_ms=pc_track.duration_ms,
@@ -412,6 +415,7 @@ class FingerprintDiffEngine:
         supports_podcast: bool = True,
         fpcalc_path: str = "",
         photo_sync_settings: dict[str, bool] | None = None,
+        transcode_options: TranscodeOptions | None = None,
     ):
         self.pc_library = pc_library
         self.ipod_path = Path(ipod_path)
@@ -419,6 +423,7 @@ class FingerprintDiffEngine:
         self.supports_podcast = supports_podcast
         self.fpcalc_path = fpcalc_path
         self.photo_sync_settings = photo_sync_settings
+        self.transcode_options = transcode_options or TranscodeOptions()
         self.mapping_manager = MappingManager(ipod_path)
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -744,7 +749,7 @@ class FingerprintDiffEngine:
 
             if not mapping_entries:
                 # NEW TRACK: Not in mapping → Add
-                estimated_size = estimate_transcode_size(pc_track)
+                estimated_size = estimate_transcode_size(pc_track, self.transcode_options)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
@@ -761,7 +766,7 @@ class FingerprintDiffEngine:
             if not available_entries:
                 # All mapping entries for this fingerprint are claimed by other
                 # album groups → this is a new album variant (greatest hits case)
-                estimated_size = estimate_transcode_size(pc_track)
+                estimated_size = estimate_transcode_size(pc_track, self.transcode_options)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
@@ -788,7 +793,7 @@ class FingerprintDiffEngine:
             if ipod_track is None:
                 # Mapping exists but track missing from iTunesDB (stale mapping)
                 logger.warning(f"Mapping for {fp} points to missing db_track_id {db_track_id}")
-                estimated_size = estimate_transcode_size(pc_track)
+                estimated_size = estimate_transcode_size(pc_track, self.transcode_options)
                 plan.to_add.append(SyncItem(
                     action=SyncAction.ADD_TO_IPOD,
                     fingerprint=fp,
@@ -808,7 +813,7 @@ class FingerprintDiffEngine:
 
             # File change: size+mtime gate
             if self._source_file_changed(pc_track, matched_entry):
-                estimated_size = estimate_transcode_size(pc_track)
+                estimated_size = estimate_transcode_size(pc_track, self.transcode_options)
                 plan.to_update_file.append(SyncItem(
                     action=SyncAction.UPDATE_FILE,
                     fingerprint=fp,

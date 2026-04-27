@@ -10,11 +10,18 @@ DEVICE_SETTING_KEYS = (
     "rotate_tall_photos_for_device",
     "fit_photo_thumbnails",
     "rating_conflict_strategy",
-    "aac_encoder",
-    "aac_mode",
-    "aac_music_bitrate",
-    "aac_vbr_level",
-    "aac_spoken_bitrate",
+    "lossy_encoder",
+    "lossy_quality",
+    "bitrate_mode",
+    "music_lossy_cbr_bitrate",
+    "vbr_level",
+    "spoken_lossy_cbr_bitrate",
+    "aac_cutoff",
+    "aac_tns",
+    "aac_pns",
+    "aac_ms_stereo",
+    "aac_intensity_stereo",
+    "fdk_afterburner",
     "video_crf",
     "video_preset",
     "prefer_lossy",
@@ -52,11 +59,18 @@ class AppSettings:
     ffmpeg_path: str = ""
     fpcalc_path: str = ""
 
-    aac_encoder: str = "auto"
-    aac_mode: str = "cbr"
-    aac_music_bitrate: int = 192
-    aac_vbr_level: int = 4
-    aac_spoken_bitrate: int = 64
+    lossy_encoder: str = "auto"
+    lossy_quality: str = "balanced"
+    bitrate_mode: str = "cbr"
+    music_lossy_cbr_bitrate: int = 192
+    vbr_level: int = 4
+    spoken_lossy_cbr_bitrate: int = 64
+    aac_cutoff: int = 0
+    aac_tns: bool = True
+    aac_pns: bool = False
+    aac_ms_stereo: bool = True
+    aac_intensity_stereo: bool = True
+    fdk_afterburner: bool = True
     video_crf: int = 23
     video_preset: str = "fast"
     prefer_lossy: bool = False
@@ -89,6 +103,6 @@ class DeviceSettingsState:
     """Loaded on-iPod settings plus metadata for the Settings page."""
 
     settings: AppSettings
-    use_global_settings: bool = False
+    use_global_settings: bool = True
     exists: bool = False
     path: str = ""

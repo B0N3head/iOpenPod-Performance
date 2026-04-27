@@ -70,24 +70,6 @@ def load_app_settings() -> AppSettings:
                 if isinstance(value, expected_type):
                     setattr(settings, key, value)
 
-        if "media_folder" not in data and "music_folder" in data:
-            settings.media_folder = data["music_folder"]
-
-        if "aac_bitrate" in data and "aac_music_bitrate" not in data:
-            bitrate = int(data["aac_bitrate"])
-            if bitrate == 64:
-                settings.aac_spoken_bitrate = 64
-            else:
-                settings.aac_music_bitrate = min(bitrate, 256)
-
-        if "aac_quality" in data and "aac_music_bitrate" not in data:
-            old_quality = data.get("aac_quality", "normal")
-            quality_map = {"high": 256, "normal": 192, "compact": 128}
-            if old_quality == "spoken":
-                settings.aac_spoken_bitrate = 64
-            else:
-                settings.aac_music_bitrate = quality_map.get(old_quality, 192)
-
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         pass
     return settings

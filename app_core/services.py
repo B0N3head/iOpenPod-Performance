@@ -33,11 +33,18 @@ class SettingsSnapshot:
     rating_conflict_strategy: str
     ffmpeg_path: str
     fpcalc_path: str
-    aac_encoder: str
-    aac_mode: str
-    aac_music_bitrate: int
-    aac_vbr_level: int
-    aac_spoken_bitrate: int
+    lossy_encoder: str
+    lossy_quality: str
+    bitrate_mode: str
+    music_lossy_cbr_bitrate: int
+    vbr_level: int
+    spoken_lossy_cbr_bitrate: int
+    aac_cutoff: int
+    aac_tns: bool
+    aac_pns: bool
+    aac_ms_stereo: bool
+    aac_intensity_stereo: bool
+    fdk_afterburner: bool
     video_crf: int
     video_preset: str
     prefer_lossy: bool

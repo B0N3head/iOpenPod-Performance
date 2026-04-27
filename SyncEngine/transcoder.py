@@ -2,8 +2,8 @@
 Transcoder — Convert audio/video files to iPod-compatible formats via FFmpeg.
 
 Supported conversions:
-  FLAC/WAV/AIFF  → ALAC (lossless) or AAC (if prefer_lossy setting is on)
-  OGG/Opus/WMA   → AAC
+    FLAC/WAV/AIFF  → ALAC (lossless) or lossy (AAC/MP3 when prefer_lossy is on)
+    OGG/Opus/WMA   → lossy (AAC/MP3)
   Video           → M4V (H.264 Baseline + stereo AAC)
   Native formats  → re-encoded only when they exceed iPod hardware limits
 
@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -44,7 +44,7 @@ IPOD_MAX_SAMPLE_RATE = 48_000   # Hz
 IPOD_MAX_CHANNELS = 2           # Stereo
 IPOD_MAX_BIT_DEPTH = 16         # ALAC/WAV ceiling
 
-# Fallback video limits when no device is connected.
+# Fallback video limits when device detection fails.
 _DEFAULT_VIDEO_W = 640
 _DEFAULT_VIDEO_H = 480
 
@@ -55,6 +55,7 @@ class TranscodeTarget(Enum):
     """What codec to produce."""
     ALAC = "alac"
     AAC = "aac"
+    MP3 = "mp3"
     VIDEO_H264 = "video_h264"
     COPY = "copy"
 
@@ -62,12 +63,69 @@ class TranscodeTarget(Enum):
 _OUTPUT_EXT: dict[TranscodeTarget, str] = {
     TranscodeTarget.ALAC: ".m4a",
     TranscodeTarget.AAC: ".m4a",
+    TranscodeTarget.MP3: ".mp3",
     TranscodeTarget.VIDEO_H264: ".m4v",
 }
 
-# Approximate stereo kbps for libfdk_aac -vbr 1..5 (midpoints of the per-channel
-# ranges in the libfdk-aac docs, doubled for 2ch). Used only for size estimates.
-_LIBFDK_VBR_KBPS: dict[int, int] = {1: 52, 2: 72, 3: 104, 4: 136, 5: 208}
+_VALID_LOSSY_ENCODERS: frozenset[str] = frozenset(
+    {"auto", "libfdk_aac", "aac_at", "aac", "libmp3lame", "libshine"}
+)
+_VALID_QUALITY_LEVELS: frozenset[str] = frozenset({"high", "balanced", "compact"})
+_VALID_BITRATE_MODES: frozenset[str] = frozenset({"cbr", "abr", "vbr", "cvbr"})
+
+# Approximate kbps for aac_at VBR quality q0–q14 (for size estimation)
+_AAC_AT_VBR_Q_KBPS: dict[int, int] = {
+    0: 256, 1: 240, 2: 224, 3: 192, 4: 176, 5: 160,
+    6: 144, 7: 128, 8: 112, 9: 96, 10: 80, 11: 72,
+    12: 64, 13: 56, 14: 48,
+}
+
+# Approximate kbps for libfdk_aac VBR levels 1-5 (for size estimation)
+_FDK_VBR_KBPS: dict[int, int] = {1: 32, 2: 64, 3: 96, 4: 128, 5: 192}
+# Approximate kbps for libmp3lame VBR q0-q9 (for size estimation)
+_MP3_VBR_Q_KBPS: dict[int, int] = {0: 245, 1: 225, 2: 190, 3: 175, 4: 165, 5: 130, 6: 115, 7: 100, 8: 85, 9: 65}
+
+# Music bitrate per quality preset — used for AAC/CBR and spoken-word estimates
+_QUALITY_MUSIC_KBPS: dict[str, int] = {"high": 256, "balanced": 192, "compact": 128}
+
+# libmp3lame VBR q-value per quality preset (-q:a N, lower = better)
+_QUALITY_MP3_VBR_Q: dict[str, int] = {"high": 2, "balanced": 4, "compact": 6}
+
+
+# Approximate kbps for those VBR levels — for size estimation
+_QUALITY_MP3_KBPS: dict[str, int] = {"high": 190, "balanced": 130, "compact": 100}
+
+_VALID_X264_PRESETS: frozenset[str] = frozenset({
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+    "slow", "slower", "veryslow",
+})
+
+
+def _read_setting_str(settings: object, key: str, default: str) -> str:
+    value = getattr(settings, key, default)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _read_setting_int(settings: object, key: str, default: int) -> int:
+    value = getattr(settings, key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_choice(value: str, *, allowed: frozenset[str], default: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in allowed:
+        return normalized
+    return default
+
+
+def _clamp_int(value: int, *, minimum: int, maximum: int) -> int:
+    return max(minimum, min(value, maximum))
 
 
 @dataclass(frozen=True)
@@ -81,36 +139,85 @@ class TranscodeOptions:
     smart_quality_by_type: bool = True
     video_crf: int = 23
     video_preset: str = "medium"
-    aac_encoder: str = "auto"
-    aac_mode: str = "cbr"
-    aac_music_bitrate: int = 192
-    aac_vbr_level: int = 4
-    aac_spoken_bitrate: int = 64
+    lossy_encoder: str = "auto"
+    lossy_quality: str = "balanced"
+    bitrate_mode: str = "cbr"
+    music_lossy_cbr_bitrate: int = 192
+    vbr_level: int = 4
+    spoken_lossy_cbr_bitrate: int = 64
+    aac_cutoff: int = 0
+    aac_tns: bool = True
+    aac_pns: bool = False
+    aac_ms_stereo: bool = True
+    aac_intensity_stereo: bool = True
+    fdk_afterburner: bool = True
+
+    def normalized(self) -> "TranscodeOptions":
+        """Return a validated copy with sane bounds and allowed enum values."""
+        return replace(
+            self,
+            video_crf=_clamp_int(int(self.video_crf), minimum=0, maximum=51),
+            video_preset=_normalize_choice(
+                self.video_preset,
+                allowed=_VALID_X264_PRESETS,
+                default="medium",
+            ),
+            lossy_encoder=_normalize_choice(
+                self.lossy_encoder,
+                allowed=_VALID_LOSSY_ENCODERS,
+                default="auto",
+            ),
+            lossy_quality=_normalize_choice(
+                self.lossy_quality,
+                allowed=_VALID_QUALITY_LEVELS,
+                default="balanced",
+            ),
+            bitrate_mode=_normalize_choice(
+                self.bitrate_mode,
+                allowed=_VALID_BITRATE_MODES,
+                default="cbr",
+            ),
+            music_lossy_cbr_bitrate=_clamp_int(
+                int(self.music_lossy_cbr_bitrate), minimum=32, maximum=320
+            ),
+            vbr_level=_clamp_int(int(self.vbr_level), minimum=0, maximum=14),
+            spoken_lossy_cbr_bitrate=_clamp_int(
+                int(self.spoken_lossy_cbr_bitrate), minimum=24, maximum=192
+            ),
+            aac_cutoff=_clamp_int(int(self.aac_cutoff), minimum=0, maximum=22050),
+        )
 
     @classmethod
     def from_settings(cls, settings: object) -> "TranscodeOptions":
         return cls(
-            ffmpeg_path=str(getattr(settings, "ffmpeg_path", "") or ""),
+            ffmpeg_path=_read_setting_str(settings, "ffmpeg_path", ""),
             prefer_lossy=bool(getattr(settings, "prefer_lossy", False)),
-            normalize_sample_rate=bool(
-                getattr(settings, "normalize_sample_rate", False)
-            ),
+            normalize_sample_rate=bool(getattr(settings, "normalize_sample_rate", False)),
             mono_for_spoken=bool(getattr(settings, "mono_for_spoken", True)),
-            smart_quality_by_type=bool(
-                getattr(settings, "smart_quality_by_type", True)
-            ),
-            video_crf=int(getattr(settings, "video_crf", 23) or 23),
-            video_preset=str(getattr(settings, "video_preset", "medium") or "medium"),
-            aac_encoder=str(getattr(settings, "aac_encoder", "auto") or "auto"),
-            aac_mode=str(getattr(settings, "aac_mode", "cbr") or "cbr"),
-            aac_music_bitrate=int(
-                getattr(settings, "aac_music_bitrate", 192) or 192
-            ),
-            aac_vbr_level=int(getattr(settings, "aac_vbr_level", 4) or 4),
-            aac_spoken_bitrate=int(
-                getattr(settings, "aac_spoken_bitrate", 64) or 64
-            ),
-        )
+            smart_quality_by_type=bool(getattr(settings, "smart_quality_by_type", True)),
+            video_crf=_read_setting_int(settings, "video_crf", 23),
+            video_preset=_read_setting_str(settings, "video_preset", "medium"),
+            lossy_encoder=_read_setting_str(settings, "lossy_encoder", "auto"),
+            lossy_quality=_read_setting_str(settings, "lossy_quality", "balanced"),
+            bitrate_mode=_read_setting_str(settings, "bitrate_mode", "cbr"),
+            music_lossy_cbr_bitrate=_read_setting_int(settings, "music_lossy_cbr_bitrate", 192),
+            vbr_level=_read_setting_int(settings, "vbr_level", 4),
+            spoken_lossy_cbr_bitrate=_read_setting_int(settings, "spoken_lossy_cbr_bitrate", 64),
+            aac_cutoff=_read_setting_int(settings, "aac_cutoff", 0),
+            aac_tns=bool(getattr(settings, "aac_tns", True)),
+            aac_pns=bool(getattr(settings, "aac_pns", False)),
+            aac_ms_stereo=bool(getattr(settings, "aac_ms_stereo", True)),
+            aac_intensity_stereo=bool(getattr(settings, "aac_intensity_stereo", True)),
+            fdk_afterburner=bool(getattr(settings, "fdk_afterburner", True)),
+        ).normalized()
+
+
+@dataclass(frozen=True)
+class _ResolvedLossyPolicy:
+    """Lossy codec policy resolved from user preferences and ffmpeg availability."""
+
+    target: TranscodeTarget
+    encoder: str
 
 
 @dataclass(frozen=True)
@@ -137,11 +244,13 @@ class TranscodePlan:
     video_max_fps: int
     video_max_bitrate_kbps: int
     video_h264_level: str
-    aac_encoder: str = "aac"
-    aac_mode: str = "cbr"
-    aac_vbr_level: int = 4
-    aac_music_bitrate: int = 192
-    aac_spoken_bitrate: int = 64
+    lossy_encoder: str = "aac"       # resolved encoder (e.g. "libfdk_aac")
+    user_lossy_encoder: str = "auto"  # original user preference (e.g. "auto")
+    lossy_quality: str = "balanced"
+    bitrate_mode: str = "cbr"
+    music_lossy_cbr_bitrate: int = 192
+    vbr_level: int = 4
+    spoken_lossy_cbr_bitrate: int = 64
 
     @property
     def is_spoken(self) -> bool:
@@ -157,6 +266,8 @@ class TranscodePlan:
             return "alac"
         if self.target == TranscodeTarget.AAC:
             return "aac"
+        if self.target == TranscodeTarget.MP3:
+            return "mp3"
         if self.target == TranscodeTarget.VIDEO_H264:
             return "m4v"
         return self.source_path.suffix.lstrip(".")
@@ -164,7 +275,9 @@ class TranscodePlan:
     @property
     def cache_bitrate_kbps(self) -> Optional[int]:
         if self.target == TranscodeTarget.AAC:
-            return self._nominal_aac_bitrate(self.effective_quality)
+            return self._nominal_lossy_bitrate(self.effective_quality)
+        if self.target == TranscodeTarget.MP3:
+            return self._estimated_mp3_kbps()
         return None
 
     def estimate_output_size(self, *, source_size: int, duration_ms: int) -> int:
@@ -181,6 +294,10 @@ class TranscodePlan:
 
         if self.target == TranscodeTarget.AAC:
             bitrate_kbps = self._estimated_aac_kbps()
+            return int((duration_seconds * bitrate_kbps * 1000) / 8)
+
+        if self.target == TranscodeTarget.MP3:
+            bitrate_kbps = self._estimated_mp3_kbps()
             return int((duration_seconds * bitrate_kbps * 1000) / 8)
 
         if self.target == TranscodeTarget.ALAC:
@@ -202,24 +319,34 @@ class TranscodePlan:
         return source_size
 
     def _estimated_aac_kbps(self) -> int:
-        """Rough CBR bitrate (kbps) for the AAC output, mode-aware.
-
-        libfdk_aac in true VBR mode is driven by ``-vbr N`` and ignores the
-        configured ``aac_music_bitrate``, so fall back to a per-level table.
-        All other modes (cbr / abr / cvbr, and aac_at's vbr hint) target the
-        configured bitrate closely enough for a storage estimate.
-        """
         if self.is_spoken:
-            return self._nominal_aac_bitrate(self.effective_quality)
+            return self.spoken_lossy_cbr_bitrate
+        is_manual = self.user_lossy_encoder not in {"auto", ""}
+        if is_manual and self.bitrate_mode == "vbr":
+            if self.lossy_encoder == "libfdk_aac":
+                return _FDK_VBR_KBPS.get(_clamp_int(self.vbr_level, minimum=1, maximum=5), 128)
+            if self.lossy_encoder == "aac_at":
+                return _AAC_AT_VBR_Q_KBPS.get(_clamp_int(self.vbr_level, minimum=0, maximum=14), 128)
+        if is_manual:
+            return self.music_lossy_cbr_bitrate
+        return _QUALITY_MUSIC_KBPS.get(self.lossy_quality, 192)
 
-        if self.aac_encoder == "libfdk_aac" and self.aac_mode == "vbr":
-            # Approximate stereo kbps for libfdk_aac -vbr 1..5.
-            return _LIBFDK_VBR_KBPS.get(self.aac_vbr_level, 144)
+    def _estimated_mp3_kbps(self) -> int:
+        if self.is_spoken:
+            return self.spoken_lossy_cbr_bitrate
+        is_manual = self.user_lossy_encoder not in {"auto", ""}
+        if is_manual and self.bitrate_mode == "vbr" and self.lossy_encoder == "libmp3lame":
+            return _MP3_VBR_Q_KBPS.get(_clamp_int(self.vbr_level, minimum=0, maximum=9), 165)
+        if is_manual:
+            return self.music_lossy_cbr_bitrate
+        if self.lossy_encoder == "libmp3lame":
+            return _QUALITY_MP3_KBPS.get(self.lossy_quality, 130)
+        return _QUALITY_MUSIC_KBPS.get(self.lossy_quality, 192)
 
-        return self._nominal_aac_bitrate(self.effective_quality)
-
-    def _nominal_aac_bitrate(self, quality: str) -> int:
-        return self.aac_spoken_bitrate if quality == "spoken" else self.aac_music_bitrate
+    def _nominal_lossy_bitrate(self, quality: str) -> int:
+        if quality == "spoken":
+            return self.spoken_lossy_cbr_bitrate
+        return self._estimated_aac_kbps()
 
     def _estimated_video_kbps(self) -> int:
         """Rough CBR bitrate (kbps) for H.264 output at the plan's CRF.
@@ -254,25 +381,25 @@ def resolve_transcode_plan(
     specially; all other values are normalized to music quality.
     """
     source_path = Path(filepath)
-    options = options or TranscodeOptions()
+    options = (options or TranscodeOptions()).normalized()
     if prefer_lossy is None:
         prefer_lossy = options.prefer_lossy
 
-    target = get_transcode_target(source_path, prefer_lossy=prefer_lossy)
+    lossy_policy = _resolve_lossy_policy(options)
+    target = get_transcode_target(
+        source_path,
+        prefer_lossy=prefer_lossy,
+        options=options,
+    )
     normalize_sample_rate = options.normalize_sample_rate
     mono_for_spoken = options.mono_for_spoken
     smart_quality_by_type = options.smart_quality_by_type
 
-    effective_quality = "spoken" if aac_quality == "spoken" else "normal"
-    if smart_quality_by_type and target == TranscodeTarget.AAC:
-        media_type = _probe_media_type(source_path)
-        if media_type in _SPOKEN_STIK_VALUES:
-            effective_quality = "spoken"
-
-    aac_encoder_resolved = (
-        _resolve_encoder(options.aac_encoder, options.ffmpeg_path)
-        if target == TranscodeTarget.AAC
-        else "aac"
+    effective_quality = _resolve_effective_quality(
+        source_path,
+        target,
+        aac_quality=aac_quality,
+        smart_quality_by_type=smart_quality_by_type,
     )
 
     max_width, max_height, max_fps, max_bitrate_kbps, h264_level = _get_video_caps()
@@ -293,12 +420,36 @@ def resolve_transcode_plan(
         video_max_fps=max_fps,
         video_max_bitrate_kbps=max_bitrate_kbps,
         video_h264_level=h264_level,
-        aac_encoder=aac_encoder_resolved,
-        aac_mode=options.aac_mode,
-        aac_vbr_level=options.aac_vbr_level,
-        aac_music_bitrate=options.aac_music_bitrate,
-        aac_spoken_bitrate=options.aac_spoken_bitrate,
+        lossy_encoder=lossy_policy.encoder,
+        user_lossy_encoder=options.lossy_encoder,
+        lossy_quality=options.lossy_quality,
+        bitrate_mode=options.bitrate_mode,
+        music_lossy_cbr_bitrate=options.music_lossy_cbr_bitrate,
+        vbr_level=options.vbr_level,
+        spoken_lossy_cbr_bitrate=options.spoken_lossy_cbr_bitrate,
     )
+
+
+def _resolve_effective_quality(
+    source_path: Path,
+    target: TranscodeTarget,
+    *,
+    aac_quality: Optional[str],
+    smart_quality_by_type: bool,
+) -> str:
+    """Resolve legacy quality hint plus spoken-word auto-detection."""
+    if not smart_quality_by_type:
+        return "normal"
+
+    if _is_spoken_quality(aac_quality or ""):
+        return "spoken"
+
+    if target in {TranscodeTarget.AAC, TranscodeTarget.MP3}:
+        media_type = _probe_media_type(source_path)
+        if media_type in _SPOKEN_STIK_VALUES:
+            return "spoken"
+
+    return "normal"
 
 
 # ── Result ──────────────────────────────────────────────────────────────────
@@ -324,6 +475,7 @@ def clear_caches() -> None:
     """Clear cached settings/binary lookups. Call at the start of each sync."""
     _find_ffprobe.cache_clear()
     _best_aac_encoder.cache_clear()
+    _best_mp3_encoder.cache_clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -409,6 +561,43 @@ def _best_aac_encoder(ffmpeg_path: Optional[str] = None) -> str:
     return "aac"
 
 
+@lru_cache(maxsize=8)
+def available_mp3_encoders(ffmpeg_path: Optional[str] = None) -> set[str]:
+    """Return the set of MP3 encoders exposed by the current ffmpeg build."""
+    ffmpeg = find_ffmpeg(ffmpeg_path)
+    if not ffmpeg:
+        return set()
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-encoders"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=10, **_SP_KWARGS,
+        )
+        out = r.stdout
+        available: set[str] = set()
+        for encoder in ("libmp3lame", "libshine"):
+            if f" {encoder} " in out:
+                available.add(encoder)
+        return available
+    except Exception:
+        return set()
+
+
+@lru_cache(maxsize=8)
+def _best_mp3_encoder(ffmpeg_path: Optional[str] = None) -> str:
+    """Return the best available MP3 encoder.
+
+    Preference: libmp3lame > libshine.
+    """
+    available = available_mp3_encoders(ffmpeg_path)
+    for encoder in ("libmp3lame", "libshine"):
+        if encoder in available:
+            logger.info("Using MP3 encoder: %s", encoder)
+            return encoder
+    return "libmp3lame"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Probing
 # ═══════════════════════════════════════════════════════════════════════════
@@ -448,9 +637,16 @@ class AudioProperties:
     })
 
     def exceeds_ipod_limits(self) -> bool:
+        # ``bits_per_raw_sample`` from ffprobe is not meaningful for compressed
+        # codecs like AAC/MP3 and can report large internal decode precision
+        # (e.g. 24/32), which should not trigger an ALAC safety transcode.
+        # Enforce bit-depth only for codecs where source bit depth is real.
+        bit_depth_relevant = self.codec_name.lower() in {
+            "alac", "flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "wavpack"
+        }
         return (
             self.sample_rate > IPOD_MAX_SAMPLE_RATE
-            or self.bits_per_sample > IPOD_MAX_BIT_DEPTH
+            or (bit_depth_relevant and self.bits_per_sample > IPOD_MAX_BIT_DEPTH)
             or self.channels > IPOD_MAX_CHANNELS
         )
 
@@ -557,18 +753,6 @@ def _probe_duration_us(filepath: str | Path) -> int:
 # Target resolution — "what should this file become?"
 # ═══════════════════════════════════════════════════════════════════════════
 
-@lru_cache(maxsize=1)
-def _read_prefer_lossy() -> bool:
-    return False
-
-
-@lru_cache(maxsize=1)
-def _read_audio_settings() -> tuple[bool, bool, bool]:
-    """Return ``(normalize_sample_rate, mono_for_spoken, smart_quality_by_type)``
-    from settings, with safe defaults if settings are unavailable."""
-    return False, True, True
-
-
 # stik atom values that indicate spoken-word content.
 # Apple stik table: 0=Movie, 1=Normal(Music), 2=Audiobook, 5=Whacked Bookmark,
 # 6=Music Video, 9=Short Film, 10=TV Show, 11=Booklet, 14=Ringtone, 21=iTunes U,
@@ -666,6 +850,7 @@ def get_transcode_target(
     filepath: str | Path,
     *,
     prefer_lossy: Optional[bool] = None,
+    options: Optional[TranscodeOptions] = None,
 ) -> TranscodeTarget:
     """Determine the target format for *filepath*.
 
@@ -678,21 +863,23 @@ def get_transcode_target(
          or prefer_lossy wants to shrink a native ALAC
     """
     suffix = Path(filepath).suffix.lower()
+    options = (options or TranscodeOptions()).normalized()
+    lossy_target = _resolve_lossy_target(options)
 
     # ── Non-native video — always transcode ─────────────────────────────
     if suffix in _NON_NATIVE_VIDEO_EXTS:
         return TranscodeTarget.VIDEO_H264
 
     if prefer_lossy is None:
-        prefer_lossy = _read_prefer_lossy()
+        prefer_lossy = options.prefer_lossy
 
     # ── Non-native audio ────────────────────────────────────────────────
     if suffix in _NON_NATIVE_LOSSLESS_EXTS:
         if prefer_lossy or not _device_supports_alac():
-            return TranscodeTarget.AAC
+            return lossy_target
         return TranscodeTarget.ALAC
     if suffix in _NON_NATIVE_LOSSY_EXTS:
-        return TranscodeTarget.AAC
+        return lossy_target
 
     # ── Native formats ──────────────────────────────────────────────────
     if suffix in IPOD_NATIVE_FORMATS:
@@ -709,37 +896,37 @@ def get_transcode_target(
         # MP3 is safe to copy blind; M4A/AAC could be HE-AAC so re-encode.
         if not props.probe_ok:
             if suffix in {".m4a", ".m4b", ".aac"}:
-                logger.warning("TRANSCODE: could not probe %s — re-encoding to AAC as safe fallback",
+                logger.warning("TRANSCODE: could not probe %s — re-encoding to lossy codec as safe fallback",
                                Path(filepath).name)
-                return TranscodeTarget.AAC
+                return lossy_target
             logger.warning("TRANSCODE: could not probe %s — copying as-is", Path(filepath).name)
             return TranscodeTarget.COPY
 
         if props.exceeds_ipod_limits():
             if suffix in {".m4a", ".m4b"} and not prefer_lossy and _device_supports_alac():
                 return TranscodeTarget.ALAC
-            return TranscodeTarget.AAC
+            return lossy_target
 
         # HE-AAC v1/v2 — iPod only supports AAC-LC; re-encode to LC
         if props.is_incompatible_aac_profile():
             logger.info("TRANSCODE: %s has incompatible AAC profile %r — re-encoding to AAC-LC",
                         Path(filepath).name, props.profile)
-            return TranscodeTarget.AAC
+            return lossy_target
 
         # User wants to shrink native ALAC → AAC
         # (bits_per_sample ≥ 16 distinguishes ALAC from AAC which reports 0)
         if prefer_lossy and suffix in {".m4a", ".m4b"} and props.bits_per_sample >= 16:
-            return TranscodeTarget.AAC
+            return lossy_target
 
         # Device doesn't support ALAC: transcode native ALAC → AAC
         if (suffix in {".m4a", ".m4b"} and props.bits_per_sample >= 16
                 and not _device_supports_alac()):
-            return TranscodeTarget.AAC
+            return lossy_target
 
         return TranscodeTarget.COPY
 
     # Unknown extension — AAC is the safest bet
-    return TranscodeTarget.AAC
+    return lossy_target
 
 
 def needs_transcoding(
@@ -759,69 +946,157 @@ def quality_to_nominal_bitrate(
     quality: str,
     options: Optional[TranscodeOptions] = None,
 ) -> int:
-    """Return the nominal bitrate (kbps) for display / cache-key purposes.
-
-    Reads the user's configured bitrates from settings.  Falls back to
-    safe defaults if settings are unavailable.
-    """
+    """Return the nominal bitrate (kbps) for display / cache-key purposes."""
     options = options or TranscodeOptions()
     if quality == "spoken":
-        return options.aac_spoken_bitrate
-    return options.aac_music_bitrate
+        return options.spoken_lossy_cbr_bitrate
+    return _QUALITY_MUSIC_KBPS.get(options.lossy_quality, 192)
 
 
-def _resolve_encoder(
-    encoder_pref: str,
-    ffmpeg_path: Optional[str] = None,
-) -> str:
-    """Resolve 'auto' to the best available encoder name.
+def _is_spoken_quality(quality: str) -> bool:
+    return quality == "spoken"
 
-    When a specific encoder is requested but unavailable, falls back to
-    the best available encoder rather than failing silently.
+
+def _bitrate_for_quality(quality: str, options: TranscodeOptions) -> int:
+    if _is_spoken_quality(quality):
+        return options.spoken_lossy_cbr_bitrate
+    return _QUALITY_MUSIC_KBPS.get(options.lossy_quality, 192)
+
+
+def _resolve_lossy_policy(options: TranscodeOptions) -> _ResolvedLossyPolicy:
+    """Resolve lossy target and the concrete encoder name from user settings."""
+    pref = (options.lossy_encoder or "auto").lower()
+    ffmpeg_path = options.ffmpeg_path
+
+    if pref in {"libmp3lame", "libshine"}:
+        avail = available_mp3_encoders(ffmpeg_path)
+        encoder = pref if pref in avail else _best_mp3_encoder(ffmpeg_path)
+        return _ResolvedLossyPolicy(target=TranscodeTarget.MP3, encoder=encoder)
+
+    if pref in {"libfdk_aac", "aac_at", "aac"}:
+        avail = available_aac_encoders(ffmpeg_path)
+        encoder = pref if pref in avail else _best_aac_encoder(ffmpeg_path)
+        return _ResolvedLossyPolicy(target=TranscodeTarget.AAC, encoder=encoder)
+
+    # "auto" — use best available AAC encoder; only fall back to MP3 if no AAC at all
+    aac_avail = available_aac_encoders(ffmpeg_path)
+    if aac_avail:
+        return _ResolvedLossyPolicy(target=TranscodeTarget.AAC, encoder=_best_aac_encoder(ffmpeg_path))
+    if available_mp3_encoders(ffmpeg_path):
+        return _ResolvedLossyPolicy(target=TranscodeTarget.MP3, encoder=_best_mp3_encoder(ffmpeg_path))
+    return _ResolvedLossyPolicy(target=TranscodeTarget.AAC, encoder="aac")
+
+
+def _resolve_lossy_target(options: TranscodeOptions) -> TranscodeTarget:
+    """Resolve user lossy policy to AAC or MP3."""
+    return _resolve_lossy_policy(options).target
+
+
+def resolve_effective_encoder(options: TranscodeOptions) -> tuple[TranscodeTarget, str]:
+    """Return the (target, encoder) that will actually be used for *options*.
+
+    Checks ffmpeg availability and applies the same fallback logic as the
+    transcoder so callers can derive VBR/encoder flags without re-running
+    the full encode pipeline.
     """
-    if encoder_pref == "auto":
-        return _best_aac_encoder(ffmpeg_path)
-    # Validate: if the requested encoder isn't available, fall back to auto
-    available = available_aac_encoders(ffmpeg_path)
-    if encoder_pref in available:
-        return encoder_pref
-    logger.warning(
-        "Requested AAC encoder %r is not available; falling back to auto", encoder_pref
-    )
-    return _best_aac_encoder(ffmpeg_path)
+    policy = _resolve_lossy_policy(options.normalized())
+    return policy.target, policy.encoder
 
 
 def _aac_quality_args(
     quality: str,
     options: Optional[TranscodeOptions] = None,
+    *,
+    encoder: Optional[str] = None,
 ) -> list[str]:
-    """Build encoder-specific ffmpeg flags from user settings.
+    """Build encoder-specific ffmpeg flags from user settings."""
+    options = (options or TranscodeOptions()).normalized()
+    encoder = encoder or _best_aac_encoder(options.ffmpeg_path)
+    is_spoken = _is_spoken_quality(quality)
+    is_manual = options.lossy_encoder not in {"auto", ""}
 
-    ``quality`` is treated as a boolean: ``"spoken"`` selects the
-    spoken-word bitrate; anything else selects the music bitrate.
-    """
-    options = options or TranscodeOptions()
-    encoder = _resolve_encoder(options.aac_encoder, options.ffmpeg_path)
-    is_spoken = quality == "spoken"
-    bitrate = (
-        options.aac_spoken_bitrate if is_spoken else options.aac_music_bitrate
-    )
-    # Spoken-word transcodes always use CBR for compatibility.
-    mode = "cbr" if is_spoken else options.aac_mode
-    vbr_level = options.aac_vbr_level
-
-    if encoder == "libfdk_aac":
-        if mode == "vbr":
-            return ["-vbr", str(vbr_level), "-profile:a", "aac_low"]
-        return ["-b:a", f"{bitrate}k", "-profile:a", "aac_low"]
-
+    # ── aac_at: has its own CBR / ABR / VBR mode system ──────────
     if encoder == "aac_at":
-        _mode_map = {"cbr": "cbr", "cvbr": "cvbr", "abr": "abr", "vbr": "vbr"}
-        at_mode = _mode_map.get(mode, "cvbr")
-        return ["-aac_at_mode", at_mode, "-b:a", f"{bitrate}k"]
+        args: list[str] = []
+        if is_spoken:
+            args += ["-aac_at_mode", "cbr", "-b:a", f"{options.spoken_lossy_cbr_bitrate}k"]
+        elif is_manual and options.bitrate_mode == "vbr":
+            q = _clamp_int(options.vbr_level, minimum=0, maximum=14)
+            args += ["-aac_at_mode", "vbr", "-q:a", str(q)]
+        elif is_manual and options.bitrate_mode in ("abr", "cvbr"):
+            args += ["-aac_at_mode", options.bitrate_mode, "-b:a", f"{options.music_lossy_cbr_bitrate}k"]
+        elif is_manual:
+            args += ["-aac_at_mode", "cbr", "-b:a", f"{options.music_lossy_cbr_bitrate}k"]
+        else:
+            args += ["-aac_at_mode", "cbr", "-b:a", f"{_QUALITY_MUSIC_KBPS.get(options.lossy_quality, 192)}k"]
+        if is_manual and options.aac_cutoff > 0:
+            args += ["-cutoff", str(options.aac_cutoff)]
+        return args
 
-    # aac (native fallback): CBR only, disable PNS for better old-iPod compat
-    return ["-b:a", f"{bitrate}k", "-aac_pns", "0"]
+    args: list[str] = []
+
+    # ── Bitrate / VBR level (libfdk_aac and native aac) ───────
+    if is_spoken:
+        args += ["-b:a", f"{options.spoken_lossy_cbr_bitrate}k"]
+    elif is_manual and options.bitrate_mode == "vbr" and encoder == "libfdk_aac":
+        args += ["-vbr", str(_clamp_int(options.vbr_level, minimum=1, maximum=5))]
+    elif is_manual:
+        args += ["-b:a", f"{options.music_lossy_cbr_bitrate}k"]
+    else:
+        args += ["-b:a", f"{_QUALITY_MUSIC_KBPS.get(options.lossy_quality, 192)}k"]
+
+    # ── Encoder-specific flags ─────────────────────────────────
+    if encoder == "libfdk_aac":
+        args += ["-profile:a", "aac_low"]
+        if is_manual:
+            args += ["-afterburner", "1" if options.fdk_afterburner else "0"]
+            if options.aac_cutoff > 0:
+                args += ["-cutoff", str(options.aac_cutoff)]
+        else:
+            args += ["-afterburner", "1"]
+    else:
+        # Native aac
+        if is_manual:
+            args += ["-aac_pns", "1" if options.aac_pns else "0"]
+            args += ["-aac_tns", "1" if options.aac_tns else "0"]
+            args += ["-aac_ms",  "1" if options.aac_ms_stereo else "0"]
+            args += ["-aac_is",  "1" if options.aac_intensity_stereo else "0"]
+            if options.aac_cutoff > 0:
+                args += ["-cutoff", str(options.aac_cutoff)]
+        else:
+            args += ["-aac_pns", "0"]
+
+    return args
+
+
+def _mp3_quality_args(
+    quality: str,
+    options: Optional[TranscodeOptions] = None,
+    *,
+    encoder: Optional[str] = None,
+) -> list[str]:
+    """Build encoder-specific ffmpeg flags for MP3 output."""
+    options = (options or TranscodeOptions()).normalized()
+    encoder = encoder or _best_mp3_encoder(options.ffmpeg_path)
+    is_spoken = _is_spoken_quality(quality)
+    is_manual = options.lossy_encoder not in {"auto", ""}
+
+    if is_spoken:
+        return ["-b:a", f"{options.spoken_lossy_cbr_bitrate}k"]
+
+    if encoder == "libshine":
+        bitrate = options.music_lossy_cbr_bitrate if is_manual else _QUALITY_MUSIC_KBPS.get(options.lossy_quality, 192)
+        return ["-b:a", f"{bitrate}k"]
+
+    # libmp3lame
+    if is_manual and options.bitrate_mode == "vbr":
+        q = _clamp_int(options.vbr_level, minimum=0, maximum=9)
+        return ["-q:a", str(q)]
+    if is_manual:
+        return ["-b:a", f"{options.music_lossy_cbr_bitrate}k"]
+    # auto mode — VBR by quality preset
+    q = _QUALITY_MP3_VBR_Q.get(options.lossy_quality, 4)
+    return ["-q:a", str(q)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -869,34 +1144,68 @@ def _cmd_aac(
     normalize_sr: bool = False,
     mono: bool = False,
     options: Optional[TranscodeOptions] = None,
+    *,
+    encoder: Optional[str] = None,
 ) -> list[str]:
     props = probe_audio(src)
     target_sr = _target_sample_rate(props.sample_rate, normalize_sr)
     ar_args = ["-ar", str(target_sr)] if target_sr is not None else []
     # Mono downmix: spoken-word at 64 kbps sounds better in mono (~50% smaller)
     channels = 1 if mono else IPOD_MAX_CHANNELS
-    options = options or TranscodeOptions()
-    _enc = _resolve_encoder(options.aac_encoder, options.ffmpeg_path)
+    options = (options or TranscodeOptions()).normalized()
+    encoder = encoder or _best_aac_encoder(options.ffmpeg_path)
     return [
         ffmpeg, "-i", src,
         "-vn",
-        "-acodec", _enc,
+        "-acodec", encoder,
         *ar_args,
         "-ac", str(channels),
-        *_aac_quality_args(quality, options),
+        *_aac_quality_args(quality, options, encoder=encoder),
         "-movflags", "+faststart",
         "-y", dst,
     ]
 
 
-def _cmd_video(
-    ffmpeg: str, src: str, dst: str,
-    quality: str, crf: int, preset: str,
+def _cmd_mp3(
+    ffmpeg: str, src: str, dst: str, quality: str,
+    normalize_sr: bool = False,
+    mono: bool = False,
     options: Optional[TranscodeOptions] = None,
+    *,
+    encoder: Optional[str] = None,
 ) -> list[str]:
-    options = options or TranscodeOptions()
-    max_w, max_h, max_fps, max_bitrate, h264_level = _get_video_caps()
+    props = probe_audio(src)
+    target_sr = _target_sample_rate(props.sample_rate, normalize_sr)
+    ar_args = ["-ar", str(target_sr)] if target_sr is not None else []
+    channels = 1 if mono else IPOD_MAX_CHANNELS
+    options = (options or TranscodeOptions()).normalized()
+    encoder = encoder or _best_mp3_encoder(options.ffmpeg_path)
+    return [
+        ffmpeg, "-i", src,
+        "-vn",
+        "-acodec", encoder,
+        *ar_args,
+        "-ac", str(channels),
+        *_mp3_quality_args(quality, options, encoder=encoder),
+        "-id3v2_version", "3",
+        "-y", dst,
+    ]
 
+
+def _cmd_video(
+    ffmpeg: str,
+    src: str,
+    dst: str,
+    *,
+    crf: int,
+    preset: str,
+    max_w: int,
+    max_h: int,
+    max_fps: int,
+    max_bitrate: int,
+    h264_level: str,
+    audio_encoder: str,
+) -> list[str]:
     # Rotate portrait videos 90° CW when the target is landscape —
     # a tiny centred strip wastes most of the iPod's fixed-landscape screen.
     # passthrough=landscape means "leave landscape videos alone, only rotate
@@ -929,7 +1238,7 @@ def _cmd_video(
         "-vf", ",".join(vf_parts),
         "-crf", str(crf), "-preset", preset,
         *bitrate_args,
-        "-acodec", _resolve_encoder(options.aac_encoder, options.ffmpeg_path),
+        "-acodec", audio_encoder,
         "-ac", str(IPOD_MAX_CHANNELS),
         "-ar", str(IPOD_MAX_SAMPLE_RATE),
         "-b:a", "160k",
@@ -937,6 +1246,76 @@ def _cmd_video(
         "-f", "ipod",
         "-y", dst,
     ]
+
+
+def _resolve_lossy_runtime(plan: TranscodePlan) -> tuple[str, bool]:
+    """Resolve per-file lossy quality and downmix policy from a plan."""
+    if plan.smart_quality_by_type and plan.target in {TranscodeTarget.AAC, TranscodeTarget.MP3} and plan.is_spoken:
+        logger.debug(
+            "smart_quality_by_type: spoken-word tags detected for %s",
+            plan.source_path.name,
+        )
+
+    use_mono = (
+        plan.mono_for_spoken
+        and plan.is_spoken
+        and plan.target in {TranscodeTarget.AAC, TranscodeTarget.MP3}
+    )
+    return plan.effective_quality, use_mono
+
+
+def _build_ffmpeg_command(
+    ffmpeg: str,
+    source_path: Path,
+    output_path: Path,
+    plan: TranscodePlan,
+    options: TranscodeOptions,
+) -> list[str]:
+    """Build the ffmpeg command for the resolved transcode plan."""
+    src = str(source_path)
+    dst = str(output_path)
+    quality, use_mono = _resolve_lossy_runtime(plan)
+
+    if plan.target == TranscodeTarget.ALAC:
+        return _cmd_alac(ffmpeg, src, dst, normalize_sr=plan.normalize_sample_rate)
+
+    if plan.target == TranscodeTarget.AAC:
+        return _cmd_aac(
+            ffmpeg,
+            src,
+            dst,
+            quality,
+            normalize_sr=plan.normalize_sample_rate,
+            mono=use_mono,
+            options=options,
+            encoder=plan.lossy_encoder,
+        )
+
+    if plan.target == TranscodeTarget.MP3:
+        return _cmd_mp3(
+            ffmpeg,
+            src,
+            dst,
+            quality,
+            normalize_sr=plan.normalize_sample_rate,
+            mono=use_mono,
+            options=options,
+            encoder=plan.lossy_encoder,
+        )
+
+    return _cmd_video(
+        ffmpeg,
+        src,
+        dst,
+        crf=plan.video_crf,
+        preset=plan.video_preset,
+        max_w=plan.video_max_width,
+        max_h=plan.video_max_height,
+        max_fps=plan.video_max_fps,
+        max_bitrate=plan.video_max_bitrate_kbps,
+        h264_level=plan.video_h264_level,
+        audio_encoder=_best_aac_encoder(options.ffmpeg_path),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -962,7 +1341,7 @@ def transcode(
     """
     source_path = Path(source_path)
     output_dir = Path(output_dir)
-    options = options or TranscodeOptions()
+    options = (options or TranscodeOptions()).normalized()
 
     if not source_path.exists():
         return TranscodeResult(
@@ -1008,35 +1387,7 @@ def transcode(
 
     ext = plan.output_extension
     out = output_dir / (base_name + ext)
-    src, dst = str(source_path), str(out)
-
-    # Smart quality: override aac_quality for podcast/audiobook content types
-    effective_quality = plan.effective_quality
-    if plan.smart_quality_by_type and target == TranscodeTarget.AAC and plan.is_spoken:
-        logger.debug(
-            "smart_quality_by_type: spoken-word tags detected for %s",
-            source_path.name,
-        )
-
-    # Mono downmix: only for spoken-word AAC transcodes
-    use_mono = plan.mono_for_spoken and plan.is_spoken and target == TranscodeTarget.AAC
-
-    if target == TranscodeTarget.ALAC:
-        cmd = _cmd_alac(ffmpeg, src, dst, normalize_sr=plan.normalize_sample_rate)
-    elif target == TranscodeTarget.AAC:
-        cmd = _cmd_aac(ffmpeg, src, dst, effective_quality,
-                       normalize_sr=plan.normalize_sample_rate, mono=use_mono,
-                       options=options)
-    else:
-        cmd = _cmd_video(
-            ffmpeg,
-            src,
-            dst,
-            effective_quality,
-            plan.video_crf,
-            plan.video_preset,
-            options=options,
-        )
+    cmd = _build_ffmpeg_command(ffmpeg, source_path, out, plan, options)
 
     return _run_transcode(cmd, source_path, out, target, progress_callback,
                           is_cancelled=is_cancelled)
@@ -1092,7 +1443,8 @@ def _run_transcode(
             drain_t = _threading.Thread(target=_drain_stderr, daemon=True)
             drain_t.start()
 
-            # Poll so we can check cancellation every 0.5s
+            # Poll so we can check cancellation every 0.5s; enforce global timeout
+            deadline = time.monotonic() + timeout
             while proc.poll() is None:
                 if is_cancelled and is_cancelled():
                     proc.kill()
@@ -1102,6 +1454,15 @@ def _run_transcode(
                         success=False, source_path=source_path,
                         output_path=None, target_format=target,
                         was_transcoded=True, error_message="Cancelled",
+                    )
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    drain_t.join(timeout=5)
+                    return TranscodeResult(
+                        success=False, source_path=source_path,
+                        output_path=None, target_format=target,
+                        was_transcoded=True, error_message="Transcoding timed out",
                     )
                 try:
                     proc.wait(timeout=0.5)

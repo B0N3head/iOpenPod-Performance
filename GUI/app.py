@@ -54,6 +54,7 @@ from app_core.sync_plan_builder import (
     build_filtered_sync_plan,
     build_removal_sync_plan,
 )
+from app_core.sync_options import build_transcode_options
 from GUI.glyphs import glyph_pixmap
 from GUI.notifications import Notifier
 from GUI.styles import FONT_FAMILY, Colors, Metrics, btn_css
@@ -1035,6 +1036,7 @@ class MainWindow(QMainWindow):
                     ),
                     "fit_photo_thumbnails": settings.fit_photo_thumbnails,
                 },
+                transcode_options=build_transcode_options(settings),
             )
         )
         self._sync_worker.progress.connect(self.syncReview.update_progress)
@@ -1270,6 +1272,7 @@ class MainWindow(QMainWindow):
                     ),
                     "fit_photo_thumbnails": settings.fit_photo_thumbnails,
                 },
+                transcode_options=build_transcode_options(settings),
                 allowed_paths=frozenset(selected_track_paths),
             )
         )

@@ -72,6 +72,17 @@ class SettingRow(QFrame):
         widget.setStyleSheet(widget.styleSheet() + " background: transparent; border: none;")
         self._layout.addWidget(widget)
 
+    def set_override_warning(self, visible: bool) -> None:
+        """Show or hide a yellow 'overridden by device' warning under the title."""
+        if not hasattr(self, "_override_label"):
+            self._override_label = QLabel("Overridden by device settings")
+            self._override_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+            self._override_label.setStyleSheet(
+                f"color: {Colors.WARNING}; background: transparent; border: none;"
+            )
+            self._text_layout.addWidget(self._override_label)
+        self._override_label.setVisible(visible)
+
 
 class ToggleRow(SettingRow):
     """Setting row with a toggle switch (checkbox)."""
@@ -510,28 +521,23 @@ class ToolRow(SettingRow):
         super().__init__(title, description)
 
         # Optional inline status pills (used by FFmpeg row).
-        self._aac_pills_wrap = QWidget()
-        pills_layout = QHBoxLayout(self._aac_pills_wrap)
+        self._lossy_pills_wrap = QWidget()
+        pills_layout = QHBoxLayout(self._lossy_pills_wrap)
         pills_layout.setContentsMargins(0, 2, 0, 0)
         pills_layout.setSpacing((6))
 
-        self._aac_pills: dict[str, QLabel] = {}
-        pill_labels = {
-            "base": "AAC (native)",
-            "at": "AAC AudioToolbox",
-            "fdk": "libfdk_aac",
-        }
-        for key in ("base", "at", "fdk"):
-            pill = QLabel(pill_labels[key])
+        self._lossy_pills: dict[str, QLabel] = {}
+        for key in ("aac", "aac_at", "libfdk_aac", "libmp3lame", "libshine"):
+            pill = QLabel(key)
             pill.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
             pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
             pill.setMinimumWidth((104))
-            self._aac_pills[key] = pill
+            self._lossy_pills[key] = pill
             pills_layout.addWidget(pill)
         pills_layout.addStretch(1)
 
-        self._text_layout.addWidget(self._aac_pills_wrap)
-        self._aac_pills_wrap.hide()
+        self._text_layout.addWidget(self._lossy_pills_wrap)
+        self._lossy_pills_wrap.hide()
 
         right_layout = QHBoxLayout()
         right_layout.setSpacing((8))
@@ -580,10 +586,10 @@ class ToolRow(SettingRow):
         self.status_label.setText("Downloading…")
         self.status_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
 
-    def set_aac_encoder_statuses(self, statuses: dict[str, bool]):
-        """Update AAC encoder pills (base/at/fdk) for FFmpeg rows."""
+    def set_lossy_encoder_statuses(self, statuses: dict[str, bool]):
+        """Update lossy encoder pills (AAC + MP3) for FFmpeg rows."""
         any_visible = False
-        for key, pill in self._aac_pills.items():
+        for key, pill in self._lossy_pills.items():
             available = bool(statuses.get(key, False))
             if available:
                 pill.setStyleSheet(
@@ -610,7 +616,7 @@ class ToolRow(SettingRow):
                     """
                 )
             any_visible = True
-        self._aac_pills_wrap.setVisible(any_visible)
+        self._lossy_pills_wrap.setVisible(any_visible)
 
 
 class _TokenRow(SettingRow):
@@ -1233,48 +1239,58 @@ class SettingsPage(QWidget):
         )
 
     def _build_transcoding_page(self) -> QScrollArea:
-        self.aac_encoder = ComboRow(
-            "AAC Encoder",
-            "Which encoder FFmpeg uses. Auto picks the best available: "
-            "libfdk_aac (highest quality) > AudioToolbox (macOS only) > Built-in.",
-            options=["Auto", "libfdk_aac", "AudioToolbox (macOS)", "Built-in (aac)"],
+        self.lossy_encoder = ComboRow(
+            "Lossy Encoder",
+            "Choose which lossy encoder to use."
+            "Auto chooses the best available.",
+            options=[
+                "Auto",
+                "libfdk_aac",
+                "aac_at",
+                "aac",
+                "libmp3lame",
+                "libshine"
+            ],
             current="Auto",
         )
-        self.aac_quality_simple = ComboRow(
-            "Quality",
-            "Audio quality preset for music tracks. High = 256 kbps, "
-            "Normal = 192 kbps, Compact = 128 kbps. "
-            "For full control, switch the encoder above to a specific encoder.",
-            options=["High (256 kbps)", "Normal (192 kbps)", "Compact (128 kbps)"],
-            current="Normal (192 kbps)",
+        self.lossy_quality = ComboRow(
+            "Music Quality",
+            "Audio quality preset for music tracks. "
+            "High: 256 kbps / best VBR. Balanced: 192 kbps. Compact: 128 kbps / smaller VBR.",
+            options=["High Quality", "Balanced", "Compact"],
+            current="Balanced",
         )
-        self.aac_mode = ComboRow(
-            "Encoding Mode",
-            "CBR (Constant Bitrate) is recommended for best compatibility "
-            "with older iPods. VBR may cause instability on pre-Classic "
-            "iPods at higher quality levels.",
-            options=["CBR (Constant Bitrate)", "VBR (libfdk_aac only)"],
-            current="CBR (Constant Bitrate)",
+        self.bitrate_mode = ComboRow(
+            "Bitrate Mode",
+            "CBR uses a fixed target bitrate. VBR targets a quality level and lets "
+            "the encoder choose bitrate per frame — typically better quality per byte.",
+            options=["CBR", "VBR"],
+            current="CBR",
         )
-        self.aac_quality_value = ComboRow(
+        self.music_lossy_cbr_bitrate = ComboRow(
             "Music Bitrate",
-            "Target bitrate for music tracks. 256 kbps is the maximum "
-            "useful quality for AAC — higher bitrates waste storage.",
-            options=["64 kbps", "96 kbps", "128 kbps", "160 kbps",
-                     "192 kbps", "224 kbps", "256 kbps"],
+            "Target CBR bitrate for music tracks.",
+            options=["96 kbps", "128 kbps", "160 kbps", "192 kbps", "224 kbps", "256 kbps", "320 kbps"],
             current="192 kbps",
         )
-        self.aac_spoken_bitrate = ComboRow(
+        self.vbr_level = ComboRow(
+            "VBR Quality Level",
+            "Quality level for VBR encoding. Higher = better quality, larger files.",
+            options=["q0 (Best)", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9 (Smallest)"],
+            current="q4",
+        )
+        self.spoken_lossy_cbr_bitrate = ComboRow(
             "Spoken Word Bitrate",
-            "Bitrate for podcasts and audiobooks (always CBR). "
+            "Target bitrate for podcasts and audiobooks (Always uses CBR despite set Bitrate Mode). "
             "Pair with 'Mono for Spoken Word' for best results.",
             options=["32 kbps", "48 kbps", "64 kbps", "80 kbps", "96 kbps"],
             current="64 kbps",
         )
         self.prefer_lossy = ToggleRow(
             "Prefer Lossy Encoding",
-            "Encode lossless sources (FLAC, WAV, AIFF) as AAC instead of "
-            "ALAC. Saves iPod storage at the cost of quality.",
+            "Encode lossless sources (ALAC, FLAC, WAV, AIFF) as your selected "
+            "lossy format instead of ALAC. Saves iPod storage at the cost "
+            "of quality.",
         )
         self.video_crf = ComboRow(
             "Video Quality (CRF)",
@@ -1304,48 +1320,94 @@ class SettingsPage(QWidget):
         )
         self.mono_for_spoken = ToggleRow(
             "Mono for Spoken Word",
-            "Downmix to mono when encoding at Spoken Word quality (64 kbps). "
-            "Mono at 64 kbps sounds significantly better than stereo and "
-            "cuts podcast/audiobook file sizes by roughly 50%.",
+            "Downmix to mono when encoding podcasts and audiobooks. "
+            "Mono at lowbites sounds significantly better than stereo and "
+            "cuts file sizes in half.",
         )
         self.smart_quality_by_type = ToggleRow(
             "Smart Quality by Content Type",
-            "Automatically use Spoken Word quality for podcasts, audiobooks, "
-            "and iTunes U files. Music tracks always use the configured "
-            "AAC Quality preset.",
+            "Enable separate quality settings for podcasts and audiobooks."
+            "Music tracks are unaffected.",
         )
         self.normalize_sample_rate = ToggleRow(
             "Normalize to 44.1 kHz",
-            "Always output audio at 44,100 Hz (CD rate). "
-            "Recommended for early iPods (1G–4G) that can have playback "
-            "quirks with 48 kHz ALAC, and reduces file size for "
-            "hi-res (96/192 kHz) FLAC sources.",
+            "Always output audio at 44.1 kHz (CD rate). "
+            "Recommended for early iPods (1G-4G) that can have trouble with 48 kHz ALAC."
+            "When off, sample rate is reduced to 48 kHz as iPods can only decode 48 kHz or lower",
         )
 
-        # Wire reactive encoder/mode behaviour after all rows are created
-        self.aac_encoder.changed.connect(self._update_aac_mode_options)
-        self.aac_mode.changed.connect(self._update_aac_quality_value_row)
+        self.aac_cutoff = ComboRow(
+            "Bandwidth Cutoff",
+            "Maximum frequency the encoder will output. Lowering this (16–18 kHz) "
+            "frees bits for the mid-range and can eliminate high-frequency squeaks "
+            "at lower bitrates. Auto lets the encoder decide. Applies to all AAC encoders.",
+            options=["Auto", "20 kHz", "19 kHz", "18 kHz", "17 kHz", "16 kHz", "15 kHz"],
+            current="Auto",
+        )
+        self.fdk_afterburner = ToggleRow(
+            "libfdk_aac Afterburner",
+            "Enables a quality-enhancement post-processing pass in libfdk_aac. "
+            "Improves output at the cost of slightly longer encode times. "
+            "Only affects the libfdk_aac encoder.",
+        )
+        self.aac_tns = ToggleRow(
+            "Temporal Noise Shaping (TNS)",
+            "Shapes quantization noise around transients to reduce pre-echo "
+            "(smearing before drum hits). Disabling saves a few bits per block. "
+            "Affects the native aac encoder only.",
+        )
+        self.aac_pns = ToggleRow(
+            "Perceptual Noise Substitution (PNS)",
+            "Replaces noise-like frequency bands with synthetic noise, saving bits. "
+            "Can cause sandpaper or hissing artifacts if the encoder mistakes tonal "
+            "content for noise. Off by default. Affects the native aac encoder only.",
+        )
+        self.aac_ms_stereo = ToggleRow(
+            "Mid/Side Stereo",
+            "Encodes stereo as Sum (Mid) and Difference (Side) rather than Left/Right. "
+            "Concentrates bits where the signal is strongest, particularly on centred "
+            "content. Affects the native aac encoder only.",
+        )
+        self.aac_intensity_stereo = ToggleRow(
+            "Intensity Stereo",
+            "Merges high-frequency stereo bands into a single channel with direction "
+            "metadata. Saves bits at low bitrates but can cause stereo image wobble. "
+            "Affects the native aac encoder only.",
+        )
 
-        # Build audio card and store reference for later show/hide calls
         self._audio_card = _SettingsCard(
-            self.aac_encoder,
-            self.aac_quality_simple,
-            self.aac_mode,
-            self.aac_quality_value,
-            self.aac_spoken_bitrate,
+            self.lossy_encoder,
+            self.lossy_quality,
+            self.bitrate_mode,
+            self.music_lossy_cbr_bitrate,
+            self.vbr_level,
             self.prefer_lossy,
-            self.mono_for_spoken,
-            self.smart_quality_by_type,
             self.normalize_sample_rate,
         )
-        # Default state: auto encoder → show simple quality, hide advanced rows
-        self._audio_card.set_row_visible(self.aac_mode, False)
-        self._audio_card.set_row_visible(self.aac_quality_value, False)
+
+        self._spoken_card = _SettingsCard(
+            self.smart_quality_by_type,
+            self.spoken_lossy_cbr_bitrate,
+            self.mono_for_spoken,
+        )
+
+        self._advanced_aac_card = _SettingsCard(
+            self.aac_cutoff,
+            self.fdk_afterburner,
+            self.aac_tns,
+            self.aac_pns,
+            self.aac_ms_stereo,
+            self.aac_intensity_stereo,
+        )
 
         return self._make_page(
             "Transcoding",
             "Audio",
             self._audio_card,
+            "Spoken Word",
+            self._spoken_card,
+            "Advanced AAC",
+            self._advanced_aac_card,
             "Video",
             _SettingsCard(
                 self.video_crf,
@@ -1551,15 +1613,22 @@ class SettingsPage(QWidget):
             self.rotate_tall_photos,
             self.fit_photo_thumbnails,
             self.rating_strategy,
-            self.aac_encoder,
-            self.aac_quality_simple,
-            self.aac_mode,
-            self.aac_quality_value,
-            self.aac_spoken_bitrate,
+            self.lossy_encoder,
+            self.lossy_quality,
+            self.bitrate_mode,
+            self.music_lossy_cbr_bitrate,
+            self.vbr_level,
+            self.spoken_lossy_cbr_bitrate,
             self.prefer_lossy,
             self.mono_for_spoken,
             self.smart_quality_by_type,
             self.normalize_sample_rate,
+            self.aac_cutoff,
+            self.fdk_afterburner,
+            self.aac_tns,
+            self.aac_pns,
+            self.aac_ms_stereo,
+            self.aac_intensity_stereo,
             self.video_crf,
             self.video_preset,
             self.sync_workers,
@@ -1569,6 +1638,42 @@ class SettingsPage(QWidget):
         ]
         for row in rows:
             row.setEnabled(enabled)
+
+    def _device_overridable_rows(self) -> list:
+        return [
+            self.accent_color, self.show_art, self.write_back,
+            self.compute_sound_check, self.rotate_tall_photos,
+            self.fit_photo_thumbnails, self.rating_strategy,
+            self.lossy_encoder, self.lossy_quality, self.bitrate_mode,
+            self.music_lossy_cbr_bitrate, self.vbr_level,
+            self.spoken_lossy_cbr_bitrate, self.prefer_lossy,
+            self.mono_for_spoken, self.smart_quality_by_type,
+            self.normalize_sample_rate, self.aac_cutoff,
+            self.fdk_afterburner, self.aac_tns, self.aac_pns,
+            self.aac_ms_stereo, self.aac_intensity_stereo,
+            self.video_crf, self.video_preset, self.sync_workers,
+            self.scrobble_on_sync, self.listenbrainz_token_row,
+            self.backup_before_sync,
+        ]
+
+    def _update_override_warnings(self) -> None:
+        """Show yellow 'overridden by device' labels in global view when a device
+        has its own settings file and use_global_settings is off."""
+        if self._settings_scope != "global":
+            for row in self._device_overridable_rows():
+                row.set_override_warning(False)
+            return
+        ctx = self._current_device_context()
+        show = False
+        if ctx:
+            root, key = ctx
+            try:
+                state = self._settings_service.get_device_settings_for_edit(root, key)
+                show = state.exists and not state.use_global_settings
+            except Exception:
+                pass
+        for row in self._device_overridable_rows():
+            row.set_override_warning(show)
 
     def _apply_scope_visibility(self) -> None:
         """Show the settings that belong to the active Global/Device scope."""
@@ -1603,6 +1708,8 @@ class SettingsPage(QWidget):
             self._set_device_rows_enabled(False)
             self.use_global_settings.setEnabled(False)
             self.reset_device_settings.setEnabled(False)
+
+        self._update_override_warnings()
 
     # ── Settings I/O ────────────────────────────────────────────────────────
 
@@ -1720,51 +1827,44 @@ class SettingsPage(QWidget):
         if idx >= 0:
             self.max_backups.combo.setCurrentIndex(idx)
 
-        # AAC encoder — rebuild the combo with only available encoders first,
-        # then select the saved value (or fall back to Auto if unavailable).
-        enc_map = {"auto": "Auto", "libfdk_aac": "libfdk_aac",
-                   "aac_at": "AudioToolbox (macOS)", "aac": "Built-in (aac)"}
-        enc_text = enc_map.get(s.aac_encoder, "Auto")
-        enc_text = self._refresh_encoder_options(enc_text)
-        self._update_aac_mode_options(enc_text)
+        # Lossy encoder — also rebuilds bitrate_mode/vbr_level options for the encoder
+        desired_enc = "Auto" if s.lossy_encoder == "auto" else s.lossy_encoder
+        selected_enc = self._refresh_encoder_options(desired=desired_enc)
+        self._update_encoder_dependent_combos(selected_enc)
 
-        # Simple quality (auto mode)
-        if s.aac_music_bitrate >= 224:
-            simple_text = "High (256 kbps)"
-        elif s.aac_music_bitrate >= 160:
-            simple_text = "Normal (192 kbps)"
-        else:
-            simple_text = "Compact (128 kbps)"
-        idx = self.aac_quality_simple.combo.findText(simple_text)
+        # Lossy quality (Auto mode)
+        quality_display = {"high": "High Quality", "balanced": "Balanced", "compact": "Compact"}
+        q_text = quality_display.get(s.lossy_quality, "Balanced")
+        idx = self.lossy_quality.combo.findText(q_text)
         if idx >= 0:
-            self.aac_quality_simple.combo.setCurrentIndex(idx)
+            self.lossy_quality.combo.setCurrentIndex(idx)
 
-        # AAC mode (manual encoder)
-        mode_map = {"cbr": "CBR (Constant Bitrate)", "vbr": "VBR (libfdk_aac only)",
-                    "cvbr": "CVBR (Constrained VBR)", "abr": "ABR (Average Bitrate)",
-                    "vbr_at": "VBR (Variable Bitrate)"}
-        mode_text = mode_map.get(s.aac_mode, "CBR (Constant Bitrate)")
-        idx = self.aac_mode.combo.findText(mode_text)
+        # Bitrate mode (manual encoder mode)
+        bm_text = {"vbr": "VBR", "abr": "ABR", "cvbr": "CVBR"}.get(s.bitrate_mode, "CBR")
+        idx = self.bitrate_mode.combo.findText(bm_text)
         if idx >= 0:
-            self.aac_mode.combo.setCurrentIndex(idx)
-        self._update_aac_quality_value_row(mode_text)
+            self.bitrate_mode.combo.setCurrentIndex(idx)
 
-        # Music bitrate / VBR level (manual encoder)
-        if "VBR" in self.aac_quality_value.title_label.text():
-            vbr_map = {1: "1 (~64 kbps)", 2: "2 (~80 kbps)", 3: "3 (~112 kbps)",
-                       4: "4 (~144 kbps)", 5: "5 (~192–256 kbps)"}
-            q_text = vbr_map.get(s.aac_vbr_level, "4 (~144 kbps)")
-        else:
-            q_text = f"{s.aac_music_bitrate} kbps"
-        idx = self.aac_quality_value.combo.findText(q_text)
+        # Music CBR bitrate
+        cbr_text = f"{s.music_lossy_cbr_bitrate} kbps"
+        idx = self.music_lossy_cbr_bitrate.combo.findText(cbr_text)
         if idx >= 0:
-            self.aac_quality_value.combo.setCurrentIndex(idx)
+            self.music_lossy_cbr_bitrate.combo.setCurrentIndex(idx)
+
+        # VBR level
+        vbr_text = self._vbr_level_to_text(selected_enc, s.vbr_level)
+        idx = self.vbr_level.combo.findText(vbr_text)
+        if idx >= 0:
+            self.vbr_level.combo.setCurrentIndex(idx)
+
+        self._update_lossy_visibility()
+        self._update_advanced_aac_visibility(selected_enc)
 
         # Spoken word bitrate
-        spk_text = f"{s.aac_spoken_bitrate} kbps"
-        idx = self.aac_spoken_bitrate.combo.findText(spk_text)
+        spk_text = f"{s.spoken_lossy_cbr_bitrate} kbps"
+        idx = self.spoken_lossy_cbr_bitrate.combo.findText(spk_text)
         if idx >= 0:
-            self.aac_spoken_bitrate.combo.setCurrentIndex(idx)
+            self.spoken_lossy_cbr_bitrate.combo.setCurrentIndex(idx)
 
         # Prefer lossy toggle
         self.prefer_lossy.value = s.prefer_lossy
@@ -1773,6 +1873,21 @@ class SettingsPage(QWidget):
         self.mono_for_spoken.value = s.mono_for_spoken
         self.smart_quality_by_type.value = s.smart_quality_by_type
         self.normalize_sample_rate.value = s.normalize_sample_rate
+
+        # Advanced AAC
+        cutoff_display = {0: "Auto", 15000: "15 kHz", 16000: "16 kHz", 17000: "17 kHz",
+                          18000: "18 kHz", 19000: "19 kHz", 20000: "20 kHz"}
+        c_text = cutoff_display.get(s.aac_cutoff, "Auto")
+        idx = self.aac_cutoff.combo.findText(c_text)
+        if idx >= 0:
+            self.aac_cutoff.combo.setCurrentIndex(idx)
+        self.fdk_afterburner.value = s.fdk_afterburner
+        self.aac_tns.value = s.aac_tns
+        self.aac_pns.value = s.aac_pns
+        self.aac_ms_stereo.value = s.aac_ms_stereo
+        self.aac_intensity_stereo.value = s.aac_intensity_stereo
+
+        self._update_smart_quality_visibility()
 
         # Video CRF → combo text
         crf_map = {18: "18 (High)", 20: "20 (Good)", 23: "23 (Balanced)", 26: "26 (Low)", 28: "28 (Very Low)"}
@@ -1805,15 +1920,25 @@ class SettingsPage(QWidget):
             self.rotate_tall_photos.changed.connect(self._save)
             self.fit_photo_thumbnails.changed.connect(self._save)
             self.rating_strategy.changed.connect(self._save)
-            self.aac_encoder.changed.connect(self._save)
-            self.aac_quality_simple.changed.connect(self._save)
-            self.aac_mode.changed.connect(self._save)
-            self.aac_quality_value.changed.connect(self._save)
-            self.aac_spoken_bitrate.changed.connect(self._save)
+            self.lossy_encoder.changed.connect(self._save)
+            self.lossy_encoder.changed.connect(self._on_encoder_changed)
+            self.lossy_quality.changed.connect(self._save)
+            self.bitrate_mode.changed.connect(self._save)
+            self.bitrate_mode.changed.connect(self._on_bitrate_mode_changed)
+            self.music_lossy_cbr_bitrate.changed.connect(self._save)
+            self.vbr_level.changed.connect(self._save)
+            self.spoken_lossy_cbr_bitrate.changed.connect(self._save)
             self.prefer_lossy.changed.connect(self._save)
             self.mono_for_spoken.changed.connect(self._save)
             self.smart_quality_by_type.changed.connect(self._save)
+            self.smart_quality_by_type.changed.connect(self._update_smart_quality_visibility)
             self.normalize_sample_rate.changed.connect(self._save)
+            self.aac_cutoff.changed.connect(self._save)
+            self.fdk_afterburner.changed.connect(self._save)
+            self.aac_tns.changed.connect(self._save)
+            self.aac_pns.changed.connect(self._save)
+            self.aac_ms_stereo.changed.connect(self._save)
+            self.aac_intensity_stereo.changed.connect(self._save)
             self.video_crf.changed.connect(self._save)
             self.video_preset.changed.connect(self._save)
             self.sync_workers.changed.connect(self._save)
@@ -1834,129 +1959,170 @@ class SettingsPage(QWidget):
             self.scrobble_on_sync.changed.connect(self._save)
         self._loading_settings = False
 
-    # ── AAC encoder reactive helpers ─────────────────────────────────────────
+    # ── Lossy encoder reactive helpers ───────────────────────────────────────
 
     def _refresh_encoder_options(self, desired: str = "Auto") -> str:
-        """Repopulate the AAC encoder combo with only available encoders.
-
-        Queries ``available_aac_encoders()`` (cached after first call) and
-        rebuilds the combo so the user can only pick what their ffmpeg build
-        actually supports. If *desired* names an encoder that isn't available,
-        returns ``"Auto"`` so the caller can update downstream rows.
-
-        Returns the encoder text that was actually selected.
-        """
+        """Repopulate the lossy encoder combo based on what ffmpeg actually supports."""
+        aac_avail: set[str] = set()
+        mp3_avail: set[str] = set()
         try:
-            from SyncEngine.transcoder import available_aac_encoders, find_ffmpeg
-            settings = self._settings_service.get_effective_settings()
-            ffmpeg_ok = bool(find_ffmpeg(settings.ffmpeg_path))
-            available = available_aac_encoders(settings.ffmpeg_path) if ffmpeg_ok else set()
+            from SyncEngine.transcoder import (
+                available_aac_encoders,
+                available_mp3_encoders,
+                find_ffmpeg,
+            )
+            ffmpeg_path = self._settings_service.get_effective_settings().ffmpeg_path
+            if find_ffmpeg(ffmpeg_path):
+                aac_avail = set(available_aac_encoders(ffmpeg_path))
+                mp3_avail = set(available_mp3_encoders(ffmpeg_path))
         except Exception:
-            available = set()
+            pass
 
-        # Map display name → internal key for each candidate encoder.
-        candidates = [
-            ("libfdk_aac", "libfdk_aac"),
-            ("AudioToolbox (macOS)", "aac_at"),
-            ("Built-in (aac)", "aac"),
-        ]
-        options = ["Auto"] + [
-            label for label, key in candidates if key in available
-        ]
+        options = ["Auto"]
+        for enc in ("libfdk_aac", "aac_at", "aac"):
+            if enc in aac_avail:
+                options.append(enc)
+        for enc in ("libmp3lame", "libshine"):
+            if enc in mp3_avail:
+                options.append(enc)
+        if len(options) == 1:
+            options += ["libfdk_aac", "aac_at", "aac", "libmp3lame", "libshine"]
 
-        combo = self.aac_encoder.combo
+        combo = self.lossy_encoder.combo
         combo.blockSignals(True)
         combo.clear()
         combo.addItems(options)
+        idx = combo.findText(desired) if desired in options else 0
+        combo.setCurrentIndex(idx)
         combo.blockSignals(False)
+        return options[idx]
 
-        # Use desired value if it's present; otherwise fall back to Auto.
-        if desired in options:
-            idx = combo.findText(desired)
-            combo.blockSignals(True)
-            combo.setCurrentIndex(idx)
-            combo.blockSignals(False)
-            return desired
+    def _update_encoder_dependent_combos(self, encoder_text: str) -> None:
+        """Repopulate bitrate_mode and vbr_level combos to match the selected encoder."""
+        if encoder_text == "aac_at":
+            bm_options = ["CBR", "ABR", "CVBR", "VBR"]
+        elif encoder_text in ("libfdk_aac", "libmp3lame"):
+            bm_options = ["CBR", "VBR"]
         else:
-            combo.blockSignals(True)
-            combo.setCurrentIndex(0)  # Auto
-            combo.blockSignals(False)
-            return "Auto"
+            bm_options = ["CBR"]
 
-    def _update_aac_mode_options(self, encoder_text: str) -> None:
-        """Show simple quality row for Auto; show advanced rows for a specific encoder."""
-        is_auto = encoder_text == "Auto"
+        bm_combo = self.bitrate_mode.combo
+        current_bm = bm_combo.currentText()
+        bm_combo.blockSignals(True)
+        bm_combo.clear()
+        bm_combo.addItems(bm_options)
+        idx = bm_combo.findText(current_bm)
+        bm_combo.setCurrentIndex(max(0, idx))
+        bm_combo.blockSignals(False)
 
-        if hasattr(self, "_audio_card"):
-            self._audio_card.set_row_visible(self.aac_quality_simple, is_auto)
-            self._audio_card.set_row_visible(self.aac_mode, not is_auto)
-            self._audio_card.set_row_visible(self.aac_quality_value, not is_auto)
-
-        if not is_auto:
-            # Carry the simple quality preset's implied bitrate to the advanced combo
-            simple_map = {"High (256 kbps)": "256 kbps", "Normal (192 kbps)": "192 kbps",
-                          "Compact (128 kbps)": "128 kbps"}
-            implied_br = simple_map.get(self.aac_quality_simple.value)
-            if implied_br:
-                idx = self.aac_quality_value.combo.findText(implied_br)
-                if idx >= 0:
-                    self.aac_quality_value.combo.setCurrentIndex(idx)
-
-            mode_combo = self.aac_mode.combo
-            prev = mode_combo.currentText()
-            mode_combo.blockSignals(True)
-            mode_combo.clear()
-            if "AudioToolbox" in encoder_text:
-                mode_combo.addItems([
-                    "CBR (Constant Bitrate)", "CVBR (Constrained VBR)",
-                    "ABR (Average Bitrate)", "VBR (Variable Bitrate)",
-                ])
-            elif "Built-in" in encoder_text:
-                mode_combo.addItems(["CBR (Constant Bitrate)"])
-            else:  # libfdk_aac
-                mode_combo.addItems(["CBR (Constant Bitrate)", "VBR (libfdk_aac only)"])
-            idx = mode_combo.findText(prev)
-            mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            mode_combo.blockSignals(False)
-            self._update_aac_quality_value_row(mode_combo.currentText())
-
-    def _update_aac_quality_value_row(self, mode_text: str) -> None:
-        """Swap the quality-value row between bitrate options and VBR levels."""
-        # Only libfdk_aac uses true VBR quality levels. AudioToolbox VBR
-        # still uses a target bitrate, so show the bitrate picker for it.
-        is_fdk_vbr = mode_text == "VBR (libfdk_aac only)"
-        is_vbr = is_fdk_vbr
-        row = self.aac_quality_value
-        combo = row.combo
-        prev = combo.currentText()
-        combo.blockSignals(True)
-        combo.clear()
-        if is_vbr:
-            row.title_label.setText("VBR Quality Level")
-            row.desc_label.setText(
-                "libfdk_aac VBR quality level (1 = lowest, 5 = highest). "
-                "Level 5 can spike above 256 kbps and may cause instability "
-                "on pre-Classic iPods."
-            )
-            combo.addItems([
-                "1 (~64 kbps)", "2 (~80 kbps)", "3 (~112 kbps)",
-                "4 (~144 kbps)", "5 (~192–256 kbps)",
+        vbr_combo = self.vbr_level.combo
+        current_vbr = vbr_combo.currentText()
+        vbr_combo.blockSignals(True)
+        vbr_combo.clear()
+        if encoder_text == "libfdk_aac":
+            vbr_combo.addItems([
+                "VBR 1 (Low)", "VBR 2", "VBR 3", "VBR 4", "VBR 5 (High)",
             ])
-            default = "4 (~144 kbps)"
+            default_idx = 3  # VBR 4
+        elif encoder_text == "aac_at":
+            vbr_combo.addItems([
+                "q0 (Best)", "q1", "q2", "q3", "q4", "q5", "q6", "q7",
+                "q8", "q9", "q10", "q11", "q12", "q13", "q14 (Lowest)",
+            ])
+            default_idx = 9  # q9 mid-range
         else:
-            row.title_label.setText("Music Bitrate")
-            row.desc_label.setText(
-                "Target bitrate for music tracks. 256 kbps is the maximum "
-                "useful quality for AAC — higher bitrates waste storage."
-            )
-            combo.addItems([
-                "64 kbps", "96 kbps", "128 kbps", "160 kbps",
-                "192 kbps", "224 kbps", "256 kbps",
+            vbr_combo.addItems([
+                "q0 (Best)", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9 (Smallest)",
             ])
-            default = "192 kbps"
-        idx = combo.findText(prev)
-        combo.setCurrentIndex(idx if idx >= 0 else combo.findText(default))
-        combo.blockSignals(False)
+            default_idx = 4  # q4
+        idx = vbr_combo.findText(current_vbr)
+        vbr_combo.setCurrentIndex(idx if idx >= 0 else default_idx)
+        vbr_combo.blockSignals(False)
+
+    def _update_lossy_visibility(self) -> None:
+        """Show/hide rows based on current encoder and bitrate_mode selections."""
+        if not hasattr(self, "_audio_card"):
+            return
+        enc = self.lossy_encoder.value
+        is_auto = enc == "Auto"
+        is_vbr = self.bitrate_mode.value == "VBR"
+        self._audio_card.set_row_visible(self.lossy_quality, is_auto)
+        self._audio_card.set_row_visible(self.bitrate_mode, not is_auto)
+        self._audio_card.set_row_visible(self.music_lossy_cbr_bitrate, not is_auto and not is_vbr)
+        self._audio_card.set_row_visible(self.vbr_level, not is_auto and is_vbr)
+
+    def _on_encoder_changed(self, encoder_text: str) -> None:
+        self._update_encoder_dependent_combos(encoder_text)
+        self._update_lossy_visibility()
+        self._update_advanced_aac_visibility(encoder_text)
+
+    def _update_advanced_aac_visibility(self, encoder_text: str) -> None:
+        if not hasattr(self, "_advanced_aac_card"):
+            return
+        is_fdk = encoder_text == "libfdk_aac"
+        is_native = encoder_text == "aac"
+        is_specific_aac = encoder_text in ("libfdk_aac", "aac_at", "aac")
+
+        # Only show for a manually chosen AAC encoder
+        self._advanced_aac_card.setVisible(is_specific_aac)
+        self._set_section_visible("Transcoding", "Advanced AAC", is_specific_aac)
+        if not is_specific_aac:
+            return
+
+        # Bandwidth cutoff applies to every specific AAC encoder
+        self._advanced_aac_card.set_row_visible(self.aac_cutoff, True)
+
+        # fdk_afterburner is only meaningful for libfdk_aac
+        self._advanced_aac_card.set_row_visible(self.fdk_afterburner, is_fdk)
+
+        # PNS / TNS / M/S / IS are only controllable on the native aac encoder
+        self._advanced_aac_card.set_row_visible(self.aac_tns,               is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_pns,               is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_ms_stereo,         is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_intensity_stereo,  is_native)
+
+    def _on_bitrate_mode_changed(self, _: str) -> None:
+        self._update_lossy_visibility()
+
+    def _update_smart_quality_visibility(self) -> None:
+        if not hasattr(self, "_spoken_card"):
+            return
+        enabled = self.smart_quality_by_type.value
+        self._spoken_card.set_row_visible(self.spoken_lossy_cbr_bitrate, enabled)
+        self._spoken_card.set_row_visible(self.mono_for_spoken, enabled)
+
+    @staticmethod
+    def _vbr_text_to_level(encoder: str, text: str) -> int:
+        if encoder == "libfdk_aac":
+            try:
+                return int(text.split()[1])
+            except (IndexError, ValueError):
+                return 4
+        elif encoder == "aac_at":
+            try:
+                return max(0, min(14, int(text.lstrip("q").split()[0])))
+            except (IndexError, ValueError):
+                return 9
+        else:
+            try:
+                return int(text.lstrip("q").split()[0])
+            except (IndexError, ValueError):
+                return 4
+
+    @staticmethod
+    def _vbr_level_to_text(encoder: str, level: int) -> str:
+        if encoder == "libfdk_aac":
+            l = max(1, min(5, level))
+            labels = {1: "VBR 1 (Low)", 5: "VBR 5 (High)"}
+            return labels.get(l, f"VBR {l}")
+        elif encoder == "aac_at":
+            q = max(0, min(14, level))
+            labels = {0: "q0 (Best)", 14: "q14 (Lowest)"}
+            return labels.get(q, f"q{q}")
+        else:
+            q = max(0, min(9, level))
+            labels = {0: "q0 (Best)", 9: "q9 (Smallest)"}
+            return labels.get(q, f"q{q}")
 
     # ── Settings persistence ─────────────────────────────────────────────────
 
@@ -1977,6 +2143,20 @@ class SettingsPage(QWidget):
         s.rating_conflict_strategy = strategy_keys.get(self.rating_strategy.value, "ipod_wins")
 
         s.scrobble_on_sync = self.scrobble_on_sync.value
+
+        # Lossy encoder
+        enc_text = self.lossy_encoder.value
+        s.lossy_encoder = "auto" if enc_text == "Auto" else enc_text
+
+        # Lossy quality (Auto mode preset)
+        quality_keys = {"High Quality": "high", "Balanced": "balanced", "Compact": "compact"}
+        s.lossy_quality = quality_keys.get(self.lossy_quality.value, "balanced")
+
+        # Manual encoder settings
+        s.bitrate_mode = {"VBR": "vbr", "ABR": "abr", "CVBR": "cvbr"}.get(self.bitrate_mode.value, "cbr")
+        cbr_str = self.music_lossy_cbr_bitrate.value.replace(" kbps", "")
+        s.music_lossy_cbr_bitrate = int(cbr_str) if cbr_str.isdigit() else 192
+        s.vbr_level = self._vbr_text_to_level(enc_text, self.vbr_level.value)
 
         s.show_art_in_tracklist = self.show_art.value
 
@@ -2022,35 +2202,8 @@ class SettingsPage(QWidget):
             mb_text = self.max_backups.value
             s.max_backups = int(mb_text) if mb_text and mb_text != "Unlimited" else 0
 
-        # AAC encoder / mode / bitrate
-        enc_key_map = {"Auto": "auto", "libfdk_aac": "libfdk_aac",
-                       "AudioToolbox (macOS)": "aac_at", "Built-in (aac)": "aac"}
-        s.aac_encoder = enc_key_map.get(self.aac_encoder.value, "auto")
-
-        if s.aac_encoder == "auto":
-            # Simple quality preset → bitrate (always CBR in auto mode)
-            simple_map = {"High (256 kbps)": 256, "Normal (192 kbps)": 192,
-                          "Compact (128 kbps)": 128}
-            s.aac_music_bitrate = simple_map.get(self.aac_quality_simple.value, 192)
-            s.aac_mode = "cbr"
-        else:
-            mode_key_map = {"CBR (Constant Bitrate)": "cbr", "VBR (libfdk_aac only)": "vbr",
-                            "CVBR (Constrained VBR)": "cvbr", "ABR (Average Bitrate)": "abr",
-                            "VBR (Variable Bitrate)": "vbr"}
-            s.aac_mode = mode_key_map.get(self.aac_mode.value, "cbr")
-
-            qv = self.aac_quality_value.value
-            if "~" in qv:
-                # VBR level — parse leading digit
-                vbr_str = qv[:1]
-                s.aac_vbr_level = int(vbr_str) if vbr_str.isdigit() else 4
-            else:
-                # CBR bitrate — parse leading integer
-                br_str = qv.replace(" kbps", "")
-                s.aac_music_bitrate = int(br_str) if br_str.isdigit() else 192
-
-        spk_str = self.aac_spoken_bitrate.value.replace(" kbps", "")
-        s.aac_spoken_bitrate = int(spk_str) if spk_str.isdigit() else 64
+        spk_str = self.spoken_lossy_cbr_bitrate.value.replace(" kbps", "")
+        s.spoken_lossy_cbr_bitrate = int(spk_str) if spk_str.isdigit() else 64
 
         # Prefer lossy toggle
         s.prefer_lossy = self.prefer_lossy.value
@@ -2059,6 +2212,16 @@ class SettingsPage(QWidget):
         s.mono_for_spoken = self.mono_for_spoken.value
         s.smart_quality_by_type = self.smart_quality_by_type.value
         s.normalize_sample_rate = self.normalize_sample_rate.value
+
+        # Advanced AAC
+        cutoff_keys = {"Auto": 0, "15 kHz": 15000, "16 kHz": 16000, "17 kHz": 17000,
+                       "18 kHz": 18000, "19 kHz": 19000, "20 kHz": 20000}
+        s.aac_cutoff = cutoff_keys.get(self.aac_cutoff.value, 0)
+        s.fdk_afterburner = self.fdk_afterburner.value
+        s.aac_tns = self.aac_tns.value
+        s.aac_pns = self.aac_pns.value
+        s.aac_ms_stereo = self.aac_ms_stereo.value
+        s.aac_intensity_stereo = self.aac_intensity_stereo.value
 
         # Parse video CRF (extract leading integer)
         crf_text = self.video_crf.value
@@ -2365,18 +2528,25 @@ class SettingsPage(QWidget):
 
     def _refresh_tool_status(self):
         """Check whether ffmpeg and fpcalc are reachable and update the UI."""
-        from SyncEngine.transcoder import find_ffmpeg, available_aac_encoders
+        from SyncEngine.transcoder import (
+            find_ffmpeg,
+            available_aac_encoders,
+            available_mp3_encoders,
+        )
         from SyncEngine.audio_fingerprint import find_fpcalc
 
         settings = self._settings_service.get_effective_settings()
         ffmpeg = find_ffmpeg(settings.ffmpeg_path)
         self.ffmpeg_tool.set_status(bool(ffmpeg), ffmpeg or "")
-        enc = available_aac_encoders(settings.ffmpeg_path) if ffmpeg else set()
-        self.ffmpeg_tool.set_aac_encoder_statuses(
+        aac_enc = available_aac_encoders(settings.ffmpeg_path) if ffmpeg else set()
+        mp3_enc = available_mp3_encoders(settings.ffmpeg_path) if ffmpeg else set()
+        self.ffmpeg_tool.set_lossy_encoder_statuses(
             {
-                "base": "aac" in enc,
-                "at": "aac_at" in enc,
-                "fdk": "libfdk_aac" in enc,
+                "aac": "aac" in aac_enc,
+                "aac_at": "aac_at" in aac_enc,
+                "libfdk_aac": "libfdk_aac" in aac_enc,
+                "libmp3lame": "libmp3lame" in mp3_enc,
+                "libshine": "libshine" in mp3_enc,
             }
         )
 

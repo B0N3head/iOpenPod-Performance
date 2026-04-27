@@ -508,6 +508,7 @@ class SyncDiffRequest:
     allowed_paths: frozenset[str] | None = None
     fpcalc_path: str = ""
     photo_sync_settings: dict[str, bool] | None = None
+    transcode_options: Any = None
 
 
 class SyncDiffWorker(QThread):
@@ -535,6 +536,7 @@ class SyncDiffWorker(QThread):
                 supports_podcast=request.supports_podcast,
                 fpcalc_path=request.fpcalc_path,
                 photo_sync_settings=request.photo_sync_settings,
+                transcode_options=request.transcode_options,
             )
 
             plan = diff_engine.compute_diff(

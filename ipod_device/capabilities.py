@@ -145,7 +145,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "1st Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
-        supports_alac=False,
+        supports_alac=True,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -153,7 +153,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "2nd Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
-        supports_alac=False,
+        supports_alac=True,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -161,7 +161,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     ("iPod", "3rd Gen"): DeviceCapabilities(
         supports_podcast=False,
         supports_artwork=False,
-        supports_alac=False,
+        supports_alac=True,
         has_screen=True,
         music_dirs=20,
         db_version=0x13,
@@ -360,7 +360,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
     # ── iPod Mini ─────────────────────────────────────────────────────
     ("iPod Mini", "1st Gen"): DeviceCapabilities(
         supports_artwork=False,
-        supports_alac=False,
+        supports_alac=True,
         music_dirs=6,
         db_version=0x13,
     ),

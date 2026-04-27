@@ -452,7 +452,7 @@ class SyncExecutor:
                 disk = shutil.disk_usage(self.ipod_path)
 
                 # Updates can increase file size (e.g., re-encoding to a higher
-                # AAC bitrate). Account for positive growth so we fail early
+                # lossy bitrate). Account for positive growth so we fail early
                 # instead of deleting/replacing tracks until space runs out.
                 update_growth = 0
                 for item in ctx.plan.to_update_file:
@@ -1088,14 +1088,18 @@ class SyncExecutor:
                     existing_track.filetype = ext
 
                 if was_transcoded:
-                    if ext in ("m4a", "aac") and ext != "alac":
+                    if ext in ("m4a", "aac", "mp3") and ext != "alac":
                         plan = resolve_transcode_plan(
                             source_path,
                             options=self.transcode_options,
                         )
-                        existing_track.bitrate = quality_to_nominal_bitrate(
-                            plan.effective_quality,
-                            self.transcode_options,
+                        existing_track.bitrate = (
+                            plan.cache_bitrate_kbps
+                            if plan.cache_bitrate_kbps is not None
+                            else quality_to_nominal_bitrate(
+                                plan.effective_quality,
+                                self.transcode_options,
+                            )
                         )
 
                 if item.pc_track.duration_ms:
@@ -2040,6 +2044,7 @@ class SyncExecutor:
         return pc_track_to_info(
             pc_track, ipod_location, was_transcoded,
             ipod_file_path=ipod_file_path,
+            transcode_options=self.transcode_options if was_transcoded else None,
         )
 
     @staticmethod

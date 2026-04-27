@@ -76,7 +76,7 @@ class CachedFile:
 
     fingerprint: str        # Acoustic fingerprint of source audio
     source_format: str      # Original file extension (flac, wav, …)
-    target_format: str      # Transcoded format (alac, aac)
+    target_format: str      # Transcoded format (alac, aac, mp3)
     filename: str           # Filename inside cache/files/
     size: int               # Transcoded file size in bytes
     created: str            # ISO-8601 timestamp when entry was created
@@ -267,7 +267,7 @@ class TranscodeCache:
         bitrate: Optional[int] = None,
     ) -> str:
         fp_hash = hashlib.sha256(fingerprint.encode()).hexdigest()[:24]
-        ext = ".m4a" if target_format in ("alac", "aac") else f".{target_format}"
+        ext = ".m4a" if target_format in ("alac", "aac") else ".mp3" if target_format == "mp3" else f".{target_format}"
         bitrate_tag = f"_{bitrate}" if bitrate else ""
         return f"{fp_hash}_{target_format}{bitrate_tag}{ext}"
 
