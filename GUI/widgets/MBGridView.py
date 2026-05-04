@@ -399,11 +399,11 @@ class MusicBrowserGrid(QFrame):
             return True
 
         try:
-            from ..imgMaker import get_cached_image_by_img_id
+            from ..imgMaker import get_artwork
         except Exception:
             return False
 
-        cached = get_cached_image_by_img_id(int(link))
+        cached = get_artwork(int(link), mode="cache_only")
         if cached is None:
             return False
 
@@ -464,18 +464,18 @@ class MusicBrowserGrid(QFrame):
         """Background worker: decode artwork + colors for a batch of mhiiLinks."""
         import os
 
-        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
+        from ..imgMaker import configure_artwork_api, get_artwork
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
-        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
+        configure_artwork_api(artworkdb_path, artwork_folder)
         results: dict[int, tuple | None] = {}
 
         for link in links:
             if cancellation_token.is_cancelled():
                 break
-            result = find_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
+            result = get_artwork(int(link), mode="with_colors")
             if result is not None:
                 pil_img, dcol, album_colors = result
                 # Serialize PIL image to RGBA bytes for thread-safe transfer

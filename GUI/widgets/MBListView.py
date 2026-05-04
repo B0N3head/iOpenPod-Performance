@@ -520,10 +520,9 @@ class _FilePrepThread(QThread):
         from PyQt6.QtCore import QUrl
 
         try:
-            artworkdb_data = img_id_index = None
             if os.path.isfile(self._artworkdb_path):
-                from ..imgMaker import get_artworkdb_cached
-                artworkdb_data, img_id_index = get_artworkdb_cached(self._artworkdb_path)
+                from ..imgMaker import configure_artwork_api, get_artwork
+                configure_artwork_api(self._artworkdb_path, self._artwork_folder)
 
             def _safe(s: str) -> str:
                 return re.sub(r'[\\/:*?"<>|]', "_", s).strip() or "Unknown"
@@ -547,12 +546,10 @@ class _FilePrepThread(QThread):
                 shutil.copy2(src, dest)
 
                 img_id = track.get("artwork_id_ref") or track.get("mhii_link", 0)
-                if img_id and artworkdb_data is not None:
+                if img_id:
                     try:
-                        from ..imgMaker import decode_image_by_img_id
-                        pil_img = decode_image_by_img_id(
-                            artworkdb_data, self._artwork_folder, img_id, img_id_index
-                        )
+                        from ..imgMaker import get_artwork
+                        pil_img = get_artwork(int(img_id), mode="image_only")
                         if pil_img is not None:
                             buf = io.BytesIO()
                             pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
@@ -1412,22 +1409,22 @@ class MusicBrowserList(QFrame):
         """Background worker: decode artwork for a batch of mhiiLinks.
 
         Returns dict mapping mhiiLink -> (width, height, rgba_bytes) or None.
-        Uses decode-only path (no color extraction) since the list view
+        Uses image-only decoding (no color extraction) since the list view
         only needs the thumbnail pixmap.
         """
-        from ..imgMaker import decode_image_by_img_id, get_artworkdb_cached
+        from ..imgMaker import configure_artwork_api, get_artwork
         import os
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
-        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
+        configure_artwork_api(artworkdb_path, artwork_folder)
         results: dict[int, tuple[int, int, bytes] | None] = {}
 
         for link in links:
             if cancellation_token.is_cancelled():
                 break
-            pil_img = decode_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
+            pil_img = get_artwork(int(link), mode="image_only")
             if pil_img is not None:
                 pil_img = pil_img.convert("RGBA")
                 results[link] = (pil_img.width, pil_img.height, pil_img.tobytes("raw", "RGBA"))

@@ -471,8 +471,8 @@ class MainWindow(QMainWindow):
         thread_pool = ThreadPoolSingleton.get_instance()
         thread_pool.clear()
 
-        from .imgMaker import clear_artworkdb_cache
-        clear_artworkdb_cache()
+        from .imgMaker import clear_artwork_api
+        clear_artwork_api()
 
         if self._apply_effective_theme():
             self._schedule_themed_rebuild(restore_page=0)
@@ -753,8 +753,8 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to clear music browser before eject", exc_info=True)
 
         try:
-            from .imgMaker import clear_artworkdb_cache
-            clear_artworkdb_cache()
+            from .imgMaker import clear_artwork_api
+            clear_artwork_api()
         except Exception:
             logger.debug("Failed to clear artwork cache before eject", exc_info=True)
 
@@ -863,10 +863,9 @@ class MainWindow(QMainWindow):
             return None
 
         try:
-            from GUI.imgMaker import find_image_by_img_id, get_artworkdb_cached
+            from GUI.imgMaker import configure_artwork_api, get_artwork
 
-            db, idx = get_artworkdb_cached(str(artworkdb_path))
-            artwork_folder_str = str(artwork_folder)
+            configure_artwork_api(str(artworkdb_path), str(artwork_folder))
         except Exception:
             logger.debug("Back Sync artwork context unavailable", exc_info=True)
             return None
@@ -883,15 +882,10 @@ class MainWindow(QMainWindow):
             try:
                 import io
 
-                result = find_image_by_img_id(
-                    db,
-                    artwork_folder_str,
-                    int(img_id),
-                    img_id_index=idx,
-                )
-                if not result:
+                img = get_artwork(int(img_id), mode="image_only")
+                if not img:
                     return None
-                img = result[0].convert("RGB")
+                img = img.convert("RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=90)
                 return buf.getvalue()
@@ -1482,8 +1476,8 @@ class MainWindow(QMainWindow):
         cache.clear()
 
         # Clear artwork cache — sync may have added/changed album art
-        from .imgMaker import clear_artworkdb_cache
-        clear_artworkdb_cache()
+        from .imgMaker import clear_artwork_api
+        clear_artwork_api()
 
         # Clear UI so the reload starts from a clean slate
         self.musicBrowser.reloadData()
