@@ -1,4 +1,6 @@
 import logging
+from collections import OrderedDict
+import threading
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtWidgets import QLabel, QFrame, QVBoxLayout
 from PyQt6.QtGui import QFont, QPixmap, QCursor, QImage
@@ -15,6 +17,41 @@ from ..glyphs import glyph_pixmap
 from .scrollingLabel import ScrollingLabel
 
 log = logging.getLogger(__name__)
+
+_PIXMAP_CACHE_MAX = 500
+_pixmap_cache: OrderedDict[tuple, QPixmap] = OrderedDict()
+_pixmap_cache_lock = threading.Lock()
+
+
+def _pixmap_cache_get(key: tuple) -> QPixmap | None:
+    with _pixmap_cache_lock:
+        pix = _pixmap_cache.get(key)
+        if pix is not None:
+            _pixmap_cache.move_to_end(key)
+        return pix
+
+
+def _pixmap_cache_put(key: tuple, pixmap: QPixmap) -> None:
+    with _pixmap_cache_lock:
+        _pixmap_cache[key] = pixmap
+        _pixmap_cache.move_to_end(key)
+        while len(_pixmap_cache) > _PIXMAP_CACHE_MAX:
+            _pixmap_cache.popitem(last=False)
+
+
+def clear_pixmap_cache() -> None:
+    with _pixmap_cache_lock:
+        _pixmap_cache.clear()
+
+
+def _pixmap_cache_key(mhiiLink, size: int, widget: QLabel) -> tuple | None:
+    if mhiiLink is None:
+        return None
+    try:
+        dpr = widget.devicePixelRatioF()
+    except Exception:
+        dpr = 1.0
+    return (int(mhiiLink), size, int(dpr * 1000))
 
 
 class MusicBrowserGridItem(QFrame):
@@ -128,17 +165,22 @@ class MusicBrowserGridItem(QFrame):
 
         if pil_image is not None:
             self._art_applied_link = self.mhiiLink
-            pil_image = pil_image.convert("RGBA")
-            data = pil_image.tobytes("raw", "RGBA")
-            qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888)
-            qimage = qimage.copy()
-            pixmap = scale_pixmap_for_display(
-                QPixmap.fromImage(qimage),
-                Metrics.GRID_ART_SIZE, Metrics.GRID_ART_SIZE,
-                widget=self.img_label,
-                aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
-                transform_mode=Qt.TransformationMode.SmoothTransformation,
-            )
+            cache_key = _pixmap_cache_key(self.mhiiLink, Metrics.GRID_ART_SIZE, self.img_label)
+            pixmap = _pixmap_cache_get(cache_key) if cache_key else None
+            if pixmap is None:
+                pil_image = pil_image.convert("RGBA")
+                data = pil_image.tobytes("raw", "RGBA")
+                qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888)
+                qimage = qimage.copy()
+                pixmap = scale_pixmap_for_display(
+                    QPixmap.fromImage(qimage),
+                    Metrics.GRID_ART_SIZE, Metrics.GRID_ART_SIZE,
+                    widget=self.img_label,
+                    aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
+                    transform_mode=Qt.TransformationMode.SmoothTransformation,
+                )
+                if cache_key is not None:
+                    _pixmap_cache_put(cache_key, pixmap)
             self.img_label.setPixmap(pixmap)
             self.img_label.setStyleSheet(f"""
                 border: none;

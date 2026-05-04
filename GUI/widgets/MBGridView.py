@@ -191,6 +191,9 @@ class MusicBrowserGrid(QFrame):
         self._sort_key: str = "title"
         self._sort_reverse: bool = False
         self._search_query: str = ""
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._apply_filter_and_sort)
 
     def attachScrollArea(self, scroll_area: QScrollArea | None) -> None:
         """Bind the grid to a QScrollArea to drive virtualized updates."""
@@ -516,13 +519,17 @@ class MusicBrowserGrid(QFrame):
     def setSearchFilter(self, query: str) -> None:
         """Filter grid items whose title contains *query* (case-insensitive)."""
         self._search_query = query
-        self._apply_filter_and_sort()
+        if self._search_timer.isActive():
+            self._search_timer.stop()
+        self._search_timer.start(250)
 
     def resetFilters(self) -> None:
         """Reset sort and search to defaults without reloading source data."""
         self._sort_key = "title"
         self._sort_reverse = False
         self._search_query = ""
+        if self._search_timer.isActive():
+            self._search_timer.stop()
         self._apply_filter_and_sort()
 
     @staticmethod

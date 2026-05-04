@@ -472,7 +472,9 @@ class MainWindow(QMainWindow):
         thread_pool.clear()
 
         from .imgMaker import clear_artworkdb_cache
+        from .widgets.MBGridViewItem import clear_pixmap_cache
         clear_artworkdb_cache()
+        clear_pixmap_cache()
 
         if self._apply_effective_theme():
             self._schedule_themed_rebuild(restore_page=0)
@@ -754,7 +756,9 @@ class MainWindow(QMainWindow):
 
         try:
             from .imgMaker import clear_artworkdb_cache
+            from .widgets.MBGridViewItem import clear_pixmap_cache
             clear_artworkdb_cache()
+            clear_pixmap_cache()
         except Exception:
             logger.debug("Failed to clear artwork cache before eject", exc_info=True)
 
@@ -1483,7 +1487,9 @@ class MainWindow(QMainWindow):
 
         # Clear artwork cache — sync may have added/changed album art
         from .imgMaker import clear_artworkdb_cache
+        from .widgets.MBGridViewItem import clear_pixmap_cache
         clear_artworkdb_cache()
+        clear_pixmap_cache()
 
         # Clear UI so the reload starts from a clean slate
         self.musicBrowser.reloadData()
