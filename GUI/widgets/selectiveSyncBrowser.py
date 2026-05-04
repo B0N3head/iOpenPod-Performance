@@ -292,13 +292,13 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
         self._pc_art_pending.clear()
         super().loadCategory(category)
 
-    def clearGrid(self):
+    def clearGrid(self, preserve_all_items: bool = False):
         # Only clear the per-populate tracking; keep _pc_mode and _pc_art_map
-        # alive because populateGrid() calls clearGrid() internally before
+        # alive because populateGrid() may call clearGrid() internally before
         # re-adding items from the same data set.
         self._pc_art_items.clear()
         self._pc_art_pending.clear()
-        super().clearGrid()
+        super().clearGrid(preserve_all_items=preserve_all_items)
 
 
 # ── PC-adapted track table ─────────────────────────────────────────────────
@@ -1128,6 +1128,7 @@ class SelectiveSyncBrowser(QWidget):
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded
             )
             scroll.setWidget(grid)
+            grid.attachScrollArea(scroll)
             self._grids[cat] = grid
             self._grid_scrolls[cat] = scroll
             self._grid_stack.addWidget(scroll)

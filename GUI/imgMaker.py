@@ -32,6 +32,11 @@ def _image_cache_get(img_id: int):
         return val
 
 
+def get_cached_image_by_img_id(img_id: int):
+    """Return cached artwork tuple without decoding, or None."""
+    return _image_cache_get(img_id)
+
+
 def _image_cache_put(img_id: int, value):
     """Store (pil_image, dcol, album_colors) in the LRU cache. Thread-safe."""
     with _image_cache_lock:

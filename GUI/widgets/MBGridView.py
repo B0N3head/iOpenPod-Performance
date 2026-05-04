@@ -1,10 +1,10 @@
 import difflib
 import logging
-from collections import deque
+from collections import Counter, deque
 from typing import TYPE_CHECKING, Any
 
-from PyQt6.QtCore import QRect, QSize, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QSizePolicy
+from PyQt6.QtCore import QEvent, QRect, QSize, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QScrollArea, QSizePolicy
 from .MBGridViewItem import MusicBrowserGridItem
 from ..styles import Metrics
 
@@ -131,6 +131,8 @@ class _FlowLayout(QLayout):
 
 
 _ART_BATCH_SIZE = 20  # mhiiLinks per background worker
+_VIRTUALIZE_MIN_ITEMS = 200  # switch to pooled widgets beyond this count
+_VIRTUAL_ROW_BUFFER = 1  # extra rows above/below viewport
 
 
 class MusicBrowserGrid(QFrame):
@@ -161,15 +163,67 @@ class MusicBrowserGrid(QFrame):
         self._current_category = "Albums"
         self._load_id = 0
 
+        # Scroll area binding (for virtualized layout updates)
+        self._scroll_area: QScrollArea | None = None
+
+        # Virtualized grid state
+        self._virtual_enabled = False
+        self._virtual_items: list[dict] = []
+        self._virtual_pool: list[MusicBrowserGridItem] = []
+        self._virtual_visible: dict[int, MusicBrowserGridItem] = {}
+        self._virtual_columns = 1
+        self._virtual_refresh_scheduled = False
+        self._virtual_force_refresh = False
+
+        # Widget reuse tracking (non-virtual)
+        self._item_widgets_by_key: dict[tuple, MusicBrowserGridItem] = {}
+        self._item_order_keys: list[tuple] = []
+
         # Artwork loading state
         self._items_by_link: dict[int, list[MusicBrowserGridItem]] = {}  # mhiiLink -> items waiting for art
         self._art_pending: set[int] = set()  # links currently being loaded
+        self._art_seen: set[int] = set()  # links confirmed missing artwork
 
         # Sort / filter state
         self._all_items: list[dict] = []
         self._sort_key: str = "title"
         self._sort_reverse: bool = False
         self._search_query: str = ""
+
+    def attachScrollArea(self, scroll_area: QScrollArea | None) -> None:
+        """Bind the grid to a QScrollArea to drive virtualized updates."""
+        if self._scroll_area is scroll_area:
+            return
+
+        if self._scroll_area is not None:
+            try:
+                self._scroll_area.verticalScrollBar().valueChanged.disconnect(
+                    self._on_scroll_changed
+                )
+            except Exception:
+                pass
+            try:
+                self._scroll_area.viewport().removeEventFilter(self)
+            except Exception:
+                pass
+
+        self._scroll_area = scroll_area
+        if scroll_area is None:
+            return
+
+        scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_scroll_changed
+        )
+        scroll_area.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if (
+            self._scroll_area is not None
+            and obj is self._scroll_area.viewport()
+            and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+        ):
+            self._schedule_virtual_refresh(force=True)
+        return super().eventFilter(obj, event)
 
     def loadCategory(self, category: str):
         """Load and display items for the specified category."""
@@ -202,13 +256,15 @@ class MusicBrowserGrid(QFrame):
 
     def populateGrid(self, items):
         """Populate the grid with items."""
-        _saved_all = self._all_items   # preserve source list across clearGrid()
-        self.clearGrid()
-        self._all_items = _saved_all
-        self._load_id += 1
+        if self._virtual_enabled:
+            self._set_virtual_items(items)
+            return
+
+        self.clearGrid(preserve_all_items=True)
         current_load_id = self._load_id
 
-        self.pendingItems = deque(enumerate(items))
+        self._item_order_keys = [self._item_key(item) for item in items]
+        self.pendingItems = deque(zip(self._item_order_keys, items))
 
         if self.pendingItems and not self.timerActive:
             self.timerActive = True
@@ -232,35 +288,23 @@ class MusicBrowserGrid(QFrame):
                 if not self.pendingItems:
                     break
 
-                i, item = self.pendingItems.popleft()
+                key, item = self.pendingItems.popleft()
 
                 if isinstance(item, dict):
-                    title = item.get("title") or item.get("album", "Unknown")
-                    subtitle = item.get("subtitle") or item.get("artist", "")
-                    mhiiLink = item.get("artwork_id_ref")
-
-                    item_data = {
-                        "title": title,
-                        "subtitle": subtitle,
-                        "artwork_id_ref": mhiiLink,
-                        "category": item.get("category", "Albums"),
-                        "filter_key": item.get("filter_key", "Album"),
-                        "filter_value": item.get("filter_value", title),
-                        "album": item.get("album"),
-                        "artist": item.get("artist"),
-                    }
-
-                    gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
-                    gridItem.clicked.connect(self._onItemClicked)
+                    gridItem = self._create_grid_item(item)
                     self.gridItems.append(gridItem)
+                    self._item_widgets_by_key[key] = gridItem
 
                     # Track which items need artwork
-                    if mhiiLink is not None:
-                        self._items_by_link.setdefault(int(mhiiLink), []).append(gridItem)
+                    if gridItem.mhiiLink is not None:
+                        if not self._apply_cached_art(gridItem) and int(gridItem.mhiiLink) not in self._art_seen:
+                            self._items_by_link.setdefault(int(gridItem.mhiiLink), []).append(gridItem)
 
                 elif isinstance(item, MusicBrowserGridItem):
                     gridItem = item
-                    gridItem.clicked.connect(self._onItemClicked)
+                    if not getattr(gridItem, "_click_connected", False):
+                        gridItem.clicked.connect(self._onItemClicked)
+                        gridItem._click_connected = True
                 else:
                     continue
 
@@ -284,6 +328,63 @@ class MusicBrowserGrid(QFrame):
             # Nothing to do — just stop the loading chain.
             self.timerActive = False
 
+    @staticmethod
+    def _item_key(item: dict) -> tuple:
+        """Stable identity key for reuse across sorts/filters."""
+        return (
+            item.get("category", ""),
+            item.get("album") or "",
+            item.get("artist") or "",
+            item.get("title") or "",
+            item.get("filter_key") or "",
+            item.get("filter_value") or "",
+        )
+
+    @staticmethod
+    def _normalize_item(item: dict) -> tuple[str, str, Any, dict]:
+        title = item.get("title") or item.get("album", "Unknown")
+        subtitle = item.get("subtitle") or item.get("artist", "")
+        mhiiLink = item.get("artwork_id_ref")
+        item_data = {
+            "title": title,
+            "subtitle": subtitle,
+            "artwork_id_ref": mhiiLink,
+            "category": item.get("category", "Albums"),
+            "filter_key": item.get("filter_key", "Album"),
+            "filter_value": item.get("filter_value", title),
+            "album": item.get("album"),
+            "artist": item.get("artist"),
+        }
+        return title, subtitle, mhiiLink, item_data
+
+    def _create_grid_item(self, item: dict) -> MusicBrowserGridItem:
+        title, subtitle, mhiiLink, item_data = self._normalize_item(item)
+        gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
+        gridItem.setParent(self)
+        gridItem.clicked.connect(self._onItemClicked)
+        gridItem._click_connected = True
+        gridItem._item_key = self._item_key(item)
+        return gridItem
+
+    def _apply_cached_art(self, widget: MusicBrowserGridItem) -> bool:
+        """Apply cached art immediately if available."""
+        link = widget.mhiiLink
+        if link is None:
+            return False
+
+        try:
+            from ..imgMaker import get_cached_image_by_img_id
+        except Exception:
+            return False
+
+        cached = get_cached_image_by_img_id(int(link))
+        if cached is None:
+            return False
+
+        img, dcol, album_colors = cached
+        widget.applyImageResult(img, dcol, album_colors)
+        return True
+
     # -------------------------------------------------------------------------
     # Batched artwork loading
     # -------------------------------------------------------------------------
@@ -292,7 +393,11 @@ class MusicBrowserGrid(QFrame):
         """Collect unique mhiiLinks and load artwork in background batches."""
         from app_core.runtime import ThreadPoolSingleton, Worker
 
-        links_to_load = set(self._items_by_link.keys()) - self._art_pending
+        links_to_load = (
+            set(self._items_by_link.keys())
+            - self._art_pending
+            - self._art_seen
+        )
         if not links_to_load:
             return
         if self._device_sessions is None:
@@ -371,15 +476,18 @@ class MusicBrowserGrid(QFrame):
                     continue
 
                 if data is None:
+                    self._art_seen.add(link)
                     for item in items:
-                        item.applyImageResult(None, None, None)
+                        if item.mhiiLink == link:
+                            item.applyImageResult(None, None, None)
                     continue
 
                 w, h, rgba, dcol, album_colors = data
                 pil_img = Image.frombytes("RGBA", (w, h), rgba)
 
                 for item in items:
-                    item.applyImageResult(pil_img, dcol, album_colors)
+                    if item.mhiiLink == link:
+                        item.applyImageResult(pil_img, dcol, album_colors)
 
                 # Remove from tracking — these items are done
                 self._items_by_link.pop(link, None)
@@ -448,22 +556,276 @@ class MusicBrowserGrid(QFrame):
             return v if v is not None else 0
 
         items = sorted(items, key=_key_fn, reverse=self._sort_reverse)
-        self.populateGrid(items)
+        self._update_grid(items)
+
+    def _update_grid(self, items: list[dict]) -> None:
+        if self.timerActive or self.pendingItems:
+            # Cancel any in-progress batch build before re-sorting.
+            self.clearGrid(preserve_all_items=True)
+
+        if self._should_virtualize(items):
+            if not self._virtual_enabled:
+                self._enter_virtual_mode()
+            self._set_virtual_items(items)
+            return
+
+        if self._virtual_enabled:
+            self._exit_virtual_mode()
+
+        self._update_non_virtual(items)
+
+    def _should_virtualize(self, items: list[dict]) -> bool:
+        return len(items) >= _VIRTUALIZE_MIN_ITEMS and self._scroll_area is not None
+
+    def _enter_virtual_mode(self) -> None:
+        self.clearGrid(preserve_all_items=True)
+        self._virtual_enabled = True
+
+    def _exit_virtual_mode(self) -> None:
+        self._clear_virtual_widgets(delete_widgets=True)
+        self._virtual_enabled = False
+
+    def _update_non_virtual(self, items: list[dict]) -> None:
+        if not items:
+            self.clearGrid(preserve_all_items=True)
+            return
+
+        new_keys = [self._item_key(item) for item in items]
+
+        if not self.gridItems:
+            self.populateGrid(items)
+            return
+
+        if Counter(new_keys) == Counter(self._item_order_keys):
+            if new_keys != self._item_order_keys:
+                self._reorder_existing_widgets(new_keys)
+            return
+
+        self._diff_rebuild_non_virtual(items, new_keys)
+
+    def _reorder_existing_widgets(self, new_keys: list[tuple]) -> None:
+        while self._flow.count():
+            self._flow.takeAt(0)
+
+        new_items: list[MusicBrowserGridItem] = []
+        for key in new_keys:
+            widget = self._item_widgets_by_key.get(key)
+            if widget is None:
+                continue
+            self._flow.addWidget(widget)
+            new_items.append(widget)
+
+        self.gridItems = new_items
+        self._item_order_keys = new_keys
+
+        w = self.width()
+        if w > 0:
+            self.setMinimumHeight(self._flow.heightForWidth(w))
+
+    def _diff_rebuild_non_virtual(self, items: list[dict], new_keys: list[tuple]) -> None:
+        old_map = dict(self._item_widgets_by_key)
+        self._item_widgets_by_key.clear()
+        self._item_order_keys = new_keys
+        self.gridItems = []
+        self._items_by_link.clear()
+
+        while self._flow.count():
+            self._flow.takeAt(0)
+
+        for item, key in zip(items, new_keys):
+            widget = old_map.pop(key, None)
+            if widget is None:
+                widget = self._create_grid_item(item)
+            else:
+                title, subtitle, mhiiLink, item_data = self._normalize_item(item)
+                widget.update_item_data(title, subtitle, mhiiLink, item_data)
+                widget._item_key = key
+
+            self._item_widgets_by_key[key] = widget
+            self.gridItems.append(widget)
+            self._flow.addWidget(widget)
+
+            if widget.mhiiLink is not None:
+                if not self._apply_cached_art(widget) and int(widget.mhiiLink) not in self._art_seen:
+                    self._items_by_link.setdefault(int(widget.mhiiLink), []).append(widget)
+
+        for widget in old_map.values():
+            try:
+                widget.cleanup()
+            except Exception:
+                pass
+            widget.deleteLater()
+
+        w = self.width()
+        if w > 0:
+            self.setMinimumHeight(self._flow.heightForWidth(w))
+
+        self._load_art_async()
+
+    # ── Virtualized layout ───────────────────────────────────────────────
+
+    def _set_virtual_items(self, items: list[dict]) -> None:
+        self._virtual_items = items
+        self._virtual_force_refresh = True
+        self._schedule_virtual_refresh(force=True)
+
+    def _schedule_virtual_refresh(self, *, force: bool = False) -> None:
+        if not self._virtual_enabled:
+            return
+        if force:
+            self._virtual_force_refresh = True
+        if self._virtual_refresh_scheduled:
+            return
+        self._virtual_refresh_scheduled = True
+        QTimer.singleShot(0, self._refresh_virtual_viewport)
+
+    def _on_scroll_changed(self, _value: int) -> None:
+        if self._virtual_enabled:
+            self._schedule_virtual_refresh()
+
+    def _refresh_virtual_viewport(self) -> None:
+        self._virtual_refresh_scheduled = False
+        if not self._virtual_enabled:
+            return
+
+        items = self._virtual_items
+        count = len(items)
+        if count == 0:
+            self._clear_virtual_widgets(delete_widgets=False)
+            self.setMinimumHeight(0)
+            return
+
+        width = self.width()
+        if width <= 0:
+            self._schedule_virtual_refresh(force=True)
+            return
+
+        columns = self._compute_columns(width)
+        if columns != self._virtual_columns or self._virtual_force_refresh:
+            self._virtual_columns = max(1, columns)
+            self.columnCount = self._virtual_columns
+            self._recycle_virtual_visible()
+            self._virtual_force_refresh = False
+
+        margin = Metrics.GRID_SPACING
+        row_height = Metrics.GRID_ITEM_H + Metrics.GRID_SPACING
+        total_rows = (count + self._virtual_columns - 1) // self._virtual_columns
+        total_height = (
+            margin * 2
+            + total_rows * Metrics.GRID_ITEM_H
+            + max(0, total_rows - 1) * Metrics.GRID_SPACING
+        )
+        self.setMinimumHeight(total_height)
+
+        scroll_value = 0
+        viewport_height = self.height()
+        if self._scroll_area is not None and self._scroll_area.viewport() is not None:
+            scroll_value = self._scroll_area.verticalScrollBar().value()
+            viewport_height = self._scroll_area.viewport().height()
+            if viewport_height <= 0:
+                self._schedule_virtual_refresh(force=True)
+                return
+
+        first_row = max(0, (scroll_value - margin) // row_height)
+        last_row = min(total_rows - 1, (scroll_value + viewport_height - margin) // row_height)
+        first_row = max(0, first_row - _VIRTUAL_ROW_BUFFER)
+        last_row = min(total_rows - 1, last_row + _VIRTUAL_ROW_BUFFER)
+
+        start_index = first_row * self._virtual_columns
+        end_index = min(count, (last_row + 1) * self._virtual_columns)
+
+        visible_indices = set(range(start_index, end_index))
+        for idx in list(self._virtual_visible.keys()):
+            if idx not in visible_indices:
+                widget = self._virtual_visible.pop(idx)
+                widget.hide()
+                self._virtual_pool.append(widget)
+
+        for idx in range(start_index, end_index):
+            widget = self._virtual_visible.get(idx)
+            if widget is None:
+                widget = self._virtual_pool.pop() if self._virtual_pool else None
+                if widget is None:
+                    widget = self._create_grid_item(items[idx])
+                else:
+                    title, subtitle, mhiiLink, item_data = self._normalize_item(items[idx])
+                    widget.update_item_data(title, subtitle, mhiiLink, item_data)
+                    widget._item_key = self._item_key(items[idx])
+                if not getattr(widget, "_click_connected", False):
+                    widget.clicked.connect(self._onItemClicked)
+                    widget._click_connected = True
+                self._virtual_visible[idx] = widget
+
+            row = idx // self._virtual_columns
+            col = idx % self._virtual_columns
+            x = margin + col * (Metrics.GRID_ITEM_W + Metrics.GRID_SPACING)
+            y = margin + row * (Metrics.GRID_ITEM_H + Metrics.GRID_SPACING)
+            widget.setGeometry(QRect(x, y, Metrics.GRID_ITEM_W, Metrics.GRID_ITEM_H))
+            widget.show()
+
+        ordered_indices = sorted(self._virtual_visible)
+        self.gridItems = [self._virtual_visible[i] for i in ordered_indices]
+
+        self._items_by_link.clear()
+        for widget in self.gridItems:
+            if widget.mhiiLink is not None:
+                if not self._apply_cached_art(widget) and int(widget.mhiiLink) not in self._art_seen:
+                    self._items_by_link.setdefault(int(widget.mhiiLink), []).append(widget)
+
+        self._load_art_async()
+
+    @staticmethod
+    def _compute_columns(width: int) -> int:
+        margin = Metrics.GRID_SPACING
+        usable = max(1, width - (margin * 2))
+        cell = Metrics.GRID_ITEM_W + Metrics.GRID_SPACING
+        return max(1, (usable + Metrics.GRID_SPACING) // cell)
+
+    def _recycle_virtual_visible(self) -> None:
+        for widget in self._virtual_visible.values():
+            widget.hide()
+            self._virtual_pool.append(widget)
+        self._virtual_visible.clear()
+
+    def _clear_virtual_widgets(self, *, delete_widgets: bool) -> None:
+        for widget in list(self._virtual_visible.values()) + list(self._virtual_pool):
+            widget.hide()
+            if delete_widgets:
+                try:
+                    widget.cleanup()
+                except Exception:
+                    pass
+                widget.deleteLater()
+
+        self._virtual_visible.clear()
+        self._virtual_pool.clear()
+        self._virtual_items = []
+        self.gridItems = []
+        self._items_by_link.clear()
 
     # ── Grid management ───────────────────────────────────────────────────────
 
     def rearrangeGrid(self):
         """Trigger a re-layout (flow layout handles this automatically)."""
-        self._flow.activate()
+        if self._virtual_enabled:
+            self._schedule_virtual_refresh(force=True)
+        else:
+            self._flow.activate()
 
-    def clearGrid(self):
+    def clearGrid(self, preserve_all_items: bool = False):
         """Clear all grid items to prepare for reloading."""
         self.timerActive = False
         self.pendingItems = deque()
         self._load_id += 1
         self._items_by_link.clear()
         self._art_pending.clear()
-        self._all_items = []
+        self._art_seen.clear()
+        self._item_widgets_by_key.clear()
+        self._item_order_keys = []
+        self._virtual_items = []
+
+        if self._virtual_enabled:
+            self._clear_virtual_widgets(delete_widgets=True)
 
         while self._flow.count():
             item = self._flow.takeAt(0)
@@ -476,8 +838,16 @@ class MusicBrowserGrid(QFrame):
 
         self.gridItems = []
 
+        if not preserve_all_items:
+            self._all_items = []
+
+        self.setMinimumHeight(0)
+
     def resizeEvent(self, a0):
         super().resizeEvent(a0)
+        if self._virtual_enabled:
+            self._schedule_virtual_refresh(force=True)
+            return
         # Explicitly set minimum height from the flow layout's heightForWidth
         # so the scroll area knows the correct content height.  QScrollArea's
         # built-in heightForWidth propagation is unreliable when items are
@@ -489,6 +859,9 @@ class MusicBrowserGrid(QFrame):
 
     def showEvent(self, a0):
         super().showEvent(a0)
+        if self._virtual_enabled:
+            self._schedule_virtual_refresh(force=True)
+            return
         # When the widget becomes visible (e.g. stacked-widget page switch),
         # defer the relayout to after Qt finishes settling geometry.
         # Items added while hidden (width=0) are all at (0,0); activate() is
@@ -498,6 +871,8 @@ class MusicBrowserGrid(QFrame):
             QTimer.singleShot(0, self._force_relayout)
 
     def _force_relayout(self):
+        if self._virtual_enabled:
+            return
         w = self.width()
         if w > 0 and self._flow.count():
             self._flow.setGeometry(self.rect())

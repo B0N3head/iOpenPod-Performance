@@ -102,6 +102,20 @@ class MusicBrowserGridItem(QFrame):
             color: {Colors.TEXT_TERTIARY};
         """)
 
+    def _reset_art_background(self, mhiiLink):
+        """Reset artwork frame for a new item assignment."""
+        if mhiiLink is None:
+            self._setPlaceholderImage()
+            return
+
+        self.img_label.setText("")
+        self.img_label.setPixmap(QPixmap())
+        self.img_label.setStyleSheet(f"""
+            border: none;
+            background: {Colors.SURFACE_ALT};
+            border-radius: {Metrics.BORDER_RADIUS}px;
+        """)
+
     def applyImageResult(self, pil_image, dcol, album_colors):
         """Apply a pre-loaded image result (called by MusicBrowserGrid)."""
         try:
@@ -169,6 +183,21 @@ class MusicBrowserGridItem(QFrame):
                 """)
         else:
             self._setPlaceholderImage()
+
+    def update_item_data(self, title: str, subtitle: str, mhiiLink, item_data: dict):
+        """Update widget contents for a new item without re-creating widgets."""
+        self.title_text = title
+        self.subtitle_text = subtitle
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+
+        if mhiiLink != self.mhiiLink:
+            # Reset style and artwork when the linked image changes.
+            self._setupStyle()
+            self._reset_art_background(mhiiLink)
+
+        self.mhiiLink = mhiiLink
+        self.item_data = item_data
 
     def mousePressEvent(self, a0):
         if a0 and a0.button() == Qt.MouseButton.LeftButton:

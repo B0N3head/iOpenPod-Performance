@@ -71,6 +71,7 @@ class MusicBrowser(QFrame):
         self.browserGridScroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.browserGridScroll.minimumSizeHint = lambda: QSize(0, 0)
         self.browserGridScroll.setWidget(self.browserGrid)
+        self.browserGrid.attachScrollArea(self.browserGridScroll)
 
         self.gridHeaderBar = GridHeaderBar()
         self.gridHeaderBar.sort_changed.connect(
