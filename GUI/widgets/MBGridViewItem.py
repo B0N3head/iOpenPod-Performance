@@ -106,6 +106,7 @@ class MusicBrowserGridItem(QFrame):
         """Reset artwork frame for a new item assignment."""
         if mhiiLink is None:
             self._setPlaceholderImage()
+            self._art_applied_link = mhiiLink
             return
 
         self.img_label.setText("")
@@ -115,6 +116,7 @@ class MusicBrowserGridItem(QFrame):
             background: {Colors.SURFACE_ALT};
             border-radius: {Metrics.BORDER_RADIUS}px;
         """)
+        self._art_applied_link = None
 
     def applyImageResult(self, pil_image, dcol, album_colors):
         """Apply a pre-loaded image result (called by MusicBrowserGrid)."""
@@ -125,6 +127,7 @@ class MusicBrowserGridItem(QFrame):
             return
 
         if pil_image is not None:
+            self._art_applied_link = self.mhiiLink
             pil_image = pil_image.convert("RGBA")
             data = pil_image.tobytes("raw", "RGBA")
             qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888)
@@ -183,6 +186,7 @@ class MusicBrowserGridItem(QFrame):
                 """)
         else:
             self._setPlaceholderImage()
+            self._art_applied_link = self.mhiiLink
 
     def update_item_data(self, title: str, subtitle: str, mhiiLink, item_data: dict):
         """Update widget contents for a new item without re-creating widgets."""
@@ -195,6 +199,7 @@ class MusicBrowserGridItem(QFrame):
             # Reset style and artwork when the linked image changes.
             self._setupStyle()
             self._reset_art_background(mhiiLink)
+            self._art_applied_link = None
 
         self.mhiiLink = mhiiLink
         self.item_data = item_data

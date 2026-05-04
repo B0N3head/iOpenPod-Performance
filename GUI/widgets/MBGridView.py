@@ -133,6 +133,7 @@ class _FlowLayout(QLayout):
 _ART_BATCH_SIZE = 20  # mhiiLinks per background worker
 _VIRTUALIZE_MIN_ITEMS = 200  # switch to pooled widgets beyond this count
 _VIRTUAL_ROW_BUFFER = 1  # extra rows above/below viewport
+_VIRTUAL_SCROLL_THROTTLE_MS = 16
 
 
 class MusicBrowserGrid(QFrame):
@@ -174,6 +175,7 @@ class MusicBrowserGrid(QFrame):
         self._virtual_columns = 1
         self._virtual_refresh_scheduled = False
         self._virtual_force_refresh = False
+        self._virtual_last_range: tuple[int, int, int] | None = None
 
         # Widget reuse tracking (non-virtual)
         self._item_widgets_by_key: dict[tuple, MusicBrowserGridItem] = {}
@@ -297,8 +299,9 @@ class MusicBrowserGrid(QFrame):
 
                     # Track which items need artwork
                     if gridItem.mhiiLink is not None:
-                        if not self._apply_cached_art(gridItem) and int(gridItem.mhiiLink) not in self._art_seen:
-                            self._items_by_link.setdefault(int(gridItem.mhiiLink), []).append(gridItem)
+                        if getattr(gridItem, "_art_applied_link", None) != gridItem.mhiiLink:
+                            if not self._apply_cached_art(gridItem) and int(gridItem.mhiiLink) not in self._art_seen:
+                                self._items_by_link.setdefault(int(gridItem.mhiiLink), []).append(gridItem)
 
                 elif isinstance(item, MusicBrowserGridItem):
                     gridItem = item
@@ -371,6 +374,9 @@ class MusicBrowserGrid(QFrame):
         link = widget.mhiiLink
         if link is None:
             return False
+
+        if getattr(widget, "_art_applied_link", None) == link:
+            return True
 
         try:
             from ..imgMaker import get_cached_image_by_img_id
@@ -677,7 +683,8 @@ class MusicBrowserGrid(QFrame):
         if self._virtual_refresh_scheduled:
             return
         self._virtual_refresh_scheduled = True
-        QTimer.singleShot(0, self._refresh_virtual_viewport)
+        delay = 0 if force else _VIRTUAL_SCROLL_THROTTLE_MS
+        QTimer.singleShot(delay, self._refresh_virtual_viewport)
 
     def _on_scroll_changed(self, _value: int) -> None:
         if self._virtual_enabled:
@@ -701,11 +708,12 @@ class MusicBrowserGrid(QFrame):
             return
 
         columns = self._compute_columns(width)
+        force_rebuild = self._virtual_force_refresh or columns != self._virtual_columns
         if columns != self._virtual_columns or self._virtual_force_refresh:
             self._virtual_columns = max(1, columns)
             self.columnCount = self._virtual_columns
             self._recycle_virtual_visible()
-            self._virtual_force_refresh = False
+            self._virtual_last_range = None
 
         margin = Metrics.GRID_SPACING
         row_height = Metrics.GRID_ITEM_H + Metrics.GRID_SPACING
@@ -733,6 +741,12 @@ class MusicBrowserGrid(QFrame):
 
         start_index = first_row * self._virtual_columns
         end_index = min(count, (last_row + 1) * self._virtual_columns)
+
+        current_range = (start_index, end_index, self._virtual_columns)
+        if self._virtual_last_range == current_range and not force_rebuild:
+            return
+        self._virtual_last_range = current_range
+        self._virtual_force_refresh = False
 
         visible_indices = set(range(start_index, end_index))
         for idx in list(self._virtual_visible.keys()):
@@ -768,9 +782,12 @@ class MusicBrowserGrid(QFrame):
 
         self._items_by_link.clear()
         for widget in self.gridItems:
-            if widget.mhiiLink is not None:
-                if not self._apply_cached_art(widget) and int(widget.mhiiLink) not in self._art_seen:
-                    self._items_by_link.setdefault(int(widget.mhiiLink), []).append(widget)
+            if widget.mhiiLink is None:
+                continue
+            if getattr(widget, "_art_applied_link", None) == widget.mhiiLink:
+                continue
+            if not self._apply_cached_art(widget) and int(widget.mhiiLink) not in self._art_seen:
+                self._items_by_link.setdefault(int(widget.mhiiLink), []).append(widget)
 
         self._load_art_async()
 
@@ -800,6 +817,7 @@ class MusicBrowserGrid(QFrame):
         self._virtual_visible.clear()
         self._virtual_pool.clear()
         self._virtual_items = []
+        self._virtual_last_range = None
         self.gridItems = []
         self._items_by_link.clear()
 
