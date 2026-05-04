@@ -31,7 +31,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
@@ -113,6 +113,39 @@ def configure_artwork_api(artworkdb_path: str, artwork_folder_path: str | None =
     return _artworkdb_cache, _img_id_index
 
 
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["image_only"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> Image.Image | None: ...
+
+
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["with_colors"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> ArtworkResult | None: ...
+
+
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["cache_only"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> ArtworkResult | None: ...
+
+
 def get_artwork(
     img_id: int,
     *,
@@ -120,7 +153,7 @@ def get_artwork(
     artworkdb_data: dict[str, Any] | None = None,
     artwork_folder_path: str | None = None,
     img_id_index: dict[int, dict[str, Any]] | None = None,
-):
+) -> Image.Image | ArtworkResult | None:
     """Get artwork by image id through a single concrete API.
 
     Modes:
@@ -178,7 +211,6 @@ def _build_img_id_index(artworkdb_data):
         if img_id is not None:
             index[img_id] = entry
     return index
-
 
 
 def get_artworkdb_cached(artworkdb_path):

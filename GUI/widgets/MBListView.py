@@ -7,13 +7,14 @@ robust against rapid user interactions (spam-clicking).
 """
 
 from __future__ import annotations
-import sys as _sys
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable
+import sys as _sys
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent, QPainter
+from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -26,10 +27,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from .formatters import format_size, format_duration_mmss
+
 from ..glyphs import glyph_icon
 from ..hidpi import scale_pixmap_for_display
-from ..styles import Colors, FONT_FAMILY, Metrics, table_css
+from ..styles import FONT_FAMILY, Colors, Metrics, table_css
+from .formatters import format_duration_mmss, format_size
 
 log = logging.getLogger(__name__)
 
@@ -517,17 +519,18 @@ class _FilePrepThread(QThread):
         import re
         import shutil
         from concurrent.futures import ThreadPoolExecutor
+
         from PyQt6.QtCore import QUrl
 
         try:
             if os.path.isfile(self._artworkdb_path):
-                from ..imgMaker import configure_artwork_api, get_artwork
+                from ..imgMaker import configure_artwork_api
                 configure_artwork_api(self._artworkdb_path, self._artwork_folder)
 
             def _safe(s: str) -> str:
                 return re.sub(r'[\\/:*?"<>|]', "_", s).strip() or "Unknown"
 
-            def _prep_one(idx: int, track: dict) -> "QUrl | None":
+            def _prep_one(idx: int, track: dict) -> QUrl | None:
                 """Copy one track and embed its artwork. Returns QUrl or None."""
                 location = track.get("Location", "")
                 if not location:
@@ -598,7 +601,7 @@ class MusicBrowserList(QFrame):
         settings_service: SettingsService,
         device_sessions: DeviceSessionService,
         *,
-        library_cache: "LibraryCacheLike | None" = None,
+        library_cache: LibraryCacheLike | None = None,
         show_art_override: bool | None = None,
     ):
         super().__init__()
@@ -1412,8 +1415,9 @@ class MusicBrowserList(QFrame):
         Uses image-only decoding (no color extraction) since the list view
         only needs the thumbnail pixmap.
         """
-        from ..imgMaker import configure_artwork_api, get_artwork
         import os
+
+        from ..imgMaker import configure_artwork_api, get_artwork
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
@@ -1997,6 +2001,7 @@ class MusicBrowserList(QFrame):
         _on_drag_files_ready once the thread finishes and the mouse is still held.
         """
         import os
+
         from PyQt6.QtWidgets import QApplication
 
         if self._drag_prep_thread is not None:
@@ -2017,6 +2022,7 @@ class MusicBrowserList(QFrame):
             return
 
         import shutil
+
         from infrastructure.settings_paths import default_cache_dir
         cache_root = (
             self._settings_service.get_effective_settings().transcode_cache_dir
@@ -2116,7 +2122,7 @@ class MusicBrowserList(QFrame):
             self._drag_orphan_threads.append(t)
             t.finished.connect(lambda: self._reap_orphan_thread(t))
 
-    def _reap_orphan_thread(self, t: "_FilePrepThread") -> None:
+    def _reap_orphan_thread(self, t: _FilePrepThread) -> None:
         """Remove a finished orphan thread from the holding list."""
         try:
             self._drag_orphan_threads.remove(t)
@@ -2690,6 +2696,7 @@ class MusicBrowserList(QFrame):
         """
         import os
         import shutil
+
         from infrastructure.settings_paths import default_cache_dir
 
         if self._clip_prep_thread is not None:
@@ -2751,7 +2758,9 @@ class MusicBrowserList(QFrame):
         self._cleanup_clip_prep()
 
         import sys
-        from PyQt6.QtCore import QByteArray, QMimeData as _QMimeData
+
+        from PyQt6.QtCore import QByteArray
+        from PyQt6.QtCore import QMimeData as _QMimeData
         mime = _QMimeData()
         mime.setUrls(urls)
 
@@ -2807,7 +2816,7 @@ class MusicBrowserList(QFrame):
             self._clip_orphan_threads.append(t)
             t.finished.connect(lambda: self._reap_clip_orphan_thread(t))
 
-    def _reap_clip_orphan_thread(self, t: "_FilePrepThread") -> None:
+    def _reap_clip_orphan_thread(self, t: _FilePrepThread) -> None:
         try:
             self._clip_orphan_threads.remove(t)
         except ValueError:

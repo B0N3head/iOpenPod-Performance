@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont
@@ -50,11 +50,11 @@ from app_core.runtime import (
     ThreadPoolSingleton,
     same_device_path,
 )
+from app_core.sync_options import build_transcode_options
 from app_core.sync_plan_builder import (
     build_filtered_sync_plan,
     build_removal_sync_plan,
 )
-from app_core.sync_options import build_transcode_options
 from GUI.glyphs import glyph_pixmap
 from GUI.notifications import Notifier
 from GUI.styles import FONT_FAMILY, Colors, Metrics, btn_css
@@ -268,7 +268,7 @@ class MainWindow(QMainWindow):
         self.noDeviceWidget = QWidget()
         no_device_layout = QVBoxLayout(self.noDeviceWidget)
         no_device_layout.setContentsMargins((36), (36), (36), (36))
-        no_device_layout.setSpacing((12))
+        no_device_layout.setSpacing(12)
 
         no_device_layout.addStretch(1)
 
@@ -289,7 +289,7 @@ class MainWindow(QMainWindow):
 
         select_btn = QPushButton("Select Device")
         select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        select_btn.setFixedWidth((170))
+        select_btn.setFixedWidth(170)
         select_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD, QFont.Weight.DemiBold))
         select_btn.setStyleSheet(btn_css(
             bg=Colors.ACCENT,
@@ -315,7 +315,7 @@ class MainWindow(QMainWindow):
         self.loadingDeviceWidget = QWidget()
         loading_layout = QVBoxLayout(self.loadingDeviceWidget)
         loading_layout.setContentsMargins((36), (36), (36), (36))
-        loading_layout.setSpacing((12))
+        loading_layout.setSpacing(12)
         loading_layout.addStretch(1)
 
         loading_title = QLabel("Loading iPod...")
@@ -687,7 +687,8 @@ class MainWindow(QMainWindow):
 
         dev = device.discovered_ipod
         if dev is not None:
-            setattr(dev, "ipod_name", new_name)
+            from typing import cast
+            cast(Any, dev).ipod_name = new_name
 
         # Update master playlist Title in the cache
         playlists = cache.get_playlists()
@@ -1687,7 +1688,7 @@ class _MissingToolsDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Missing Tools")
-        self.setFixedWidth((420))
+        self.setFixedWidth(420)
         self.setStyleSheet(f"""
             QDialog {{
                 background: {Colors.DIALOG_BG};
@@ -1697,7 +1698,7 @@ class _MissingToolsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins((28), (24), (28), (24))
-        layout.setSpacing((10))
+        layout.setSpacing(10)
 
         # Icon + title row
         icon_label = QLabel()
@@ -1717,7 +1718,7 @@ class _MissingToolsDialog(QDialog):
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        layout.addSpacing((4))
+        layout.addSpacing(4)
 
         if can_download:
             body = QLabel(
@@ -1732,17 +1733,17 @@ class _MissingToolsDialog(QDialog):
         body.setWordWrap(True)
         layout.addWidget(body)
 
-        layout.addSpacing((12))
+        layout.addSpacing(12)
 
         # Buttons
         btn_row = QHBoxLayout()
-        btn_row.setSpacing((12))
+        btn_row.setSpacing(12)
 
         if can_download:
             no_btn = QPushButton("Not Now")
             no_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
             no_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            no_btn.setMinimumHeight((40))
+            no_btn.setMinimumHeight(40)
             no_btn.setStyleSheet(btn_css(
                 bg=Colors.SURFACE_RAISED,
                 bg_hover=Colors.SURFACE_HOVER,
@@ -1756,7 +1757,7 @@ class _MissingToolsDialog(QDialog):
             yes_btn = QPushButton("Download")
             yes_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
             yes_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            yes_btn.setMinimumHeight((40))
+            yes_btn.setMinimumHeight(40)
             yes_btn.setStyleSheet(btn_css(
                 bg=Colors.ACCENT_DIM,
                 bg_hover=Colors.ACCENT_HOVER,
@@ -1770,7 +1771,7 @@ class _MissingToolsDialog(QDialog):
             ok_btn = QPushButton("OK")
             ok_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
             ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            ok_btn.setMinimumHeight((40))
+            ok_btn.setMinimumHeight(40)
             ok_btn.setStyleSheet(btn_css(
                 bg=Colors.SURFACE_RAISED,
                 bg_hover=Colors.SURFACE_HOVER,
@@ -1797,7 +1798,7 @@ class _MissingToolsDialog(QDialog):
             cont_btn = QPushButton("Continue Anyway")
             cont_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
             cont_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            cont_btn.setMinimumHeight((40))
+            cont_btn.setMinimumHeight(40)
             cont_btn.setStyleSheet(btn_css(
                 bg=Colors.ACCENT_DIM,
                 bg_hover=Colors.ACCENT_HOVER,
@@ -1830,7 +1831,7 @@ class _DownloadProgressDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins((28), (24), (28), (24))
-        layout.setSpacing((14))
+        layout.setSpacing(14)
 
         title = QLabel("Downloading Tools…")
         title.setFont(QFont(FONT_FAMILY, Metrics.FONT_XXL, QFont.Weight.Bold))
@@ -1846,7 +1847,7 @@ class _DownloadProgressDialog(QDialog):
 
         bar = QProgressBar()
         bar.setRange(0, 0)  # indeterminate
-        bar.setFixedHeight((6))
+        bar.setFixedHeight(6)
         bar.setTextVisible(False)
         bar.setStyleSheet(f"""
             QProgressBar {{
