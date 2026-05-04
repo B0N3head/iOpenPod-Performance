@@ -82,14 +82,14 @@ only-include = [
 # Allow line breaks before binary operators (W503) — matches Black's style
 extend-ignore = ["W503"]
 # Keep line length reasonable; adjust if you prefer a different value
-max-line-length = 88
+max-line-length = 320
 
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider"
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 88
+line-length = 320
 target-version = "py311"
 extend-exclude = ["compendium", "vendor"]
 

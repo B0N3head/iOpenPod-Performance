@@ -1,12 +1,13 @@
 import difflib
 import logging
 from collections import Counter, deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from PyQt6.QtCore import QEvent, QRect, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QRect, QSize, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QScrollArea, QSizePolicy
-from .MBGridViewItem import MusicBrowserGridItem
+
 from ..styles import Metrics
+from .MBGridViewItem import MusicBrowserGridItem
 
 if TYPE_CHECKING:
     from app_core.services import DeviceSessionService, LibraryCacheLike
@@ -198,14 +199,16 @@ class MusicBrowserGrid(QFrame):
             return
 
         if self._scroll_area is not None:
+            old_bar = self._scroll_area.verticalScrollBar()
             try:
-                self._scroll_area.verticalScrollBar().valueChanged.disconnect(
-                    self._on_scroll_changed
-                )
+                if old_bar is not None:
+                    old_bar.valueChanged.disconnect(self._on_scroll_changed)
             except Exception:
                 pass
+            old_viewport = self._scroll_area.viewport()
             try:
-                self._scroll_area.viewport().removeEventFilter(self)
+                if old_viewport is not None:
+                    old_viewport.removeEventFilter(self)
             except Exception:
                 pass
 
@@ -213,19 +216,24 @@ class MusicBrowserGrid(QFrame):
         if scroll_area is None:
             return
 
-        scroll_area.verticalScrollBar().valueChanged.connect(
-            self._on_scroll_changed
-        )
-        scroll_area.viewport().installEventFilter(self)
+        bar = scroll_area.verticalScrollBar()
+        if bar is not None:
+            bar.valueChanged.connect(self._on_scroll_changed)
+        viewport = scroll_area.viewport()
+        if viewport is not None:
+            viewport.installEventFilter(self)
 
-    def eventFilter(self, obj, event):
+    def eventFilter(self, a0: QObject | None, a1: QEvent | None) -> bool:
+        obj = a0
+        event = a1
         if (
             self._scroll_area is not None
             and obj is self._scroll_area.viewport()
+            and event is not None
             and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
         ):
             self._schedule_virtual_refresh(force=True)
-        return super().eventFilter(obj, event)
+        return super().eventFilter(a0, a1)
 
     def loadCategory(self, category: str):
         """Load and display items for the specified category."""
@@ -266,7 +274,7 @@ class MusicBrowserGrid(QFrame):
         current_load_id = self._load_id
 
         self._item_order_keys = [self._item_key(item) for item in items]
-        self.pendingItems = deque(zip(self._item_order_keys, items))
+        self.pendingItems = deque(zip(self._item_order_keys, items, strict=True))
 
         if self.pendingItems and not self.timerActive:
             self.timerActive = True
@@ -305,9 +313,9 @@ class MusicBrowserGrid(QFrame):
 
                 elif isinstance(item, MusicBrowserGridItem):
                     gridItem = item
-                    if not getattr(gridItem, "_click_connected", False):
+                    if not self._is_click_connected(gridItem):
                         gridItem.clicked.connect(self._onItemClicked)
-                        gridItem._click_connected = True
+                        self._set_click_connected(gridItem)
                 else:
                     continue
 
@@ -365,9 +373,21 @@ class MusicBrowserGrid(QFrame):
         gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
         gridItem.setParent(self)
         gridItem.clicked.connect(self._onItemClicked)
-        gridItem._click_connected = True
-        gridItem._item_key = self._item_key(item)
+        self._set_click_connected(gridItem)
+        self._set_item_key(gridItem, self._item_key(item))
         return gridItem
+
+    @staticmethod
+    def _is_click_connected(widget: MusicBrowserGridItem) -> bool:
+        return bool(getattr(widget, "_click_connected", False))
+
+    @staticmethod
+    def _set_click_connected(widget: MusicBrowserGridItem) -> None:
+        cast(Any, widget)._click_connected = True
+
+    @staticmethod
+    def _set_item_key(widget: MusicBrowserGridItem, key: tuple) -> None:
+        cast(Any, widget)._item_key = key
 
     def _apply_cached_art(self, widget: MusicBrowserGridItem) -> bool:
         """Apply cached art immediately if available."""
@@ -442,8 +462,9 @@ class MusicBrowserGrid(QFrame):
         cancellation_token: Any,
     ) -> dict:
         """Background worker: decode artwork + colors for a batch of mhiiLinks."""
-        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
         import os
+
+        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
@@ -638,14 +659,14 @@ class MusicBrowserGrid(QFrame):
         while self._flow.count():
             self._flow.takeAt(0)
 
-        for item, key in zip(items, new_keys):
+        for item, key in zip(items, new_keys, strict=True):
             widget = old_map.pop(key, None)
             if widget is None:
                 widget = self._create_grid_item(item)
             else:
                 title, subtitle, mhiiLink, item_data = self._normalize_item(item)
                 widget.update_item_data(title, subtitle, mhiiLink, item_data)
-                widget._item_key = key
+                self._set_item_key(widget, key)
 
             self._item_widgets_by_key[key] = widget
             self.gridItems.append(widget)
@@ -727,9 +748,12 @@ class MusicBrowserGrid(QFrame):
 
         scroll_value = 0
         viewport_height = self.height()
-        if self._scroll_area is not None and self._scroll_area.viewport() is not None:
-            scroll_value = self._scroll_area.verticalScrollBar().value()
-            viewport_height = self._scroll_area.viewport().height()
+        if self._scroll_area is not None:
+            viewport = self._scroll_area.viewport()
+            scroll_bar = self._scroll_area.verticalScrollBar()
+            if viewport is not None and scroll_bar is not None:
+                scroll_value = scroll_bar.value()
+                viewport_height = viewport.height()
             if viewport_height <= 0:
                 self._schedule_virtual_refresh(force=True)
                 return
@@ -764,10 +788,10 @@ class MusicBrowserGrid(QFrame):
                 else:
                     title, subtitle, mhiiLink, item_data = self._normalize_item(items[idx])
                     widget.update_item_data(title, subtitle, mhiiLink, item_data)
-                    widget._item_key = self._item_key(items[idx])
-                if not getattr(widget, "_click_connected", False):
+                    self._set_item_key(widget, self._item_key(items[idx]))
+                if not self._is_click_connected(widget):
                     widget.clicked.connect(self._onItemClicked)
-                    widget._click_connected = True
+                    self._set_click_connected(widget)
                 self._virtual_visible[idx] = widget
 
             row = idx // self._virtual_columns

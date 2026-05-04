@@ -13,8 +13,8 @@ import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QCursor, QPixmap
+from PyQt6.QtCore import QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QCursor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -29,10 +29,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ArtworkDB_Writer.art_extractor import (
+    extract_art,
+    find_folder_art,
+)
+from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
+
 from ..glyphs import glyph_icon
 from ..styles import (
-    Colors,
     FONT_FAMILY,
+    Colors,
     Metrics,
     back_btn_css,
     btn_css,
@@ -40,19 +46,13 @@ from ..styles import (
     sidebar_nav_css,
     sidebar_nav_selected_css,
 )
-from .MBGridView import MusicBrowserGrid
-from .MBGridViewItem import MusicBrowserGridItem
 from .browserChrome import style_browser_splitter
 from .formatters import format_duration_human, format_size
 from .gridHeaderBar import GridHeaderBar
+from .MBGridView import MusicBrowserGrid
+from .MBGridViewItem import MusicBrowserGridItem
 from .photoBrowser import PhotoGridView
 from .photoViewer import PhotoViewerPane
-
-from ArtworkDB_Writer.art_extractor import (
-    extract_art,
-    find_folder_art,
-)
-from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
 
 log = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ def _extract_art_for_group(file_paths: list[str]) -> tuple | None:
         return None
 
     img.thumbnail((300, 300))
-    from ..imgMaker import getDominantColor, getAlbumColors
+    from ..imgMaker import getAlbumColors, getDominantColor
     dcol = getDominantColor(img)
     album_colors = getAlbumColors(img, bg=dcol)
     return (img, dcol, album_colors)
@@ -187,8 +187,9 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
 
     def _load_pc_art(self):
         """Kick off background artwork extraction for PC albums."""
-        from app_core.runtime import ThreadPoolSingleton, Worker
         from PIL import Image
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
 
         # Map grid widget titles back to the pre-stored art paths.
         for item in self.gridItems:
@@ -321,7 +322,7 @@ class _PCMusicBrowserList:
     """
 
     @staticmethod
-    def create(owner: "PCTrackListView"):
+    def create(owner: PCTrackListView):
         """Create and configure a MusicBrowserList for PC track use."""
         from .MBListView import MusicBrowserList
 

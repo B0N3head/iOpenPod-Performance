@@ -3,16 +3,17 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtWidgets import QFrame, QSplitter, QVBoxLayout, QSizePolicy, QStackedWidget
+from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtWidgets import QFrame, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout
+
+from ..styles import Colors, make_scroll_area
+from .gridHeaderBar import GridHeaderBar
 from .MBGridView import MusicBrowserGrid
 from .MBListView import MusicBrowserList
+from .photoBrowser import PhotoBrowserWidget
 from .playlistBrowser import PlaylistBrowser
 from .podcastBrowser import PodcastBrowser
-from .photoBrowser import PhotoBrowserWidget
 from .trackListTitleBar import TrackListTitleBar
-from .gridHeaderBar import GridHeaderBar
-from ..styles import Colors, make_scroll_area
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ class MusicBrowser(QFrame):
             handle.setEnabled(True)
         self.gridTrackSplitter.setCollapsible(0, True)
         self.gridTrackSplitter.setCollapsible(1, True)
-        self.gridTrackSplitter.setHandleWidth((3))
+        self.gridTrackSplitter.setHandleWidth(3)
         self.gridTrackSplitter.setStretchFactor(0, 2)
         self.gridTrackSplitter.setStretchFactor(1, 1)
         self.gridTrackSplitter.setMinimumSize(0, 0)

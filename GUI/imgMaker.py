@@ -2,8 +2,10 @@ import logging
 import os
 import threading
 from collections import OrderedDict
+
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
+
 from ArtworkDB_Writer.ithmb_codecs import decode_pixels_for_format
 
 logger = logging.getLogger(__name__)
