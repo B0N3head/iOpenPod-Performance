@@ -7,13 +7,14 @@ robust against rapid user interactions (spam-clicking).
 """
 
 from __future__ import annotations
-import sys as _sys
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable
+import sys as _sys
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QImage, QIcon, QColor, QCursor, QKeyEvent, QWheelEvent, QMouseEvent, QPainter
+from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -26,10 +27,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from .formatters import format_size, format_duration_mmss
+
 from ..glyphs import glyph_icon
 from ..hidpi import scale_pixmap_for_display
-from ..styles import Colors, FONT_FAMILY, Metrics, table_css
+from ..styles import FONT_FAMILY, Colors, Metrics, table_css
+from .formatters import format_duration_mmss, format_size
 
 log = logging.getLogger(__name__)
 
@@ -389,6 +391,7 @@ SORTABLE_NUMERIC_KEYS = frozenset({
 # Batch size for incremental population (rows per timer tick)
 # Keep small to avoid blocking UI
 BATCH_SIZE = 50
+ART_LOAD_BATCH_SIZE = 20
 
 # Artwork thumbnail size in pixels for the track list
 ART_THUMB_SIZE = 32
@@ -517,18 +520,18 @@ class _FilePrepThread(QThread):
         import re
         import shutil
         from concurrent.futures import ThreadPoolExecutor
+
         from PyQt6.QtCore import QUrl
 
         try:
-            artworkdb_data = img_id_index = None
             if os.path.isfile(self._artworkdb_path):
-                from ..imgMaker import get_artworkdb_cached
-                artworkdb_data, img_id_index = get_artworkdb_cached(self._artworkdb_path)
+                from ..imgMaker import configure_artwork_api
+                configure_artwork_api(self._artworkdb_path, self._artwork_folder)
 
             def _safe(s: str) -> str:
                 return re.sub(r'[\\/:*?"<>|]', "_", s).strip() or "Unknown"
 
-            def _prep_one(idx: int, track: dict) -> "QUrl | None":
+            def _prep_one(idx: int, track: dict) -> QUrl | None:
                 """Copy one track and embed its artwork. Returns QUrl or None."""
                 location = track.get("Location", "")
                 if not location:
@@ -546,13 +549,11 @@ class _FilePrepThread(QThread):
                                     f"{base}{ext}" if idx == 0 else f"{base} ({idx + 1}){ext}")
                 shutil.copy2(src, dest)
 
-                img_id = track.get("artwork_id_ref") or track.get("mhii_link", 0)
-                if img_id and artworkdb_data is not None:
+                artwork_id = MusicBrowserList._track_artwork_id(track)
+                if artwork_id is not None:
                     try:
-                        from ..imgMaker import decode_image_by_img_id
-                        pil_img = decode_image_by_img_id(
-                            artworkdb_data, self._artwork_folder, img_id, img_id_index
-                        )
+                        from ..imgMaker import get_artwork
+                        pil_img = get_artwork(artwork_id, mode="image_only")
                         if pil_img is not None:
                             buf = io.BytesIO()
                             pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
@@ -601,7 +602,7 @@ class MusicBrowserList(QFrame):
         settings_service: SettingsService,
         device_sessions: DeviceSessionService,
         *,
-        library_cache: "LibraryCacheLike | None" = None,
+        library_cache: LibraryCacheLike | None = None,
         show_art_override: bool | None = None,
     ):
         super().__init__()
@@ -647,8 +648,8 @@ class MusicBrowserList(QFrame):
 
         # Artwork state
         self._show_art = False      # Controlled by settings
-        self._art_cache: dict[int, QPixmap] = {}   # mhiiLink →  QPixmap
-        self._art_pending: set[int] = set()         # mhiiLinks currently being loaded
+        self._art_cache: dict[int, QPixmap] = {}   # artwork_id -> QPixmap
+        self._art_pending: set[int] = set()        # artwork_ids currently being loaded
 
         # Shared resources (created once, reused)
         self._font = QFont(FONT_FAMILY, Metrics.FONT_MD)
@@ -1230,17 +1231,15 @@ class MusicBrowserList(QFrame):
             art_item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # not selectable/editable
             self.table.setItem(row, 0, art_item)
 
-            # Request artwork load for this track's artwork_id_ref
-            mhii_link = track.get("artwork_id_ref")
-            if mhii_link:  # Truthy check ignores 0 and None
-                mhii_link = int(mhii_link)
-                # Cache row index for this artwork link (used during async load)
-                self._link_to_rows.setdefault(mhii_link, []).append(row)
-                if mhii_link in self._art_cache:
-                    art_item.setIcon(QIcon(self._art_cache[mhii_link]))
+            artwork_id = self._track_artwork_id(track)
+            if artwork_id is not None:
+                self._link_to_rows.setdefault(artwork_id, []).append(row)
+                pixmap = self._thumbnail_for_artwork_id(artwork_id)
+                if pixmap is not None:
+                    art_item.setIcon(QIcon(pixmap))
                 else:
-                    # Remember row for async backfill
-                    art_item.setData(Qt.ItemDataRole.UserRole, mhii_link)
+                    # Remember row for async backfill.
+                    art_item.setData(Qt.ItemDataRole.UserRole, artwork_id)
 
         for col, key in enumerate(columns):
             # Playlist position is synthetic — not from track dict
@@ -1355,22 +1354,22 @@ class MusicBrowserList(QFrame):
         """Scan rows for missing artwork and load in background batches."""
         from app_core.runtime import ThreadPoolSingleton, Worker
 
-        # Collect unique mhiiLinks that need loading
-        links_to_load: set[int] = set()
+        # Collect unique artwork IDs that need loading.
+        artwork_ids_to_load: set[int] = set()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item is None:
                 continue
-            link = item.data(Qt.ItemDataRole.UserRole)
-            if link:
+            artwork_id = item.data(Qt.ItemDataRole.UserRole)
+            if artwork_id:
                 try:
-                    link = int(link)
+                    artwork_id = int(artwork_id)
                 except (ValueError, TypeError):
                     continue
-                if link not in self._art_cache and link not in self._art_pending:
-                    links_to_load.add(link)
+                if artwork_id not in self._art_cache and artwork_id not in self._art_pending:
+                    artwork_ids_to_load.add(artwork_id)
 
-        if not links_to_load:
+        if not artwork_ids_to_load:
             return
 
         session = self._device_sessions.current_session()
@@ -1379,16 +1378,14 @@ class MusicBrowserList(QFrame):
         artwork_folder = session.artwork_folder_path or ""
         cancellation_token = self._device_sessions.manager().cancellation_token
 
-        self._art_pending |= links_to_load
+        self._art_pending |= artwork_ids_to_load
         load_id = self._load_id
 
-        # Load in smaller background batches so UI updates incrementally
-        links_list = list(links_to_load)
-        chunk_size = 20
+        artwork_id_list = list(artwork_ids_to_load)
         pool = ThreadPoolSingleton.get_instance()
 
-        for i in range(0, len(links_list), chunk_size):
-            chunk = links_list[i:i + chunk_size]
+        for i in range(0, len(artwork_id_list), ART_LOAD_BATCH_SIZE):
+            chunk = artwork_id_list[i:i + ART_LOAD_BATCH_SIZE]
             worker = Worker(
                 self._load_art_batch,
                 chunk,
@@ -1404,35 +1401,40 @@ class MusicBrowserList(QFrame):
 
     def _load_art_batch(
         self,
-        links: list[int],
+        artwork_ids: list[int],
         artworkdb_path: str,
         artwork_folder: str,
         cancellation_token: Any,
     ) -> dict[int, tuple[int, int, bytes] | None]:
-        """Background worker: decode artwork for a batch of mhiiLinks.
+        """Background worker: decode artwork for a batch of artwork IDs.
 
-        Returns dict mapping mhiiLink -> (width, height, rgba_bytes) or None.
-        Uses decode-only path (no color extraction) since the list view
+        Returns dict mapping artwork_id -> (width, height, rgba_bytes) or None.
+        Uses image-only decoding (no color extraction) since the list view
         only needs the thumbnail pixmap.
         """
-        from ..imgMaker import decode_image_by_img_id, get_artworkdb_cached
         import os
+
+        from ..imgMaker import configure_artwork_api, get_artwork
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
-        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
+        configure_artwork_api(artworkdb_path, artwork_folder)
         results: dict[int, tuple[int, int, bytes] | None] = {}
 
-        for link in links:
+        for artwork_id in artwork_ids:
             if cancellation_token.is_cancelled():
                 break
-            pil_img = decode_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
+            pil_img = get_artwork(int(artwork_id), mode="image_only")
             if pil_img is not None:
                 pil_img = pil_img.convert("RGBA")
-                results[link] = (pil_img.width, pil_img.height, pil_img.tobytes("raw", "RGBA"))
+                results[artwork_id] = (
+                    pil_img.width,
+                    pil_img.height,
+                    pil_img.tobytes("raw", "RGBA"),
+                )
             else:
-                results[link] = None
+                results[artwork_id] = None
 
         return results
 
@@ -1446,9 +1448,9 @@ class MusicBrowserList(QFrame):
 
         try:
             # Convert to QPixmaps and cache
-            new_links: set[int] = set()
-            for link, data in results.items():
-                self._art_pending.discard(link)
+            new_artwork_ids: set[int] = set()
+            for artwork_id, data in results.items():
+                self._art_pending.discard(artwork_id)
                 if data is None:
                     continue
                 w, h, rgba = data
@@ -1461,19 +1463,19 @@ class MusicBrowserList(QFrame):
                     aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
                     transform_mode=Qt.TransformationMode.SmoothTransformation,
                 )
-                self._art_cache[link] = pixmap
-                new_links.add(link)
+                self._art_cache[artwork_id] = pixmap
+                new_artwork_ids.add(artwork_id)
 
-            if not new_links:
+            if not new_artwork_ids:
                 return
 
             # Use cached row-index instead of scanning all rows (O(K) where K = matched rows)
             # Only process rows with artwork links that were just loaded
-            for link in new_links:
-                if link not in self._link_to_rows:
+            for artwork_id in new_artwork_ids:
+                if artwork_id not in self._link_to_rows:
                     continue
-                rows = self._link_to_rows[link]
-                pixmap = self._art_cache[link]
+                rows = self._link_to_rows[artwork_id]
+                pixmap = self._art_cache[artwork_id]
                 icon = QIcon(pixmap)
                 for row in rows:
                     item = self.table.item(row, 0)
@@ -1501,6 +1503,55 @@ class MusicBrowserList(QFrame):
         except (TypeError, ValueError):
             return 0
         return iv if iv in (1, 2) else 0
+
+    @staticmethod
+    def _track_artwork_id(track: dict[str, Any]) -> int | None:
+        """Return the normalized artwork ID for a track, if available."""
+        artwork_id = (
+            track.get("artwork_id_ref")
+            or track.get("mhii_link")
+            or track.get("mhiiLink")
+            or 0
+        )
+        if not artwork_id:
+            return None
+        try:
+            return int(artwork_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _thumbnail_for_artwork_id(self, artwork_id: int) -> QPixmap | None:
+        """Return a cached/scaled thumbnail for *artwork_id* when available."""
+        pixmap = self._art_cache.get(artwork_id)
+        if pixmap is not None:
+            return pixmap
+
+        try:
+            from ..imgMaker import get_artwork
+        except Exception:
+            return None
+
+        cached = get_artwork(artwork_id, mode="cache_only")
+        if cached is None:
+            return None
+
+        pil_img, _dominant_color, _album_colors = cached
+        qimg = QImage(
+            pil_img.convert("RGBA").tobytes("raw", "RGBA"),
+            pil_img.width,
+            pil_img.height,
+            QImage.Format.Format_RGBA8888,
+        ).copy()
+        pixmap = scale_pixmap_for_display(
+            QPixmap.fromImage(qimg),
+            ART_THUMB_SIZE,
+            ART_THUMB_SIZE,
+            widget=self.table,
+            aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
+            transform_mode=Qt.TransformationMode.SmoothTransformation,
+        )
+        self._art_cache[artwork_id] = pixmap
+        return pixmap
 
     def _advisory_badge_icon(self, flag: int, size: int = 14) -> QIcon | None:
         """Create a compact badge icon for explicit/clean advisory values."""
@@ -2000,6 +2051,7 @@ class MusicBrowserList(QFrame):
         _on_drag_files_ready once the thread finishes and the mouse is still held.
         """
         import os
+
         from PyQt6.QtWidgets import QApplication
 
         if self._drag_prep_thread is not None:
@@ -2020,6 +2072,7 @@ class MusicBrowserList(QFrame):
             return
 
         import shutil
+
         from infrastructure.settings_paths import default_cache_dir
         cache_root = (
             self._settings_service.get_effective_settings().transcode_cache_dir
@@ -2119,7 +2172,7 @@ class MusicBrowserList(QFrame):
             self._drag_orphan_threads.append(t)
             t.finished.connect(lambda: self._reap_orphan_thread(t))
 
-    def _reap_orphan_thread(self, t: "_FilePrepThread") -> None:
+    def _reap_orphan_thread(self, t: _FilePrepThread) -> None:
         """Remove a finished orphan thread from the holding list."""
         try:
             self._drag_orphan_threads.remove(t)
@@ -2693,6 +2746,7 @@ class MusicBrowserList(QFrame):
         """
         import os
         import shutil
+
         from infrastructure.settings_paths import default_cache_dir
 
         if self._clip_prep_thread is not None:
@@ -2754,7 +2808,9 @@ class MusicBrowserList(QFrame):
         self._cleanup_clip_prep()
 
         import sys
-        from PyQt6.QtCore import QByteArray, QMimeData as _QMimeData
+
+        from PyQt6.QtCore import QByteArray
+        from PyQt6.QtCore import QMimeData as _QMimeData
         mime = _QMimeData()
         mime.setUrls(urls)
 
@@ -2810,7 +2866,7 @@ class MusicBrowserList(QFrame):
             self._clip_orphan_threads.append(t)
             t.finished.connect(lambda: self._reap_clip_orphan_thread(t))
 
-    def _reap_clip_orphan_thread(self, t: "_FilePrepThread") -> None:
+    def _reap_clip_orphan_thread(self, t: _FilePrepThread) -> None:
         try:
             self._clip_orphan_threads.remove(t)
         except ValueError:

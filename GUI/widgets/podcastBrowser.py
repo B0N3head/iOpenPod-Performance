@@ -24,12 +24,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QIcon, QPainter
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -48,19 +49,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..glyphs import glyph_icon, glyph_pixmap
 from ..hidpi import scale_pixmap_for_display
 from ..styles import (
+    FONT_FAMILY,
+    LABEL_SECONDARY,
     Colors,
     Metrics,
-    FONT_FAMILY,
     accent_btn_css,
     btn_css,
     combo_css,
     make_label,
     make_separator,
-    LABEL_SECONDARY,
 )
-from ..glyphs import glyph_icon, glyph_pixmap
 from .browserChrome import (
     BrowserHeroHeader,
     BrowserPane,
@@ -102,9 +103,9 @@ def _fmt_duration(seconds: int) -> str:
 def _fmt_date(ts: float) -> str:
     if not ts or ts <= 0:
         return ""
-    from datetime import datetime, timezone
+    from datetime import datetime
     try:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d")
     except (OSError, ValueError):
         return ""
 
@@ -137,8 +138,8 @@ class _PodcastEpisodeList:
     """Adapts MusicBrowserList for podcast episode display."""
 
     @staticmethod
-    def create(owner: "PodcastBrowser"):
-        from .MBListView import MusicBrowserList, COLUMN_CONFIG
+    def create(owner: PodcastBrowser):
+        from .MBListView import COLUMN_CONFIG, MusicBrowserList
 
         # Register the podcast-only status column if not already present
         COLUMN_CONFIG.setdefault("ep_status", ("Status", None))
@@ -199,7 +200,7 @@ class PodcastBrowser(QFrame):
         settings_service: SettingsService,
         device_sessions: DeviceSessionService,
         libraries: LibraryService,
-        parent: Optional[QWidget] = None,
+        parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self._settings_service = settings_service
@@ -288,7 +289,7 @@ class PodcastBrowser(QFrame):
         self._status_label.setText("")
         self._stack.setCurrentIndex(0)
 
-    def reconcile_ipod_statuses(self, ipod_tracks: Optional[list[dict]] = None) -> None:
+    def reconcile_ipod_statuses(self, ipod_tracks: list[dict] | None = None) -> None:
         """Reconcile stored episode state with the current iPod track list.
 
         This keeps "Downloaded" / "On iPod" statuses accurate even when
@@ -419,7 +420,7 @@ class PodcastBrowser(QFrame):
         icon_lbl.setStyleSheet(f"color: {Colors.TEXT_TERTIARY}; background: transparent;")
         layout.addWidget(icon_lbl)
 
-        layout.addSpacing((12))
+        layout.addSpacing(12)
 
         heading = make_label(
             "No Podcast Subscriptions",
@@ -429,7 +430,7 @@ class PodcastBrowser(QFrame):
         heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(heading)
 
-        layout.addSpacing((6))
+        layout.addSpacing(6)
 
         desc = make_label(
             "Search for podcasts or add an RSS feed to get started.\n"
@@ -441,13 +442,13 @@ class PodcastBrowser(QFrame):
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(desc)
 
-        layout.addSpacing((16))
+        layout.addSpacing(16)
 
         cta_btn = QPushButton("Add Your First Podcast")
         cta_btn.setFont(QFont(FONT_FAMILY, (Metrics.FONT_MD), QFont.Weight.DemiBold))
         cta_btn.setStyleSheet(accent_btn_css())
-        cta_btn.setFixedHeight((38))
-        cta_btn.setFixedWidth((240))
+        cta_btn.setFixedHeight(38)
+        cta_btn.setFixedWidth(240)
         _cta_ic = glyph_icon("plus", (16), Colors.TEXT_ON_ACCENT)
         if _cta_ic:
             cta_btn.setIcon(_cta_ic)
@@ -486,7 +487,7 @@ class PodcastBrowser(QFrame):
 
         self._feed_list = QListWidget()
         self._feed_list.setIconSize(QSize((36), (36)))
-        self._feed_list.setSpacing((2))
+        self._feed_list.setSpacing(2)
         self._feed_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._feed_list.customContextMenuRequested.connect(self._on_feed_context_menu)
         self._feed_list.currentRowChanged.connect(self._on_feed_selected)
@@ -663,7 +664,7 @@ class PodcastBrowser(QFrame):
             lay.addWidget(control)
             return w
 
-        from .MBGridView import _FlowLayout as _SettingsFlow
+        from .flowLayout import FlowLayout as _SettingsFlow
         settings_strip = QFrame()
         settings_strip.setStyleSheet("background: transparent; border: none;")
         flow = _SettingsFlow(settings_strip, spacing=12)
@@ -708,7 +709,7 @@ class PodcastBrowser(QFrame):
 
         # ── Download progress bar (hidden by default) ────────────────────
         self._progress_bar = QProgressBar()
-        self._progress_bar.setFixedHeight((3))
+        self._progress_bar.setFixedHeight(3)
         self._progress_bar.setTextVisible(False)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setStyleSheet(f"""
@@ -891,7 +892,9 @@ class PodcastBrowser(QFrame):
             return
 
         from PodcastManager.models import (
-            STATUS_DOWNLOADED, STATUS_DOWNLOADING, STATUS_ON_IPOD,
+            STATUS_DOWNLOADED,
+            STATUS_DOWNLOADING,
+            STATUS_ON_IPOD,
         )
 
         can_add = [ep for _, ep in selected if ep.status not in (STATUS_ON_IPOD, STATUS_DOWNLOADING)]
@@ -1049,6 +1052,7 @@ class PodcastBrowser(QFrame):
     def _episode_status_display(ep):
         """Return (text, QColor|None) for episode status."""
         from PyQt6.QtGui import QColor as _QC
+
         from PodcastManager.models import (
             STATUS_DOWNLOADED,
             STATUS_DOWNLOADING,
@@ -1293,7 +1297,7 @@ class PodcastBrowser(QFrame):
         os.makedirs(cache_dir, exist_ok=True)
 
         suffix = Path(urlparse(artwork_url).path).suffix.lower() or ".jpg"
-        key = hashlib.sha256(f"{feed_url}|{artwork_url}".encode("utf-8")).hexdigest()[:24]
+        key = hashlib.sha256(f"{feed_url}|{artwork_url}".encode()).hexdigest()[:24]
         cache_path = os.path.join(cache_dir, f"{key}{suffix}")
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
             return cache_path
@@ -1482,6 +1486,7 @@ class PodcastBrowser(QFrame):
     def _remove_downloads(self, episodes: list) -> None:
         """Delete downloaded files and reset episode status."""
         import os
+
         from PodcastManager.models import STATUS_NOT_DOWNLOADED
 
         removed = 0
@@ -1809,8 +1814,9 @@ class PodcastBrowser(QFrame):
         if not source:
             return
 
-        from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
 
         target_url = source
 
@@ -1864,8 +1870,9 @@ class PodcastBrowser(QFrame):
                 self._on_list_artwork_loaded(data, source)
                 return
 
-        from app_core.runtime import ThreadPoolSingleton, Worker
         import requests
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
 
         target_url = source
 

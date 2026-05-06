@@ -1,25 +1,66 @@
+"""Artwork image loading and color extraction for iOpenPod.
+
+This module provides a simple, unified API for loading and extracting metadata
+from iPod album artwork. The public interface is minimal and focused:
+
+    configure_artwork_api(artworkdb_path, artwork_folder)
+        Warm the ArtworkDB context once at startup or device change.
+
+    get_artwork(img_id, mode="with_colors")
+        Load artwork by image ID. Modes:
+        - "image_only": Returns PIL.Image (for lists/thumbnails)
+        - "with_colors": Returns (image, dominant_color, album_colors) (for UI backgrounds)
+        - "cache_only": Returns cached result or None (UI-thread peek, no decode)
+
+    get_artwork_colors(image)
+        Extract dominant and album colors from an image.
+
+    clear_artwork_api()
+        Clear all caches (call on device disconnect).
+
+Internal subsystems:
+- Shared LRU image cache (thread-safe, 500 max)
+- ArtworkDB parsing and indexing
+- RGB565 image decoding with geometry heuristics
+- Color extraction using iTunes 11 algorithms
+
+All low-level functions (_*) are internal. Legacy API functions are deprecated.
+"""
+
 import logging
 import os
 import threading
 from collections import OrderedDict
+from typing import Any, Literal, overload
+
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
+
 from ArtworkDB_Writer.ithmb_codecs import decode_pixels_for_format
 
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# SHARED CACHE (INTERNAL)
+# ============================================================================
+
 # Cache for parsed ArtworkDB and index
 _artworkdb_cache = None
 _artworkdb_path_cache = None
 _img_id_index = None
+_artwork_folder_cache = None
 _cache_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Shared decoded-image cache (LRU, keyed by mhiiLink / img_id)
+# Shared decoded-image cache (LRU, keyed by artwork_id / img_id)
 # ---------------------------------------------------------------------------
 _IMAGE_CACHE_MAX = 500
-_image_cache: OrderedDict[int, tuple[Image.Image, tuple[int, int, int], dict]] = OrderedDict()
+ArtworkColors = dict[str, tuple[int, int, int]]
+ArtworkResult = tuple[Image.Image, tuple[int, int, int], ArtworkColors]
+ArtworkMode = Literal["image_only", "with_colors", "cache_only"]
+
+_image_cache: OrderedDict[int, ArtworkResult] = OrderedDict()
 _image_cache_lock = threading.Lock()
 
 
@@ -47,6 +88,121 @@ def clear_image_cache():
         _image_cache.clear()
 
 
+# ============================================================================
+# PUBLIC API — SIMPLE ARTWORK INTERFACE
+# ============================================================================
+
+def configure_artwork_api(artworkdb_path: str, artwork_folder_path: str | None = None):
+    """Configure and warm the shared ArtworkDB context.
+
+    Simple API entrypoint for callers that want one-time setup and then
+    repeated `get_artwork` calls.
+    """
+    global _artworkdb_cache, _artworkdb_path_cache, _img_id_index, _artwork_folder_cache
+
+    with _cache_lock:
+        if _artworkdb_cache is None or _artworkdb_path_cache != artworkdb_path:
+            from ArtworkDB_Parser.parser import parse_artworkdb
+            _artworkdb_cache = parse_artworkdb(artworkdb_path)
+            _artworkdb_path_cache = artworkdb_path
+            _img_id_index = _build_img_id_index(_artworkdb_cache)
+
+    if artwork_folder_path is not None:
+        _artwork_folder_cache = artwork_folder_path
+
+    return _artworkdb_cache, _img_id_index
+
+
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["image_only"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> Image.Image | None: ...
+
+
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["with_colors"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> ArtworkResult | None: ...
+
+
+@overload
+def get_artwork(
+    img_id: int,
+    *,
+    mode: Literal["cache_only"],
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> ArtworkResult | None: ...
+
+
+def get_artwork(
+    img_id: int,
+    *,
+    mode: ArtworkMode = "with_colors",
+    artworkdb_data: dict[str, Any] | None = None,
+    artwork_folder_path: str | None = None,
+    img_id_index: dict[int, dict[str, Any]] | None = None,
+) -> Image.Image | ArtworkResult | None:
+    """Get artwork by image id through a single concrete API.
+
+    Modes:
+      - "image_only": returns PIL.Image | None
+      - "with_colors": returns (PIL.Image, dominant_color, album_colors) | None
+      - "cache_only": returns cached tuple or None, without decoding
+    """
+    if mode == "cache_only":
+        return _image_cache_get(int(img_id))
+
+    if artworkdb_data is None:
+        artworkdb_data = _artworkdb_cache
+
+    if img_id_index is None:
+        img_id_index = _img_id_index
+
+    if artwork_folder_path is None:
+        artwork_folder_path = _artwork_folder_cache
+
+    if artworkdb_data is None or not artwork_folder_path:
+        return None
+
+    if mode == "image_only":
+        return _decode_image_from_db(artworkdb_data, artwork_folder_path, int(img_id), img_id_index)
+
+    return _find_artwork_result(artworkdb_data, artwork_folder_path, int(img_id), img_id_index)
+
+
+def get_artwork_colors(image: Image.Image):
+    """Return (dominant_color, album_colors) for an image."""
+    dcol = getDominantColor(image)
+    return dcol, getAlbumColors(image, bg=dcol)
+
+
+def clear_artwork_api():
+    """Clear configured artwork context and all shared artwork caches."""
+    global _artworkdb_cache, _artworkdb_path_cache, _img_id_index, _artwork_folder_cache
+    with _cache_lock:
+        _artworkdb_cache = None
+        _artworkdb_path_cache = None
+        _img_id_index = None
+        _artwork_folder_cache = None
+    clear_image_cache()
+
+
+# ============================================================================
+# INTERNAL IMPLEMENTATIONS
+# ============================================================================
+
 def _build_img_id_index(artworkdb_data):
     """Build a dictionary index mapping img_id to entry for O(1) lookups."""
     index = {}
@@ -58,29 +214,22 @@ def _build_img_id_index(artworkdb_data):
 
 
 def get_artworkdb_cached(artworkdb_path):
-    """Get cached artworkdb data, parsing only if needed. Thread-safe."""
-    global _artworkdb_cache, _artworkdb_path_cache, _img_id_index
-
-    with _cache_lock:
-        if _artworkdb_cache is not None and _artworkdb_path_cache == artworkdb_path:
-            return _artworkdb_cache, _img_id_index
-
-        from ArtworkDB_Parser.parser import parse_artworkdb
-        _artworkdb_cache = parse_artworkdb(artworkdb_path)
-        _artworkdb_path_cache = artworkdb_path
-        _img_id_index = _build_img_id_index(_artworkdb_cache)
-        return _artworkdb_cache, _img_id_index
+    """REMOVED: Use configure_artwork_api() instead."""
+    raise NotImplementedError(
+        "get_artworkdb_cached() has been removed. Use configure_artwork_api() instead."
+    )
 
 
 def clear_artworkdb_cache():
-    """Clear the cache when device changes."""
-    global _artworkdb_cache, _artworkdb_path_cache, _img_id_index
-    with _cache_lock:
-        _artworkdb_cache = None
-        _artworkdb_path_cache = None
-        _img_id_index = None
-    clear_image_cache()
+    """REMOVED: Use clear_artwork_api() instead."""
+    raise NotImplementedError(
+        "clear_artworkdb_cache() has been removed. Use clear_artwork_api() instead."
+    )
 
+
+# ============================================================================
+# IMAGE FORMAT & GENERATION (INTERNAL HELPERS)
+# ============================================================================
 
 def rgb565_to_rgb888_vectorized(pixels):
     """Convert RGB565 to RGB888 format using vectorized NumPy operations."""
@@ -341,6 +490,10 @@ def _detect_border(image_rgb, threshold: int = 8):
     return image_rgb
 
 
+# ============================================================================
+# PUBLIC UTILITIES — COLOR EXTRACTION
+# ============================================================================
+
 def getDominantColor(image):
     """Extract a dominant background color from album artwork (iTunes 11 style).
 
@@ -546,31 +699,15 @@ def _decode_image_from_db(artworkdb_data, ithmb_folder_path, img_id, img_id_inde
 
 
 def decode_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
-    """Decode image only (no color extraction). Uses shared cache.
-
-    Returns PIL.Image or None.
-    """
-    cached = _image_cache_get(img_id)
-    if cached is not None:
-        return cached[0]
-
-    img = _decode_image_from_db(artworkdb_data, ithmb_folder_path, img_id, img_id_index)
-    # Don't cache decode-only results — let find_image_by_img_id populate the full entry
-    return img
+    """REMOVED: Use get_artwork(img_id, mode="image_only") instead."""
+    raise NotImplementedError(
+        "decode_image_by_img_id() has been removed. "
+        "Use get_artwork(img_id, mode='image_only') instead."
+    )
 
 
-def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
-    """Find and return image for the given img_id.
-
-    Args:
-        artworkdb_data: Parsed ArtworkDB dict (from parse_artworkdb)
-        ithmb_folder_path: Path to the Artwork folder containing .ithmb files
-        img_id: The image ID to find
-        img_id_index: Optional pre-built index for O(1) lookup
-
-    Returns:
-        Tuple of (PIL.Image, dominant_color, album_colors) or None if not found
-    """
+def _find_artwork_result(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
+    """Internal implementation for full artwork lookup with color extraction."""
     # Check shared cache first
     cached = _image_cache_get(img_id)
     if cached is not None:
@@ -586,3 +723,11 @@ def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index
     result = (img, dcol, album_colors)
     _image_cache_put(img_id, result)
     return result
+
+
+def find_image_by_img_id(artworkdb_data, ithmb_folder_path, img_id, img_id_index=None):
+    """REMOVED: Use get_artwork(img_id, mode="with_colors") instead."""
+    raise NotImplementedError(
+        "find_image_by_img_id() has been removed. "
+        "Use get_artwork(img_id, mode='with_colors') instead."
+    )

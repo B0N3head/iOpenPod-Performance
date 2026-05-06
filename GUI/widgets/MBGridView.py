@@ -1,12 +1,14 @@
 import difflib
 import logging
-from collections import deque
+from collections.abc import Hashable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from PyQt6.QtCore import QRect, QSize, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QSizePolicy
-from .MBGridViewItem import MusicBrowserGridItem
-from ..styles import Metrics
+from PIL import Image
+from PyQt6.QtCore import pyqtSignal
+
+from .MBGridViewItem import GridItemModel, MusicBrowserGridItem
+from .pooledCardGrid import PooledCardGrid
 
 if TYPE_CHECKING:
     from app_core.services import DeviceSessionService, LibraryCacheLike
@@ -16,19 +18,22 @@ if TYPE_CHECKING:
 _FUZZY_MIN_LEN = 3
 _FUZZY_THRESHOLD = 0.78
 
+_ART_BATCH_SIZE = 20
 
-def _token_matches(token: str, corpus_words: list[str]) -> bool:
-    """Return True if *token* matches any word in *corpus_words*.
 
-    Two-pass:
-      1. Exact substring (fast) — handles normal typing and partial words.
-      2. Fuzzy ratio (difflib) — handles typos for tokens >= _FUZZY_MIN_LEN.
-    """
-    # Pass 1: exact substring against each corpus word
+class _ArtCacheUnset:
+    """Sentinel returned when artwork is not yet cached but may still exist."""
+
+
+_ART_CACHE_UNSET = _ArtCacheUnset()
+
+
+def _token_matches(token: str, corpus_words: tuple[str, ...]) -> bool:
+    """Return True if *token* matches any word in *corpus_words*."""
     for word in corpus_words:
         if token in word:
             return True
-    # Pass 2: fuzzy match for tokens long enough to be meaningful
+
     if len(token) >= _FUZZY_MIN_LEN:
         for word in corpus_words:
             if len(word) >= _FUZZY_MIN_LEN:
@@ -43,99 +48,36 @@ def _token_matches(token: str, corpus_words: list[str]) -> bool:
 log = logging.getLogger(__name__)
 
 
-# -- Flow layout ──────────────────────────────────────────────────────────────
-# Lays out fixed-size children left-to-right, wrapping to the next row.
-# Items are always left-aligned; no centering hack needed.
+@dataclass(frozen=True)
+class GridRecord:
+    """Normalized grid data used by the pooled viewport."""
 
-class _FlowLayout(QLayout):
-    """Left-aligned, wrapping flow layout for fixed-size grid items."""
-
-    def __init__(self, parent=None, spacing: int = 0):
-        super().__init__(parent)
-        self._items: list[QLayoutItem] = []
-        self._spacing = spacing
-
-    # -- QLayout API --
-
-    def addItem(self, a0: QLayoutItem | None):
-        if a0 is not None:
-            self._items.append(a0)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def itemAt(self, index: int) -> QLayoutItem | None:
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    def takeAt(self, index: int) -> QLayoutItem | None:
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
-
-    def spacing(self) -> int:
-        return self._spacing
-
-    def setSpacing(self, a0: int):
-        self._spacing = a0
-
-    def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, a0: int) -> int:
-        return self._do_layout(a0, dry_run=True)
-
-    def sizeHint(self) -> QSize:
-        return self.minimumSize()
-
-    def minimumSize(self) -> QSize:
-        # Minimum: one item wide
-        w = h = 0
-        for item in self._items:
-            sz = item.sizeHint()
-            w = max(w, sz.width())
-            h = max(h, sz.height())
-        m = self.contentsMargins()
-        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
-
-    def setGeometry(self, a0):
-        super().setGeometry(a0)
-        self._do_layout(a0.width(), dry_run=False)
-
-    # -- Layout engine --
-
-    def _do_layout(self, width: int, *, dry_run: bool) -> int:
-        m = self.contentsMargins()
-        x = m.left()
-        y = m.top()
-        right_edge = width - m.right()
-        row_height = 0
-        sp = self._spacing
-
-        for item in self._items:
-            sz = item.sizeHint()
-            # Wrap to next row if this item exceeds the right edge
-            if x + sz.width() > right_edge and x > m.left():
-                x = m.left()
-                y += row_height + sp
-                row_height = 0
-
-            if not dry_run:
-                item.setGeometry(QRect(x, y, sz.width(), sz.height()))
-
-            x += sz.width() + sp
-            row_height = max(row_height, sz.height())
-
-        return y + row_height + m.bottom()
+    source: dict[str, Any]
+    key: tuple[Any, ...]
+    title: str
+    subtitle: str
+    payload: dict[str, Any]
+    artwork_id: int | None
+    artwork_key: Hashable | None
+    search_words: tuple[str, ...]
 
 
-_ART_BATCH_SIZE = 20  # mhiiLinks per background worker
+@dataclass(frozen=True)
+class ArtworkResult:
+    """Artwork payload cached by artwork key."""
+
+    image: Image.Image
+    dominant_color: tuple[int, int, int] | None
+    album_colors: dict[str, Any] | None
 
 
-class MusicBrowserGrid(QFrame):
+CachedArtworkLookup = ArtworkResult | None | _ArtCacheUnset
+
+
+class MusicBrowserGrid(PooledCardGrid):
     """Grid view that displays albums, artists, or genres as clickable items."""
-    item_selected = pyqtSignal(dict)  # Emits when an item is clicked
+
+    item_selected = pyqtSignal(dict)
 
     def __init__(
         self,
@@ -146,46 +88,33 @@ class MusicBrowserGrid(QFrame):
         super().__init__()
         self._device_sessions = device_sessions
         self._library_cache = library_cache
-        self._flow = _FlowLayout(self, spacing=Metrics.GRID_SPACING)
-        self._flow.setContentsMargins(Metrics.GRID_SPACING, Metrics.GRID_SPACING,
-                                      Metrics.GRID_SPACING, Metrics.GRID_SPACING)
 
-        # Allow the widget to shrink inside a QScrollArea.
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-        self.gridItems: list[MusicBrowserGridItem] = []
-        self.pendingItems: deque = deque()
-        self.timerActive = False
-        self.columnCount = 1  # kept for external compat, not used by layout
         self._current_category = "Albums"
-        self._load_id = 0
 
-        # Artwork loading state
-        self._items_by_link: dict[int, list[MusicBrowserGridItem]] = {}  # mhiiLink -> items waiting for art
-        self._art_pending: set[int] = set()  # links currently being loaded
+        self._all_items: list[dict[str, Any]] = []
+        self._records: list[GridRecord] = []
+        self._visible_records: list[GridRecord] = []
+        self._sort_key = "title"
+        self._sort_reverse = False
+        self._search_query = ""
 
-        # Sort / filter state
-        self._all_items: list[dict] = []
-        self._sort_key: str = "title"
-        self._sort_reverse: bool = False
-        self._search_query: str = ""
+        self._art_cache: dict[Hashable, ArtworkResult | None] = {}
+        self._art_pending: set[Hashable] = set()
+        self._art_seen: set[Hashable] = set()
 
-    def loadCategory(self, category: str):
+    def loadCategory(self, category: str) -> None:
         """Load and display items for the specified category."""
         from app_core.runtime import (
             build_album_list,
             build_artist_list,
             build_genre_list,
         )
-        log.debug(f"loadCategory() called: {category}")
 
+        log.debug("loadCategory() called: %s", category)
         self._current_category = category
 
         cache = self._library_cache
-        if cache is None:
-            return
-        if not cache.is_ready():
+        if cache is None or not cache.is_ready():
             return
 
         if category == "Albums":
@@ -197,120 +126,291 @@ class MusicBrowserGrid(QFrame):
         else:
             return
 
-        self._all_items = items
-        self._apply_filter_and_sort()
+        self._set_source_items(items, reset_scroll=True)
 
-    def populateGrid(self, items):
-        """Populate the grid with items."""
-        _saved_all = self._all_items   # preserve source list across clearGrid()
-        self.clearGrid()
-        self._all_items = _saved_all
-        self._load_id += 1
-        current_load_id = self._load_id
+    def populateGrid(self, items: list[dict[str, Any] | MusicBrowserGridItem]) -> None:
+        """Compatibility entry point for setting grid contents directly."""
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, MusicBrowserGridItem):
+                normalized_items.append(dict(item.item_data))
+            elif isinstance(item, dict):
+                normalized_items.append(dict(item))
+        self._set_source_items(normalized_items, reset_scroll=True)
 
-        self.pendingItems = deque(enumerate(items))
+    def setSort(self, key: str, reverse: bool = False) -> None:
+        """Apply a new sort order to the current item list."""
+        self._sort_key = key
+        self._sort_reverse = reverse
+        self._apply_filter_and_sort(reset_scroll=False)
 
-        if self.pendingItems and not self.timerActive:
-            self.timerActive = True
-            self._addNextItem(current_load_id)
+    def setSearchFilter(self, query: str) -> None:
+        """Filter grid items whose title contains *query* (case-insensitive)."""
+        self._search_query = query
+        self._apply_filter_and_sort(reset_scroll=False)
 
-    def _addNextItem(self, load_id: int):
-        """Add the next batch of items."""
-        if load_id != self._load_id:
-            self.timerActive = False
-            return
+    def resetFilters(self) -> None:
+        """Reset sort and search to defaults without reloading source data."""
+        self._sort_key = "title"
+        self._sort_reverse = False
+        self._search_query = ""
+        self._apply_filter_and_sort(reset_scroll=False)
 
-        if not self.pendingItems:
-            self.timerActive = False
-            # All items added — kick off batched artwork loading
-            self._load_art_async()
-            return
+    def clearGrid(self, preserve_all_items: bool = False) -> None:
+        """Clear all rendered widgets and cancel pending artwork work."""
+        self._art_pending.clear()
+        self._art_seen.clear()
+        self._visible_records = []
+
+        if not preserve_all_items:
+            self._all_items = []
+            self._records = []
+            self._art_cache.clear()
+        super().clearGrid(preserve_all_items=False)
+
+    @staticmethod
+    def _item_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            item.get("category", ""),
+            item.get("album") or "",
+            item.get("artist") or "",
+            item.get("title") or "",
+            item.get("filter_key") or "",
+            item.get("filter_value") or "",
+        )
+
+    @classmethod
+    def _build_record(cls, item: dict[str, Any]) -> GridRecord:
+        source = dict(item)
+        title = source.get("title") or source.get("album", "Unknown")
+        subtitle = source.get("subtitle") or source.get("artist", "")
+        artwork_id = source.get("artwork_id_ref")
+        artwork_key = source.get("_grid_art_key", artwork_id)
+
+        payload = {
+            key: value
+            for key, value in source.items()
+            if not str(key).startswith("_")
+        }
+        payload["title"] = title
+        payload["subtitle"] = subtitle
+        payload["artwork_id_ref"] = artwork_id
+        payload.setdefault("category", "Albums")
+        payload.setdefault("filter_key", "Album")
+        payload.setdefault("filter_value", title)
+        payload.setdefault("album", source.get("album"))
+        payload.setdefault("artist", source.get("artist"))
+
+        parts: list[str] = []
+        for field in ("title", "artist"):
+            value = payload.get(field)
+            if value:
+                parts.append(str(value).lower())
+        year = payload.get("year")
+        if year:
+            parts.append(str(year))
+
+        return GridRecord(
+            source=source,
+            key=cls._item_key(payload),
+            title=title,
+            subtitle=subtitle,
+            payload=payload,
+            artwork_id=artwork_id,
+            artwork_key=artwork_key,
+            search_words=tuple(" ".join(parts).split()),
+        )
+
+    def _set_source_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        reset_scroll: bool,
+    ) -> None:
+        self._all_items = [dict(item) for item in items]
+        self._records = [self._build_record(item) for item in self._all_items]
+        self._art_pending.clear()
+        self._apply_filter_and_sort(reset_scroll=reset_scroll)
+
+    def _apply_filter_and_sort(self, *, reset_scroll: bool) -> None:
+        records = self._records
+
+        if self._search_query:
+            tokens = self._search_query.lower().split()
+            filtered: list[GridRecord] = []
+            for record in records:
+                if all(_token_matches(token, record.search_words) for token in tokens):
+                    filtered.append(record)
+            records = filtered
+
+        def _key_fn(record: GridRecord):
+            value = record.source.get(self._sort_key)
+            if isinstance(value, str):
+                return value.lower()
+            return value if value is not None else 0
+
+        self._visible_records = sorted(
+            records,
+            key=_key_fn,
+            reverse=self._sort_reverse,
+        )
+        self._set_viewport_records(
+            self._visible_records,
+            reset_scroll=reset_scroll,
+            preserve_selection=False,
+            fallback_index=-1,
+        )
+
+    def _model_for_record(
+        self,
+        record: GridRecord,
+        cached_artwork: CachedArtworkLookup,
+    ) -> GridItemModel:
+        if isinstance(cached_artwork, ArtworkResult):
+            return GridItemModel(
+                title=record.title,
+                subtitle=record.subtitle,
+                artwork_id=record.artwork_id,
+                payload=record.payload,
+                image=cached_artwork.image,
+                dominant_color=cached_artwork.dominant_color,
+                album_colors=cached_artwork.album_colors,
+            )
+
+        return GridItemModel(
+            title=record.title,
+            subtitle=record.subtitle,
+            artwork_id=record.artwork_id,
+            payload=record.payload,
+        )
+
+    def _record_identity(self, record: GridRecord) -> Hashable:
+        return record.key
+
+    def _create_pooled_widget(self) -> MusicBrowserGridItem:
+        return MusicBrowserGridItem()
+
+    def _connect_widget(self, widget) -> None:
+        if isinstance(widget, MusicBrowserGridItem):
+            widget.clicked.connect(self._onItemClicked)
+
+    def _bind_widget(
+        self,
+        widget,
+        record_index: int,
+        record: GridRecord,
+    ) -> None:
+        assert isinstance(widget, MusicBrowserGridItem)
+        cached_artwork = self._lookup_cached_artwork(record)
+        widget.set_model(self._model_for_record(record, cached_artwork))
+
+    def _after_viewport_refresh(self) -> None:
+        self._load_art_async()
+
+    def _lookup_cached_artwork(
+        self,
+        record: GridRecord,
+    ) -> CachedArtworkLookup:
+        art_key = record.artwork_key
+        if art_key is None:
+            return None
+        if art_key in self._art_cache:
+            return self._art_cache[art_key]
+        if art_key in self._art_seen:
+            return None
+
+        cached = self._load_cached_artwork(record)
+        if isinstance(cached, _ArtCacheUnset):
+            return _ART_CACHE_UNSET
+
+        self._art_cache[art_key] = cached
+        if cached is None:
+            self._art_seen.add(art_key)
+        return cached
+
+    def _load_cached_artwork(
+        self,
+        record: GridRecord,
+    ) -> CachedArtworkLookup:
+        if record.artwork_id is None:
+            return None
 
         try:
-            batch_size = 5
-            for _ in range(batch_size):
-                if not self.pendingItems:
-                    break
+            from ..imgMaker import get_artwork
+        except Exception:
+            return _ART_CACHE_UNSET
 
-                i, item = self.pendingItems.popleft()
+        cached = get_artwork(int(record.artwork_id), mode="cache_only")
+        if cached is None:
+            return _ART_CACHE_UNSET
 
-                if isinstance(item, dict):
-                    title = item.get("title") or item.get("album", "Unknown")
-                    subtitle = item.get("subtitle") or item.get("artist", "")
-                    mhiiLink = item.get("artwork_id_ref")
+        image, dominant_color, album_colors = cached
+        return ArtworkResult(image, dominant_color, album_colors)
 
-                    item_data = {
-                        "title": title,
-                        "subtitle": subtitle,
-                        "artwork_id_ref": mhiiLink,
-                        "category": item.get("category", "Albums"),
-                        "filter_key": item.get("filter_key", "Album"),
-                        "filter_value": item.get("filter_value", title),
-                        "album": item.get("album"),
-                        "artist": item.get("artist"),
-                    }
+    def _apply_art_to_widget(
+        self,
+        widget: MusicBrowserGridItem,
+        record: GridRecord,
+    ) -> None:
+        cached = self._lookup_cached_artwork(record)
+        if isinstance(cached, _ArtCacheUnset):
+            widget.apply_image_result(None, None, None)
+            return
+        if cached is None:
+            widget.apply_image_result(None, None, None)
+            return
+        widget.apply_image_result(
+            cached.image,
+            cached.dominant_color,
+            cached.album_colors,
+        )
 
-                    gridItem = MusicBrowserGridItem(title, subtitle, mhiiLink, item_data)
-                    gridItem.clicked.connect(self._onItemClicked)
-                    self.gridItems.append(gridItem)
+    def _visible_records_needing_art(self) -> list[GridRecord]:
+        needed: list[GridRecord] = []
+        seen_keys: set[Hashable] = set()
+        for record_index in sorted(self._visible_widgets):
+            record = self._visible_records[record_index]
+            art_key = record.artwork_key
+            if (
+                art_key is None
+                or art_key in seen_keys
+                or art_key in self._art_cache
+                or art_key in self._art_pending
+                or art_key in self._art_seen
+            ):
+                continue
+            if self._lookup_cached_artwork(record) is _ART_CACHE_UNSET:
+                needed.append(record)
+                seen_keys.add(art_key)
+        return needed
 
-                    # Track which items need artwork
-                    if mhiiLink is not None:
-                        self._items_by_link.setdefault(int(mhiiLink), []).append(gridItem)
-
-                elif isinstance(item, MusicBrowserGridItem):
-                    gridItem = item
-                    gridItem.clicked.connect(self._onItemClicked)
-                else:
-                    continue
-
-                self._flow.addWidget(gridItem)
-
-            # Update minimum height so the scroll area can size correctly.
-            w = self.width()
-            if w > 0:
-                self.setMinimumHeight(self._flow.heightForWidth(w))
-
-            if self.pendingItems and load_id == self._load_id:
-                QTimer.singleShot(8, lambda: self._addNextItem(load_id))
-            else:
-                self.timerActive = False
-                # All items added — kick off batched artwork loading
-                self._load_art_async()
-
-        except RuntimeError:
-            # Qt has destroyed the underlying C++ layout/widget (e.g. the
-            # MusicBrowserGrid was deleted while this timer was pending).
-            # Nothing to do — just stop the loading chain.
-            self.timerActive = False
-
-    # -------------------------------------------------------------------------
-    # Batched artwork loading
-    # -------------------------------------------------------------------------
-
-    def _load_art_async(self):
-        """Collect unique mhiiLinks and load artwork in background batches."""
+    def _load_art_async(self) -> None:
+        """Collect visible artwork keys and load missing art in batches."""
         from app_core.runtime import ThreadPoolSingleton, Worker
 
-        links_to_load = set(self._items_by_link.keys()) - self._art_pending
-        if not links_to_load:
-            return
-        if self._device_sessions is None:
+        records = self._visible_records_needing_art()
+        if not records or self._device_sessions is None:
             return
 
         session = self._device_sessions.current_session()
         if not session.device_path or not session.artworkdb_path:
             return
+
         artwork_folder = session.artwork_folder_path or ""
         cancellation_token = self._device_sessions.manager().cancellation_token
-
-        self._art_pending |= links_to_load
         load_id = self._load_id
-        links_list = list(links_to_load)
         pool = ThreadPoolSingleton.get_instance()
 
-        for i in range(0, len(links_list), _ART_BATCH_SIZE):
-            chunk = links_list[i:i + _ART_BATCH_SIZE]
+        pairs: list[tuple[Hashable, int]] = []
+        for record in records:
+            art_key = record.artwork_key
+            if art_key is None or record.artwork_id is None:
+                continue
+            self._art_pending.add(art_key)
+            pairs.append((art_key, int(record.artwork_id)))
+
+        for i in range(0, len(pairs), _ART_BATCH_SIZE):
+            chunk = pairs[i:i + _ART_BATCH_SIZE]
             worker = Worker(
                 self._load_art_batch,
                 chunk,
@@ -325,180 +425,90 @@ class MusicBrowserGrid(QFrame):
 
     @staticmethod
     def _load_art_batch(
-        links: list[int],
+        pairs: list[tuple[Hashable, int]],
         artworkdb_path: str,
         artwork_folder: str,
         cancellation_token: Any,
-    ) -> dict:
-        """Background worker: decode artwork + colors for a batch of mhiiLinks."""
-        from ..imgMaker import find_image_by_img_id, get_artworkdb_cached
+    ) -> dict[Hashable, tuple[int, int, bytes, tuple[int, int, int] | None, dict[str, Any] | None] | None]:
+        """Background worker: decode artwork + colors for a batch of artwork keys."""
         import os
+
+        from ..imgMaker import configure_artwork_api, get_artwork
 
         if not artworkdb_path or not os.path.exists(artworkdb_path):
             return {}
 
-        artworkdb_data, img_id_index = get_artworkdb_cached(artworkdb_path)
-        results: dict[int, tuple | None] = {}
+        configure_artwork_api(artworkdb_path, artwork_folder)
+        results: dict[
+            Hashable,
+            tuple[int, int, bytes, tuple[int, int, int] | None, dict[str, Any] | None]
+            | None,
+        ] = {}
 
-        for link in links:
+        for art_key, link in pairs:
             if cancellation_token.is_cancelled():
                 break
-            result = find_image_by_img_id(artworkdb_data, artwork_folder, link, img_id_index)
-            if result is not None:
-                pil_img, dcol, album_colors = result
-                # Serialize PIL image to RGBA bytes for thread-safe transfer
-                pil_img = pil_img.convert("RGBA")
-                results[link] = (pil_img.width, pil_img.height,
-                                 pil_img.tobytes("raw", "RGBA"),
-                                 dcol, album_colors)
-            else:
-                results[link] = None
+            result = get_artwork(link, mode="with_colors")
+            if result is None:
+                results[art_key] = None
+                continue
+
+            pil_img, dominant_color, album_colors = result
+            pil_img = pil_img.convert("RGBA")
+            results[art_key] = (
+                pil_img.width,
+                pil_img.height,
+                pil_img.tobytes("raw", "RGBA"),
+                dominant_color,
+                album_colors,
+            )
 
         return results
 
-    def _on_art_loaded(self, results: dict | None, load_id: int):
-        """Main-thread callback: apply loaded artwork to grid items."""
+    def _on_art_loaded(
+        self,
+        results: dict[
+            Hashable,
+            tuple[int, int, bytes, tuple[int, int, int] | None, dict[str, Any] | None]
+            | None,
+        ]
+        | None,
+        load_id: int,
+    ) -> None:
+        """Main-thread callback: apply artwork to currently bound widgets."""
         if results is None or self._load_id != load_id:
             return
 
-        from PIL import Image
-
         try:
-            for link, data in results.items():
-                self._art_pending.discard(link)
-                items = self._items_by_link.get(link, [])
-                if not items:
-                    continue
-
+            for art_key, data in results.items():
+                self._art_pending.discard(art_key)
                 if data is None:
-                    for item in items:
-                        item.applyImageResult(None, None, None)
+                    self._art_cache[art_key] = None
+                    self._art_seen.add(art_key)
+                    self._apply_art_to_visible_widgets(art_key)
                     continue
 
-                w, h, rgba, dcol, album_colors = data
-                pil_img = Image.frombytes("RGBA", (w, h), rgba)
-
-                for item in items:
-                    item.applyImageResult(pil_img, dcol, album_colors)
-
-                # Remove from tracking — these items are done
-                self._items_by_link.pop(link, None)
-
+                width, height, rgba, dominant_color, album_colors = data
+                pil_img = Image.frombytes("RGBA", (width, height), rgba)
+                self._art_cache[art_key] = ArtworkResult(
+                    pil_img,
+                    dominant_color,
+                    album_colors,
+                )
+                self._apply_art_to_visible_widgets(art_key)
         except RuntimeError:
-            pass  # Widget deleted
+            pass
 
-    def _onItemClicked(self, item_data: dict):
-        """Handle grid item click."""
+    def _apply_art_to_visible_widgets(self, artwork_key: Hashable) -> None:
+        for record_index, widget in list(self._visible_widgets.items()):
+            if record_index >= len(self._visible_records):
+                continue
+            if not isinstance(widget, MusicBrowserGridItem):
+                continue
+            record = self._visible_records[record_index]
+            if record.artwork_key != artwork_key:
+                continue
+            self._apply_art_to_widget(widget, record)
+
+    def _onItemClicked(self, item_data: dict) -> None:
         self.item_selected.emit(item_data)
-
-    # ── Sort / filter ─────────────────────────────────────────────────────────
-
-    def setSort(self, key: str, reverse: bool = False) -> None:
-        """Apply a new sort order to the current item list."""
-        self._sort_key = key
-        self._sort_reverse = reverse
-        self._apply_filter_and_sort()
-
-    def setSearchFilter(self, query: str) -> None:
-        """Filter grid items whose title contains *query* (case-insensitive)."""
-        self._search_query = query
-        self._apply_filter_and_sort()
-
-    def resetFilters(self) -> None:
-        """Reset sort and search to defaults without reloading source data."""
-        self._sort_key = "title"
-        self._sort_reverse = False
-        self._search_query = ""
-        self._apply_filter_and_sort()
-
-    @staticmethod
-    def _search_corpus(item: dict) -> str:
-        """Build a single lowercase string of every searchable field for *item*.
-
-        Albums:  album title + artist name + year
-        Artists: artist name (= title)
-        Genres:  genre name (= title)
-        """
-        parts = []
-        for field in ("title", "artist"):
-            v = item.get(field)
-            if v:
-                parts.append(str(v).lower())
-        year = item.get("year")
-        if year:
-            parts.append(str(year))
-        return " ".join(parts)
-
-    def _apply_filter_and_sort(self) -> None:
-        items = self._all_items
-
-        if self._search_query:
-            tokens = self._search_query.lower().split()
-            filtered = []
-            for x in items:
-                words = self._search_corpus(x).split()
-                if all(_token_matches(t, words) for t in tokens):
-                    filtered.append(x)
-            items = filtered
-
-        def _key_fn(x):
-            v = x.get(self._sort_key)
-            if isinstance(v, str):
-                return v.lower()
-            return v if v is not None else 0
-
-        items = sorted(items, key=_key_fn, reverse=self._sort_reverse)
-        self.populateGrid(items)
-
-    # ── Grid management ───────────────────────────────────────────────────────
-
-    def rearrangeGrid(self):
-        """Trigger a re-layout (flow layout handles this automatically)."""
-        self._flow.activate()
-
-    def clearGrid(self):
-        """Clear all grid items to prepare for reloading."""
-        self.timerActive = False
-        self.pendingItems = deque()
-        self._load_id += 1
-        self._items_by_link.clear()
-        self._art_pending.clear()
-        self._all_items = []
-
-        while self._flow.count():
-            item = self._flow.takeAt(0)
-            if item:
-                widget = item.widget()
-                if widget:
-                    if isinstance(widget, MusicBrowserGridItem):
-                        widget.cleanup()
-                    widget.deleteLater()
-
-        self.gridItems = []
-
-    def resizeEvent(self, a0):
-        super().resizeEvent(a0)
-        # Explicitly set minimum height from the flow layout's heightForWidth
-        # so the scroll area knows the correct content height.  QScrollArea's
-        # built-in heightForWidth propagation is unreliable when items are
-        # added incrementally via QTimer while the widget is hidden or the
-        # viewport hasn't settled yet.
-        w = a0.size().width() if a0 else self.width()
-        if w > 0 and self._flow.count():
-            self.setMinimumHeight(self._flow.heightForWidth(w))
-
-    def showEvent(self, a0):
-        super().showEvent(a0)
-        # When the widget becomes visible (e.g. stacked-widget page switch),
-        # defer the relayout to after Qt finishes settling geometry.
-        # Items added while hidden (width=0) are all at (0,0); activate() is
-        # a no-op when Qt thinks the layout is current, so we call
-        # setGeometry() directly to force a real repositioning pass.
-        if self._flow.count():
-            QTimer.singleShot(0, self._force_relayout)
-
-    def _force_relayout(self):
-        w = self.width()
-        if w > 0 and self._flow.count():
-            self._flow.setGeometry(self.rect())
-            self.setMinimumHeight(self._flow.heightForWidth(w))

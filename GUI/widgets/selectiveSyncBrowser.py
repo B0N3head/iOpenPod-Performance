@@ -10,11 +10,12 @@ unchecks individual tracks, then submits only the selected paths for sync.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QCursor, QPixmap
+from PIL import Image, ImageOps
+from PyQt6.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QCursor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -29,10 +30,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ArtworkDB_Writer.art_extractor import (
+    extract_art,
+    find_folder_art,
+)
+from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
+
 from ..glyphs import glyph_icon
 from ..styles import (
-    Colors,
     FONT_FAMILY,
+    Colors,
     Metrics,
     back_btn_css,
     btn_css,
@@ -40,19 +47,19 @@ from ..styles import (
     sidebar_nav_css,
     sidebar_nav_selected_css,
 )
-from .MBGridView import MusicBrowserGrid
-from .MBGridViewItem import MusicBrowserGridItem
 from .browserChrome import style_browser_splitter
 from .formatters import format_duration_human, format_size
 from .gridHeaderBar import GridHeaderBar
-from .photoBrowser import PhotoGridView
-from .photoViewer import PhotoViewerPane
-
-from ArtworkDB_Writer.art_extractor import (
-    extract_art,
-    find_folder_art,
+from .MBGridView import (
+    _ART_CACHE_UNSET,
+    ArtworkResult,
+    CachedArtworkLookup,
+    GridRecord,
+    MusicBrowserGrid,
 )
-from SyncEngine.photos import PCPhoto, PCPhotoLibrary, scan_pc_photos
+from .MBGridViewItem import MusicBrowserGridItem
+from .photoViewer import PhotoViewerPane
+from .pooledPhotoGrid import PhotoTileModel, PooledPhotoGridView
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +69,10 @@ if TYPE_CHECKING:
 # ── Artwork extraction helpers ─────────────────────────────────────────────
 
 _ART_BATCH = 20  # files per background worker
+_PC_PHOTO_THUMB_BATCH_SIZE = 6
+_PC_PHOTO_PREFETCH_AHEAD = 6
+_PC_PHOTO_MAX_THUMB_WORKERS = 2
+_PC_PHOTO_PREVIEW_MAX = (1600, 1600)
 
 
 def _extract_art_for_group(file_paths: list[str]) -> tuple | None:
@@ -97,7 +108,7 @@ def _extract_art_for_group(file_paths: list[str]) -> tuple | None:
         return None
 
     img.thumbnail((300, 300))
-    from ..imgMaker import getDominantColor, getAlbumColors
+    from ..imgMaker import getAlbumColors, getDominantColor
     dcol = getDominantColor(img)
     album_colors = getAlbumColors(img, bg=dcol)
     return (img, dcol, album_colors)
@@ -135,14 +146,8 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
 
     def __init__(self):
         super().__init__()
-        # title -> list of candidate file paths for artwork extraction
         self._pc_art_map: dict[str, list[str]] = {}
-        # title -> [MusicBrowserGridItem, ...]  (filled after grid populates)
-        self._pc_art_items: dict[str, list[MusicBrowserGridItem]] = {}
-        self._pc_art_pending: set[str] = set()
         self._pc_mode = False
-        # Art result cache: title -> (w, h, rgba_bytes, dcol, album_colors) | None
-        self._pc_art_cache: dict[str, tuple | None] = {}
 
     def loadPCCategory(self, groups: dict[str, dict]):
         """Populate the grid from PC track groups.
@@ -152,18 +157,16 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
         """
         self._pc_mode = True
         self._pc_art_map.clear()
-        self._pc_art_items.clear()
-        self._pc_art_pending.clear()
 
         items: list[dict] = []
         for key, info in sorted(groups.items(), key=lambda kv: kv[0].lower()):
-            # Store art paths keyed by title BEFORE populateGrid drops them.
             self._pc_art_map[key] = info.get("art_paths", [])
 
             items.append({
                 "title": key,
                 "subtitle": info.get("subtitle", ""),
                 "artwork_id_ref": None,  # prevents base-class iPod art loading
+                "_grid_art_key": key,
                 "category": info.get("category", "Albums"),
                 "filter_key": info.get("filter_key", "album"),
                 "filter_value": info.get("filter_value", key),
@@ -175,58 +178,41 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
                 "artist_count": info.get("artist_count", 0),
             })
 
-        self._all_items = items
-        self._apply_filter_and_sort()
+        self._set_source_items(items, reset_scroll=True)
 
-    # Override base-class art loading so it uses embedded/folder art.
+    def _load_cached_artwork(
+        self,
+        record: GridRecord,
+    ) -> CachedArtworkLookup:
+        if not self._pc_mode:
+            return super()._load_cached_artwork(record)
+
+        if record.artwork_key is None:
+            return None
+        if not self._pc_art_map.get(str(record.artwork_key)):
+            return None
+        return _ART_CACHE_UNSET
+
     def _load_art_async(self):
-        if self._pc_mode:
-            self._load_pc_art()
-        else:
+        if not self._pc_mode:
             super()._load_art_async()
-
-    def _load_pc_art(self):
-        """Kick off background artwork extraction for PC albums."""
-        from app_core.runtime import ThreadPoolSingleton, Worker
-        from PIL import Image
-
-        # Map grid widget titles back to the pre-stored art paths.
-        for item in self.gridItems:
-            title = item.item_data.get("title", "")
-            if title in self._pc_art_map:
-                self._pc_art_items.setdefault(title, []).append(item)
-
-        # Apply cached results immediately
-        cached_hits: set[str] = set()
-        for key, items_list in self._pc_art_items.items():
-            if key in self._pc_art_cache:
-                cached_hits.add(key)
-                data = self._pc_art_cache[key]
-                if data is None:
-                    for item in items_list:
-                        item.applyImageResult(None, None, None)
-                else:
-                    w, h, rgba, dcol, album_colors = data
-                    pil_img = Image.frombytes("RGBA", (w, h), rgba)
-                    for item in items_list:
-                        item.applyImageResult(pil_img, dcol, album_colors)
-
-        for key in cached_hits:
-            self._pc_art_items.pop(key, None)
-
-        keys_to_load = set(self._pc_art_items.keys()) - self._pc_art_pending - cached_hits
-        if not keys_to_load:
             return
 
-        self._pc_art_pending |= keys_to_load
+        records = self._visible_records_needing_art()
+        if not records:
+            return
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
+
         load_id = self._load_id
         pool = ThreadPoolSingleton.get_instance()
-
-        # Build batch: (title, [candidate_paths])
         batch: list[tuple[str, list[str]]] = []
-        for key in keys_to_load:
+
+        for record in records:
+            key = str(record.artwork_key)
             paths = self._pc_art_map.get(key, [])
             if paths:
+                self._art_pending.add(key)
                 batch.append((key, paths))
             if len(batch) >= _ART_BATCH:
                 worker = Worker(self._pc_art_batch, list(batch))
@@ -244,7 +230,9 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
             pool.start(worker)
 
     @staticmethod
-    def _pc_art_batch(pairs: list[tuple[str, list[str]]]) -> dict:
+    def _pc_art_batch(
+        pairs: list[tuple[str, list[str]]],
+    ) -> dict[str, tuple | None]:
         results: dict[str, tuple | None] = {}
         for key, paths in pairs:
             art = _extract_art_for_group(paths)
@@ -263,24 +251,24 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
     def _on_pc_art_loaded(self, results: dict | None, load_id: int):
         if results is None or self._load_id != load_id:
             return
-        from PIL import Image
+
         try:
             for key, data in results.items():
-                self._pc_art_pending.discard(key)
-                # Store in cache for future rebuilds
-                self._pc_art_cache[key] = data
-                items_list = self._pc_art_items.get(key, [])
-                if not items_list:
-                    continue
+                self._art_pending.discard(key)
                 if data is None:
-                    for item in items_list:
-                        item.applyImageResult(None, None, None)
+                    self._art_cache[key] = None
+                    self._art_seen.add(key)
+                    self._apply_art_to_visible_widgets(key)
                     continue
+
                 w, h, rgba, dcol, album_colors = data
                 pil_img = Image.frombytes("RGBA", (w, h), rgba)
-                for item in items_list:
-                    item.applyImageResult(pil_img, dcol, album_colors)
-                self._pc_art_items.pop(key, None)
+                self._art_cache[key] = ArtworkResult(
+                    pil_img,
+                    dcol,
+                    album_colors,
+                )
+                self._apply_art_to_visible_widgets(key)
         except RuntimeError:
             pass
 
@@ -288,17 +276,12 @@ class PCMusicBrowserGrid(MusicBrowserGrid):
         """Switch back to iPod mode when the base-class loader is used."""
         self._pc_mode = False
         self._pc_art_map.clear()
-        self._pc_art_items.clear()
-        self._pc_art_pending.clear()
         super().loadCategory(category)
 
-    def clearGrid(self):
-        # Only clear the per-populate tracking; keep _pc_mode and _pc_art_map
-        # alive because populateGrid() calls clearGrid() internally before
-        # re-adding items from the same data set.
-        self._pc_art_items.clear()
-        self._pc_art_pending.clear()
-        super().clearGrid()
+    def clearGrid(self, preserve_all_items: bool = False):
+        super().clearGrid(preserve_all_items=preserve_all_items)
+        if not preserve_all_items:
+            self._pc_art_map.clear()
 
 
 # ── PC-adapted track table ─────────────────────────────────────────────────
@@ -321,7 +304,7 @@ class _PCMusicBrowserList:
     """
 
     @staticmethod
-    def create(owner: "PCTrackListView"):
+    def create(owner: PCTrackListView):
         """Create and configure a MusicBrowserList for PC track use."""
         from .MBListView import MusicBrowserList
 
@@ -757,6 +740,18 @@ class PCPhotoListView(QWidget):
         self._search_query = ""
         self._sort_key = "title"
         self._sort_reverse = False
+        self._tile_pixmap_cache: dict[str, QPixmap] = {}
+        self._preview_pixmap_cache: dict[str, QPixmap] = {}
+        self._thumb_queue: deque[tuple[str, int]] = deque()
+        self._queued_thumb_paths: set[str] = set()
+        self._thumb_in_flight_paths: set[str] = set()
+        self._thumb_workers_in_flight = 0
+        self._preview_pending: set[str] = set()
+        self._preview_request_token = 0
+        self._load_token = 0
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.timeout.connect(self._process_thumb_batch)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -778,9 +773,12 @@ class PCPhotoListView(QWidget):
 
         self._photo_scroll = make_scroll_area()
         self._photo_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._photo_grid = PhotoGridView()
+        self._photo_grid = PooledPhotoGridView(checkable=True)
         self._photo_grid.currentIndexChanged.connect(self._on_current_photo_changed)
         self._photo_grid.checkedChanged.connect(self._on_photo_checked_changed)
+        self._photo_grid.visibleIndicesChanged.connect(
+            self._on_visible_photo_indices_changed
+        )
         self._photo_scroll.setWidget(self._photo_grid)
         list_lay.addWidget(self._photo_scroll, 1)
         body_splitter.addWidget(list_panel)
@@ -800,6 +798,15 @@ class PCPhotoListView(QWidget):
         self._search_query = ""
         self._sort_key = "title"
         self._sort_reverse = False
+        self._load_token += 1
+        self._preview_request_token += 1
+        self._tile_pixmap_cache.clear()
+        self._preview_pixmap_cache.clear()
+        self._thumb_queue.clear()
+        self._queued_thumb_paths.clear()
+        self._thumb_in_flight_paths.clear()
+        self._thumb_workers_in_flight = 0
+        self._preview_pending.clear()
         self._grid_header.blockSignals(True)
         self._grid_header.resetState()
         self._grid_header.blockSignals(False)
@@ -838,6 +845,38 @@ class PCPhotoListView(QWidget):
     def _photo_title_sort_key(self, photo: PCPhoto) -> tuple[str, int]:
         return self._photo_sort_label(photo), photo.size
 
+    @staticmethod
+    def _pixmap_from_rgba_bytes(width: int, height: int, rgba: bytes) -> QPixmap:
+        qimg = QImage(rgba, width, height, width * 4, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(qimg.copy())
+
+    @staticmethod
+    def _encode_pc_photo(
+        path: str,
+        *,
+        max_size: tuple[int, int] | None = None,
+    ) -> tuple[int, int, bytes] | None:
+        try:
+            with Image.open(path) as img:
+                image = ImageOps.exif_transpose(img)
+                if max_size is not None:
+                    image.thumbnail(max_size)
+                image = image.convert("RGBA")
+                return image.width, image.height, image.tobytes("raw", "RGBA")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _load_thumb_batch(paths: list[str]) -> dict[str, tuple[int, int, bytes] | None]:
+        return {
+            path: PCPhotoListView._encode_pc_photo(path, max_size=(132, 132))
+            for path in paths
+        }
+
+    @staticmethod
+    def _load_preview(path: str) -> tuple[int, int, bytes] | None:
+        return PCPhotoListView._encode_pc_photo(path, max_size=_PC_PHOTO_PREVIEW_MAX)
+
     def _refresh_list(self) -> None:
         current_index = self._photo_grid.currentIndex()
         current_path = (
@@ -846,26 +885,40 @@ class PCPhotoListView(QWidget):
             else None
         )
 
-        self._photo_grid.clearGrid()
+        self._load_token += 1
+        self._preview_request_token += 1
+        self._thumb_timer.stop()
+        self._thumb_queue.clear()
+        self._queued_thumb_paths.clear()
+        self._thumb_in_flight_paths.clear()
+        self._thumb_workers_in_flight = 0
+        self._preview_pending.clear()
         self._visible_photos = self._sort_photos(
             [photo for photo in self._photos if self._matches_search(photo)]
         )
+        records: list[PhotoTileModel] = []
         target_index = -1
         for index, photo in enumerate(self._visible_photos):
             title = photo.display_name or photo.source_path
             checked = self._selection.get(photo.source_path, True)
-            pixmap = QPixmap(photo.source_path)
             if current_path and photo.source_path == current_path:
                 target_index = index
-            self._photo_grid.addPhoto(
-                title,
-                pixmap,
-                checkable=True,
-                checked=checked,
+            records.append(
+                PhotoTileModel(
+                    key=photo.source_path,
+                    title=title,
+                    pixmap=self._tile_pixmap_cache.get(photo.source_path, QPixmap()),
+                    checked=checked,
+                )
             )
-        if self._photo_grid.count():
-            self._photo_grid.setCurrentIndex(target_index if target_index >= 0 else 0)
-        else:
+        self._photo_grid.setRecords(
+            records,
+            reset_scroll=False,
+            preserve_selection=True,
+            fallback_index=target_index if target_index >= 0 else (0 if records else -1),
+        )
+        self._queue_visible_photo_loads(self._load_token)
+        if not records:
             self._viewer.clearPreview(
                 title="No photos found",
                 summary="Add photos to this folder to preview them here.",
@@ -881,31 +934,176 @@ class PCPhotoListView(QWidget):
         self._refresh_list()
 
     def setAllChecked(self, checked: bool):
-        for index, photo in enumerate(self._visible_photos):
+        for photo in self._visible_photos:
             self._selection[photo.source_path] = checked
-            self._photo_grid.setTileChecked(index, checked)
+        self._photo_grid.setAllRecordsChecked(checked)
+
+    def _on_visible_photo_indices_changed(self, _indices: object) -> None:
+        self._queue_visible_photo_loads(self._load_token)
+
+    def _queue_visible_photo_loads(self, load_token: int) -> None:
+        visible_indices = list(self._photo_grid.visibleIndices())
+        if not visible_indices:
+            return
+
+        first_index = min(visible_indices)
+        last_index = max(visible_indices)
+        prefetch_start = max(0, first_index - (_PC_PHOTO_PREFETCH_AHEAD // 2))
+        prefetch_stop = min(
+            len(self._visible_photos),
+            last_index + 1 + _PC_PHOTO_PREFETCH_AHEAD,
+        )
+
+        next_queue: deque[tuple[str, int]] = deque()
+        next_queued_paths: set[str] = set()
+        for index in range(prefetch_start, prefetch_stop):
+            if not (0 <= index < len(self._visible_photos)):
+                continue
+            photo = self._visible_photos[index]
+            path = photo.source_path
+            if (
+                not path
+                or path in self._tile_pixmap_cache
+                or path in self._thumb_in_flight_paths
+            ):
+                continue
+            next_queued_paths.add(path)
+            next_queue.append((path, load_token))
+        self._thumb_queue = next_queue
+        self._queued_thumb_paths = next_queued_paths
+        if self._thumb_queue and not self._thumb_timer.isActive():
+            self._thumb_timer.start(0)
+
+    def _process_thumb_batch(self) -> None:
+        if not self._thumb_queue or self._thumb_workers_in_flight >= _PC_PHOTO_MAX_THUMB_WORKERS:
+            return
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
+
+        batch: list[str] = []
+        load_token = self._load_token
+        for _ in range(_PC_PHOTO_THUMB_BATCH_SIZE):
+            if not self._thumb_queue:
+                break
+            path, token = self._thumb_queue.popleft()
+            if token != self._load_token:
+                self._queued_thumb_paths.discard(path)
+                continue
+            self._queued_thumb_paths.discard(path)
+            self._thumb_in_flight_paths.add(path)
+            batch.append(path)
+
+        if not batch:
+            if self._thumb_queue and not self._thumb_timer.isActive():
+                self._thumb_timer.start(1)
+            return
+
+        self._thumb_workers_in_flight += 1
+        worker = Worker(self._load_thumb_batch, batch)
+        worker.signals.result.connect(
+            lambda result, lid=load_token: self._on_thumb_batch_loaded(result, lid)
+        )
+        ThreadPoolSingleton.get_instance().start(worker)
+
+        if self._thumb_queue and not self._thumb_timer.isActive():
+            self._thumb_timer.start(1)
+
+    def _on_thumb_batch_loaded(
+        self,
+        results: dict[str, tuple[int, int, bytes] | None] | None,
+        load_token: int,
+    ) -> None:
+        self._thumb_workers_in_flight = max(0, self._thumb_workers_in_flight - 1)
+        if results is None:
+            return
+        if load_token != self._load_token:
+            for path in results:
+                self._thumb_in_flight_paths.discard(path)
+            return
+
+        for path, data in results.items():
+            self._thumb_in_flight_paths.discard(path)
+            pixmap = QPixmap()
+            if data is not None:
+                width, height, rgba = data
+                pixmap = self._pixmap_from_rgba_bytes(width, height, rgba)
+            self._tile_pixmap_cache[path] = pixmap
+            self._photo_grid.setRecordPixmap(path, pixmap)
+
+        if self._thumb_queue and not self._thumb_timer.isActive():
+            self._thumb_timer.start(0)
 
     def _on_current_photo_changed(self, row: int):
         if row < 0:
+            self._preview_request_token += 1
             self._viewer.clearPreview()
             return
         if row >= len(self._visible_photos):
+            self._preview_request_token += 1
             self._viewer.clearPreview()
             return
         photo = self._visible_photos[row]
 
-        pixmap = QPixmap(photo.source_path)
         album_names = sorted(name for name in photo.album_names if name)
         summary_parts = [", ".join(album_names) if album_names else "All Photos"]
         if photo.size:
             summary_parts.append(format_size(photo.size))
         meta_lines = [photo.source_path] if photo.source_path else []
+        cached = self._preview_pixmap_cache.get(photo.source_path, QPixmap())
         self._viewer.setPhoto(
             title=photo.display_name or photo.source_path,
-            pixmap=pixmap,
+            pixmap=cached,
             summary=" · ".join(part for part in summary_parts if part),
             meta_lines=meta_lines,
         )
+        if cached.isNull() and photo.source_path:
+            self._viewer.setPreviewPlaceholder("Loading preview...")
+            self._request_preview_async(photo.source_path)
+
+    def _request_preview_async(self, path: str) -> None:
+        if not path or path in self._preview_pixmap_cache or path in self._preview_pending:
+            return
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
+
+        self._preview_request_token += 1
+        request_token = self._preview_request_token
+        load_token = self._load_token
+        self._preview_pending.add(path)
+        worker = Worker(self._load_preview, path)
+        worker.signals.result.connect(
+            lambda result, p=path, lid=load_token, rid=request_token: self._on_preview_loaded(
+                p,
+                result,
+                lid,
+                rid,
+            )
+        )
+        ThreadPoolSingleton.get_instance().start(worker)
+
+    def _on_preview_loaded(
+        self,
+        path: str,
+        result: tuple[int, int, bytes] | None,
+        load_token: int,
+        request_token: int,
+    ) -> None:
+        self._preview_pending.discard(path)
+        if load_token != self._load_token or request_token != self._preview_request_token:
+            return
+
+        pixmap = QPixmap()
+        if result is not None:
+            width, height, rgba = result
+            pixmap = self._pixmap_from_rgba_bytes(width, height, rgba)
+        self._preview_pixmap_cache[path] = pixmap
+
+        current_index = self._photo_grid.currentIndex()
+        if not (0 <= current_index < len(self._visible_photos)):
+            return
+        current_photo = self._visible_photos[current_index]
+        if current_photo.source_path == path:
+            self._viewer.setPreviewPixmap(pixmap)
 
     def _on_photo_checked_changed(self, index: int, checked: bool) -> None:
         if index < 0 or index >= len(self._visible_photos):
@@ -1128,6 +1326,7 @@ class SelectiveSyncBrowser(QWidget):
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded
             )
             scroll.setWidget(grid)
+            grid.attachScrollArea(scroll)
             self._grids[cat] = grid
             self._grid_scrolls[cat] = scroll
             self._grid_stack.addWidget(scroll)
@@ -1233,7 +1432,9 @@ class SelectiveSyncBrowser(QWidget):
         self._current_group = None
         self._current_group_tracks = []
         for grid in self._grids.values():
-            grid._pc_art_cache.clear()
+            grid._art_cache.clear()
+            grid._art_pending.clear()
+            grid._art_seen.clear()
 
         # Truncate long paths for the header
         display = folder
@@ -1651,9 +1852,8 @@ class SelectiveSyncBrowser(QWidget):
             if scroll:
                 self._grid_stack.setCurrentWidget(scroll)
             self._content.setCurrentIndex(1)
-            # Force relayout — grid items added while hidden have stale geometry
             if grid:
-                grid._force_relayout()
+                grid.rearrangeGrid()
 
         self._update_footer()
 
@@ -1715,6 +1915,8 @@ class SelectiveSyncBrowser(QWidget):
         dcol = item_data.get("dominant_color")
         active_grid = self._grids.get(self._current_mode)
         for gi in (active_grid.gridItems if active_grid else []):
+            if not isinstance(gi, MusicBrowserGridItem):
+                continue
             if gi.item_data.get("title") == key:
                 pm = gi.img_label.pixmap()
                 if pm and not pm.isNull():
