@@ -53,7 +53,7 @@ _artwork_folder_cache = None
 _cache_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Shared decoded-image cache (LRU, keyed by mhiiLink / img_id)
+# Shared decoded-image cache (LRU, keyed by artwork_id / img_id)
 # ---------------------------------------------------------------------------
 _IMAGE_CACHE_MAX = 500
 ArtworkColors = dict[str, tuple[int, int, int]]

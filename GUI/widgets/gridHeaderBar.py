@@ -1,9 +1,10 @@
 from typing import cast
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLineEdit, QMenu, QPushButton, QSizePolicy
-from ..styles import Colors, Metrics, btn_css, input_css
 
+from ..styles import Colors, Metrics, btn_css, input_css
 
 # Sort definitions per category: (display_label, sort_key, reverse)
 _SORTS = {

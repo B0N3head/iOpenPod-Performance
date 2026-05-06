@@ -871,19 +871,28 @@ class MainWindow(QMainWindow):
             logger.debug("Back Sync artwork context unavailable", exc_info=True)
             return None
 
-        def _provider(track: dict) -> bytes | None:
-            img_id = (
+        def _track_artwork_id(track: dict) -> int | None:
+            artwork_id = (
                 track.get("artwork_id_ref")
                 or track.get("mhii_link")
                 or track.get("mhiiLink")
                 or 0
             )
-            if not img_id:
+            if not artwork_id:
+                return None
+            try:
+                return int(artwork_id)
+            except (TypeError, ValueError):
+                return None
+
+        def _provider(track: dict) -> bytes | None:
+            artwork_id = _track_artwork_id(track)
+            if artwork_id is None:
                 return None
             try:
                 import io
 
-                img = get_artwork(int(img_id), mode="image_only")
+                img = get_artwork(artwork_id, mode="image_only")
                 if not img:
                     return None
                 img = img.convert("RGB")
