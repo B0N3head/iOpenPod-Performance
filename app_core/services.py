@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard, runtime_checkable
 
 from infrastructure.settings_schema import AppSettings, DeviceSettingsState
 
 
+@runtime_checkable
 class DeviceInfoLike(Protocol):
     """Device identity fields used across UI-facing service boundaries."""
 
     model_family: str
     generation: str
     color: str
+
+
+def is_device_info_like(value: object) -> TypeGuard[DeviceInfoLike]:
+    """Return whether a value exposes the minimum device identity fields."""
+
+    return all(
+        hasattr(value, field_name)
+        for field_name in ("model_family", "generation", "color")
+    )
 
 
 @dataclass(frozen=True)
@@ -49,6 +59,7 @@ class SettingsSnapshot:
     video_preset: str
     prefer_lossy: bool
     sync_workers: int
+    device_write_workers: int
     normalize_sample_rate: bool
     mono_for_spoken: bool
     smart_quality_by_type: bool
@@ -424,6 +435,9 @@ class LibraryCacheLike(Protocol):
         ...
 
     def clear_pending_playlists(self) -> None:
+        ...
+
+    def commit_user_playlists(self) -> None:
         ...
 
 

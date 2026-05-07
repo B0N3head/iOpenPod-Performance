@@ -26,6 +26,7 @@ DEVICE_SETTING_KEYS = (
     "video_preset",
     "prefer_lossy",
     "sync_workers",
+    "device_write_workers",
     "normalize_sample_rate",
     "mono_for_spoken",
     "smart_quality_by_type",
@@ -75,6 +76,7 @@ class AppSettings:
     video_preset: str = "fast"
     prefer_lossy: bool = False
     sync_workers: int = 0
+    device_write_workers: int = 0
     normalize_sample_rate: bool = False
     mono_for_spoken: bool = True
     smart_quality_by_type: bool = True

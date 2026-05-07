@@ -10,7 +10,7 @@ import traceback
 
 from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
 
-from .services import LibraryCacheLike
+from .services import DeviceInfoLike, LibraryCacheLike
 
 logger = logging.getLogger(__name__)
 
@@ -199,11 +199,11 @@ class DeviceManager(QObject):
         return self._device_path
 
     @property
-    def discovered_ipod(self):
+    def discovered_ipod(self) -> DeviceInfoLike | None:
         return self._discovered_ipod
 
     @discovered_ipod.setter
-    def discovered_ipod(self, ipod) -> None:
+    def discovered_ipod(self, ipod: DeviceInfoLike | None) -> None:
         self._discovered_ipod = ipod
         self._sync_device_info(ipod)
 
@@ -520,6 +520,9 @@ class iTunesDBCache(QObject):
             if not playlist_id:
                 playlist_id = random.getrandbits(64)
                 playlist["playlist_id"] = playlist_id
+            items = playlist.get("items")
+            if isinstance(items, list):
+                playlist["mhip_child_count"] = len(items)
 
             replaced = False
             for index, user_playlist in enumerate(self._user_playlists):
@@ -562,6 +565,58 @@ class iTunesDBCache(QObject):
     def clear_pending_playlists(self) -> None:
         with self._lock:
             self._user_playlists.clear()
+
+    def commit_user_playlists(self) -> None:
+        """Hydrate pending playlist edits into the live parsed cache in place."""
+        with self._lock:
+            if not self._user_playlists:
+                return
+
+            data = self._data
+            if data is None:
+                self._user_playlists.clear()
+                return
+
+            regular = data.setdefault("mhlp", [])
+            podcast = data.setdefault("mhlp_podcast", [])
+            smart = data.setdefault("mhlp_smart", [])
+            buckets = (regular, podcast, smart)
+
+            for pending in self._user_playlists:
+                playlist_id = pending.get("playlist_id", 0)
+                if not playlist_id or pending.get("master_flag"):
+                    continue
+
+                row = dict(pending)
+                items = row.get("items")
+                if isinstance(items, list):
+                    row["mhip_child_count"] = len(items)
+
+                if row.get("smart_playlist_data") or row.get("_source") == "smart":
+                    target = smart
+                elif row.get("podcast_flag", 0) == 1 or row.get("_source") == "podcast":
+                    target = podcast
+                else:
+                    target = regular
+
+                for bucket in buckets:
+                    for index, existing in enumerate(bucket):
+                        if existing.get("playlist_id") == playlist_id:
+                            if bucket is target:
+                                bucket[index] = row
+                            else:
+                                del bucket[index]
+                            break
+                    else:
+                        continue
+                    continue
+
+                if not any(existing.get("playlist_id") == playlist_id for existing in target):
+                    target.append(row)
+
+            self._user_playlists.clear()
+
+        self.playlists_changed.emit()
 
     def update_track_flags(self, tracks: list[dict], changes: dict) -> None:
         with self._lock:

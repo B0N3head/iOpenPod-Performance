@@ -1335,7 +1335,10 @@ class PlaylistImportWorker(QThread):
             )
             from SyncEngine.mapping import MappingManager
             from SyncEngine.pc_library import PCLibrary
-            from SyncEngine.playlist_parser import parse_playlist
+            from SyncEngine.playlist_parser import (
+                parse_playlist,
+                resolve_existing_playlist_path,
+            )
             from SyncEngine.quick_writes import (
                 write_imported_playlist_from_db_track_ids,
             )
@@ -1355,10 +1358,11 @@ class PlaylistImportWorker(QThread):
             existing_paths: list[str] = []
             skipped = 0
             for raw_path in raw_paths:
-                if Path(raw_path).is_file():
-                    existing_paths.append(raw_path)
-                else:
+                resolved_path = resolve_existing_playlist_path(raw_path)
+                if resolved_path is None:
                     skipped += 1
+                    continue
+                existing_paths.append(resolved_path)
 
             total = len(existing_paths)
             if not existing_paths:
@@ -1612,9 +1616,11 @@ class SyncExecuteWorker(QThread):
                 self.ipod_path,
                 cache_dir=cache_dir,
                 max_workers=settings.sync_workers,
+                max_device_write_workers=settings.device_write_workers,
                 max_cache_size_gb=settings.max_cache_size_gb,
                 fpcalc_path=settings.fpcalc_path,
                 transcode_options=build_transcode_options(settings),
+                device_info=self.device_info,
                 photo_sync_settings={
                     "rotate_tall_photos_for_device": (
                         settings.rotate_tall_photos_for_device

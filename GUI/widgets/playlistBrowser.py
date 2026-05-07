@@ -8,28 +8,48 @@ import logging
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
-    QProgressBar, QPushButton,
-    QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSplitter,
+    QStackedWidget,
+    QVBoxLayout,
     QWidget,
 )
 
 from app_core.jobs import (
     PlaylistDeleteWorker as _PlaylistDeleteWorker,
+)
+from app_core.jobs import (
     PlaylistImportWorker as _PlaylistImportWorker,
+)
+from app_core.jobs import (
     PlaylistWriteWorker as _PlaylistWriteWorker,
 )
 
-from ..styles import (
-    Colors, FONT_FAMILY, Metrics, btn_css,
-    sidebar_nav_css, sidebar_nav_selected_css,
-    LABEL_SECONDARY, make_scroll_area,
-    make_detail_row, make_separator, make_section_header,
-)
 from ..glyphs import glyph_icon, glyph_pixmap
+from ..styles import (
+    FONT_FAMILY,
+    LABEL_SECONDARY,
+    Colors,
+    Metrics,
+    btn_css,
+    make_detail_row,
+    make_scroll_area,
+    make_section_header,
+    make_separator,
+    sidebar_nav_css,
+    sidebar_nav_selected_css,
+)
 from .browserChrome import (
     BrowserHeroHeader,
     BrowserPane,
@@ -40,8 +60,8 @@ from .formatters import (
     format_duration_human,
     format_mhsd5_type,
     format_size,
-    format_sort_order,
     format_smart_rules_summary,
+    format_sort_order,
 )
 from .MBListView import MusicBrowserList
 from .playlistEditor import NewPlaylistDialog, RegularPlaylistEditor, SmartPlaylistEditor
@@ -85,7 +105,7 @@ class PlaylistInfoCard(QFrame):
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins((16), (16), (16), (16))
-        self._layout.setSpacing((8))
+        self._layout.setSpacing(8)
 
         # ── Title row ───────────────────────────────────────────
         self.title_label = QLabel("Select a playlist")
@@ -560,7 +580,7 @@ class PlaylistListPanel(QFrame):
             empty_container.setStyleSheet("background: transparent; border: none;")
             empty_vbox = QVBoxLayout(empty_container)
             empty_vbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty_vbox.setSpacing((8))
+            empty_vbox.setSpacing(8)
 
             empty_icon = QLabel()
             _px = glyph_pixmap("annotation-dots", Metrics.FONT_ICON_LG, Colors.TEXT_TERTIARY)
@@ -587,6 +607,14 @@ class PlaylistListPanel(QFrame):
     def clear(self) -> None:
         """Public clear."""
         self._clear()
+
+    def selectPlaylistById(self, playlist_id: int) -> bool:
+        """Select a playlist button by playlist ID if it is present."""
+        for index, playlist in self._playlist_map.items():
+            if int(playlist.get("playlist_id", 0) or 0) == playlist_id:
+                self._on_click(index)
+                return True
+        return False
 
     # ─────────────────────────────────────────────────────────────
     # Internal
@@ -855,7 +883,7 @@ class PlaylistBrowser(QFrame):
         # Splitter styling
         self.rightSplitter.setCollapsible(0, True)
         self.rightSplitter.setCollapsible(1, True)
-        self.rightSplitter.setHandleWidth((3))
+        self.rightSplitter.setHandleWidth(3)
         self.rightSplitter.setStretchFactor(0, 1)
         self.rightSplitter.setStretchFactor(1, 3)
         self.rightSplitter.setSizes([250, 600])
@@ -889,6 +917,24 @@ class PlaylistBrowser(QFrame):
         self.trackTitleBar.setTitle("Select a playlist")
         self.trackTitleBar.resetColor()
         self._current_playlist = None
+
+    def refreshFromCache(self) -> None:
+        """Refresh playlist UI from cache while preserving the current selection."""
+        cache = self._library_cache
+        if not cache.is_ready():
+            return
+
+        playlists = cache.get_playlists()
+        signature = self._compute_playlist_signature(playlists)
+        current_pid = int((self._current_playlist or {}).get("playlist_id", 0) or 0)
+
+        if signature != self._playlist_signature:
+            self.listPanel.loadPlaylists(playlists)
+            self._playlist_signature = signature
+
+        if current_pid:
+            if self.listPanel.selectPlaylistById(current_pid):
+                return
 
     def clear(self) -> None:
         """Clear everything when device changes."""

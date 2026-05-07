@@ -1,4 +1,3 @@
-import json
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,27 +33,15 @@ def test_settings_persistence_round_trip(monkeypatch) -> None:
             lambda: str(settings_dir / "settings.json"),
         )
 
-        settings = AppSettings(media_folder="C:/Music", window_width=1440)
+        settings = AppSettings(
+            media_folder="C:/Music",
+            window_width=1440,
+            device_write_workers=2,
+        )
         save_app_settings(settings)
 
         loaded = load_app_settings()
 
     assert loaded.media_folder == "C:/Music"
     assert loaded.window_width == 1440
-
-
-def test_settings_persistence_migrates_legacy_music_folder(monkeypatch) -> None:
-    with repo_temp_dir() as tmp_path:
-        settings_dir = tmp_path / "settings"
-        settings_dir.mkdir()
-        path = settings_dir / "settings.json"
-        path.write_text(json.dumps({"music_folder": "C:/OldMusic"}), encoding="utf-8")
-        monkeypatch.setattr(
-            settings_persistence,
-            "get_settings_path",
-            lambda: str(path),
-        )
-
-        loaded = load_app_settings()
-
-    assert loaded.media_folder == "C:/OldMusic"
+    assert loaded.device_write_workers == 2

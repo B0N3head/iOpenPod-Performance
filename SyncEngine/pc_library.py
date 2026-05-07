@@ -12,21 +12,22 @@ Uses mutagen for metadata extraction. Supports:
 - Opus (.opus)
 """
 
+import json
+import logging
+import os
+import sys
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+
 from ._formats import (
     AUDIO_EXTENSIONS,
-    VIDEO_EXTENSIONS,
     MEDIA_EXTENSIONS,
     NEEDS_TRANSCODING,
     VIDEO_ALWAYS_TRANSCODE,
+    VIDEO_EXTENSIONS,
     VIDEO_PROBE_CONTAINERS,
 )
-import os
-import sys
-import json
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Iterator, Callable
-import logging
 
 try:
     import mutagen
@@ -182,7 +183,7 @@ def write_sound_check_tag(file_path: str, sound_check: int) -> bool:
             audio.save()
 
         elif ext in (".m4a", ".m4b", ".m4p", ".aac"):
-            from mutagen.mp4 import MP4FreeForm, AtomDataType
+            from mutagen.mp4 import AtomDataType, MP4FreeForm
             audio["----:com.apple.iTunes:replaygain_track_gain"] = [
                 MP4FreeForm(gain_str.encode("utf-8"), dataformat=AtomDataType.UTF8)
             ]
@@ -415,33 +416,33 @@ class PCTrack:
     title: str
     artist: str
     album: str
-    album_artist: Optional[str]
-    genre: Optional[str]
-    year: Optional[int]
-    track_number: Optional[int]
-    track_total: Optional[int]
-    disc_number: Optional[int]
-    disc_total: Optional[int]
+    album_artist: str | None
+    genre: str | None
+    year: int | None
+    track_number: int | None
+    track_total: int | None
+    disc_number: int | None
+    disc_total: int | None
     duration_ms: int  # Duration in milliseconds
-    bitrate: Optional[int]  # Bitrate in kbps
-    sample_rate: Optional[int]  # Sample rate in Hz
-    rating: Optional[int]  # Rating 0-100 (stars × 20, same as iPod)
+    bitrate: int | None  # Bitrate in kbps
+    sample_rate: int | None  # Sample rate in Hz
+    rating: int | None  # Rating 0-100 (stars × 20, same as iPod)
 
     # Sort tags (for proper ordering on iPod)
-    sort_artist: Optional[str] = None
-    sort_name: Optional[str] = None
-    sort_album: Optional[str] = None
-    sort_album_artist: Optional[str] = None
-    sort_composer: Optional[str] = None
+    sort_artist: str | None = None
+    sort_name: str | None = None
+    sort_album: str | None = None
+    sort_album_artist: str | None = None
+    sort_composer: str | None = None
 
     # Compilation flag (Various Artists albums)
     compilation: bool = False
 
     # Additional string metadata
-    comment: Optional[str] = None
-    composer: Optional[str] = None
-    grouping: Optional[str] = None
-    bpm: Optional[int] = None
+    comment: str | None = None
+    composer: str | None = None
+    grouping: str | None = None
+    bpm: int | None = None
 
     # Sound Check / ReplayGain (iPod volume normalization value)
     sound_check: int = 0
@@ -465,37 +466,37 @@ class PCTrack:
     date_released: int = 0
 
     # Subtitle (TIT3 in ID3, desc atom in MP4 when description uses ldes)
-    subtitle: Optional[str] = None
+    subtitle: str | None = None
 
     # Content advisory / explicit flag
     explicit_flag: int = 0  # 0=none, 1=explicit, 2=clean
     has_lyrics: bool = False  # True if embedded lyrics exist
-    lyrics: Optional[str] = None  # Full lyrics text (for iPod MHOD type 10)
+    lyrics: str | None = None  # Full lyrics text (for iPod MHOD type 10)
 
     # Artwork hash (MD5 of embedded image bytes, for change detection)
-    art_hash: Optional[str] = None
+    art_hash: str | None = None
 
     # Video metadata (populated only for video files)
     is_video: bool = False  # True if file is a video
     video_kind: str = ""  # "movie", "music_video", "tv_show", or "" for audio
-    show_name: Optional[str] = None  # TV show name
-    season_number: Optional[int] = None  # TV show season
-    episode_number: Optional[int] = None  # TV show episode number
-    episode_id: Optional[str] = None  # Episode ID string
-    description: Optional[str] = None  # Track/episode description
-    long_description: Optional[str] = None  # Extended description
-    network_name: Optional[str] = None  # TV network
-    sort_show: Optional[str] = None  # Sort show name
+    show_name: str | None = None  # TV show name
+    season_number: int | None = None  # TV show season
+    episode_number: int | None = None  # TV show episode number
+    episode_id: str | None = None  # Episode ID string
+    description: str | None = None  # Track/episode description
+    long_description: str | None = None  # Extended description
+    network_name: str | None = None  # TV network
+    sort_show: str | None = None  # Sort show name
 
     # Podcast/audiobook detection (populated from stik atom or file extension)
     is_podcast: bool = False     # True if stik=21 or pcst atom present
     is_audiobook: bool = False   # True if stik=2 or .m4b extension
-    category: Optional[str] = None  # Podcast/audiobook category (from catg atom)
-    podcast_url: Optional[str] = None  # Podcast feed URL (from purl atom)
-    podcast_enclosure_url: Optional[str] = None  # Per-episode audio URL (enclosure)
+    category: str | None = None  # Podcast/audiobook category (from catg atom)
+    podcast_url: str | None = None  # Podcast feed URL (from purl atom)
+    podcast_enclosure_url: str | None = None  # Per-episode audio URL (enclosure)
 
     # Chapter markers (list of {"startpos": ms, "title": str})
-    chapters: Optional[list] = None
+    chapters: list | None = None
 
     # Computed
     needs_transcoding: bool = False  # True if format not iPod-native
@@ -534,6 +535,11 @@ class PCLibrary:
         if not self.root_path.is_dir():
             raise ValueError(f"Library path is not a directory: {self.root_path}")
 
+    @staticmethod
+    def _should_skip_library_file(filename: str) -> bool:
+        """Return True for filesystem sidecars that should never become tracks."""
+        return filename.startswith("._")
+
     def count_audio_files(self, include_video: bool = True) -> int:
         """Count total media files in library (fast, no metadata reading).
 
@@ -542,15 +548,17 @@ class PCLibrary:
         """
         extensions = MEDIA_EXTENSIONS if include_video else AUDIO_EXTENSIONS
         count = 0
-        for root, _, files in os.walk(self.root_path):
+        for _root, _, files in os.walk(self.root_path):
             for filename in files:
+                if self._should_skip_library_file(filename):
+                    continue
                 if Path(filename).suffix.lower() in extensions:
                     count += 1
         return count
 
     def scan(
         self,
-        progress_callback: Optional[Callable[[int, int, PCTrack], None]] = None,
+        progress_callback: Callable[[int, int, PCTrack], None] | None = None,
         include_video: bool = True,
     ) -> Iterator[PCTrack]:
         """
@@ -572,6 +580,8 @@ class PCLibrary:
 
         for root, _, files in os.walk(self.root_path):
             for filename in files:
+                if self._should_skip_library_file(filename):
+                    continue
                 ext = Path(filename).suffix.lower()
                 if ext not in extensions:
                     continue
@@ -589,7 +599,7 @@ class PCLibrary:
                     current += 1
                     continue
 
-    def _read_track(self, file_path: Path) -> Optional[PCTrack]:
+    def _read_track(self, file_path: Path) -> PCTrack | None:
         """Read metadata from a single audio or video file."""
         stat = file_path.stat()
         ext = file_path.suffix.lower()
@@ -704,10 +714,10 @@ class PCLibrary:
             chapters=chapters,
         )
 
-    def _compute_art_hash(self, file_path: Path) -> Optional[str]:
+    def _compute_art_hash(self, file_path: Path) -> str | None:
         """Compute MD5 hash of album art (embedded or folder image) for change detection."""
         try:
-            from ArtworkDB_Writer.art_extractor import extract_art_with_folder, art_hash
+            from ArtworkDB_Writer.art_extractor import art_hash, extract_art_with_folder
             art_bytes = extract_art_with_folder(str(file_path))
             if art_bytes:
                 return art_hash(art_bytes)
@@ -725,6 +735,7 @@ class PCLibrary:
                 try:
                     import json
                     from subprocess import check_output
+
                     from .transcoder import find_ffmpeg
                     ffmpeg_path = find_ffmpeg()
                     ffprobe_path = str(ffmpeg_path).replace("ffmpeg", "ffprobe")
@@ -812,7 +823,7 @@ class PCLibrary:
         """Extract from mutagen easy interface."""
         metadata = {}
 
-        def get_first(key: str) -> Optional[str]:
+        def get_first(key: str) -> str | None:
             val = audio.get(key)
             if val and len(val) > 0:
                 return str(val[0])
@@ -845,7 +856,7 @@ class PCLibrary:
         return metadata
 
     @staticmethod
-    def _id3_text(tags, frame_id: str) -> Optional[str]:
+    def _id3_text(tags, frame_id: str) -> str | None:
         """Get first text value from an ID3 frame, or None."""
         frame = tags.get(frame_id)
         if frame and hasattr(frame, 'text') and frame.text:
@@ -863,7 +874,7 @@ class PCLibrary:
 
         tags = audio.tags
 
-        def _t(fid: str) -> Optional[str]:
+        def _t(fid: str) -> str | None:
             return self._id3_text(tags, fid)
 
         # Core metadata from standard ID3 frames

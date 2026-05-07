@@ -186,10 +186,17 @@ class MusicBrowser(QFrame):
         """Mark heavy tabs dirty when cache-backed data changes."""
         try:
             cache = self._library_cache
-            cache.playlists_changed.connect(lambda: self._mark_tab_dirty("Playlists"))
+            cache.playlists_changed.connect(self._on_playlists_changed)
             cache.photos_changed.connect(lambda: self._mark_tab_dirty("Photos"))
         except Exception:
             pass
+
+    def _on_playlists_changed(self) -> None:
+        """Refresh the playlists view in place when playlist data changes."""
+        self._mark_tab_dirty("Playlists")
+        if self._current_category == "Playlists" and self._tab_loaded["Playlists"]:
+            self.playlistBrowser.refreshFromCache()
+            self._tab_dirty["Playlists"] = False
 
     def _mark_tab_dirty(self, tab_name: str) -> None:
         if tab_name in self._tab_dirty:

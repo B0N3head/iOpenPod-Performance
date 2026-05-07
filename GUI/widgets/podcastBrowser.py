@@ -24,10 +24,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
@@ -115,6 +117,83 @@ def _fmt_date(ts: float) -> str:
 _PODCAST_EPISODE_COLUMNS = ["Title", "ep_status", "length", "date_added", "size"]
 
 
+def _is_remote_artwork_source(source: str) -> bool:
+    parsed = urlparse(str(source or "").strip())
+    return parsed.scheme.lower() in {"http", "https"}
+
+
+def _resolve_local_artwork_path(source: str) -> Path | None:
+    text = str(source or "").strip()
+    if not text:
+        return None
+
+    parsed = urlparse(text)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        return None
+
+    if scheme == "file":
+        path_text = unquote(parsed.path or "")
+        if (
+            os.name == "nt"
+            and path_text.startswith("/")
+            and len(path_text) > 2
+            and path_text[2] == ":"
+        ):
+            path_text = path_text[1:]
+        if parsed.netloc and parsed.netloc.lower() != "localhost" and path_text:
+            if os.name == "nt":
+                return Path("\\\\" + parsed.netloc + path_text.replace("/", "\\"))
+            return Path("//" + parsed.netloc + path_text)
+        return Path(path_text)
+
+    if re.match(r"^[a-zA-Z]:[\\/]", text):
+        return Path(text)
+
+    if text.startswith("\\\\") or text.startswith("//"):
+        return Path(text)
+
+    return Path(text)
+
+
+def _read_local_artwork_bytes(source: str) -> bytes | None:
+    path = _resolve_local_artwork_path(source)
+    if path is None:
+        return None
+    try:
+        if not path.exists() or not path.is_file():
+            return b""
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _load_artwork_bytes(source: str) -> bytes | None:
+    local_bytes = _read_local_artwork_bytes(source)
+    if local_bytes is not None:
+        return local_bytes or None
+
+    if not _is_remote_artwork_source(source):
+        return None
+
+    import requests
+
+    resp = requests.get(
+        source,
+        timeout=10,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        },
+    )
+    resp.raise_for_status()
+    return resp.content or None
+
+
 def _colorize_ep_status(bl) -> None:
     """Apply per-row colors to the ep_status column after population."""
     if "ep_status" not in bl._columns:
@@ -184,6 +263,7 @@ class _PodcastEpisodeList:
 # ── Feed artwork cache ───────────────────────────────────────────────────────
 # Maps artwork source path/URL → QPixmap so that repeated list refreshes don't re-download.
 _artwork_cache: dict[str, QPixmap] = {}
+_artwork_color_cache: dict[str, tuple[int, int, int]] = {}
 
 
 class PodcastBrowser(QFrame):
@@ -213,6 +293,7 @@ class PodcastBrowser(QFrame):
         self._deferred_reconcile_tracks: list[dict] | None = None
         self._episode_by_guid: dict[str, object] = {}
         self._episode_dicts: list[dict] = []
+        self._artwork_inflight: dict[str, list[Callable[[str, QPixmap], None]]] = {}
 
         self._build_ui()
 
@@ -274,8 +355,10 @@ class PodcastBrowser(QFrame):
 
     def clear(self) -> None:
         """Reset all state (called on device change)."""
-        global _artwork_cache
+        global _artwork_cache, _artwork_color_cache
         _artwork_cache.clear()
+        _artwork_color_cache.clear()
+        self._artwork_inflight.clear()
 
         self._store = None
         self._selected_feed = None
@@ -1703,6 +1786,36 @@ class PodcastBrowser(QFrame):
         except Exception:
             pass
 
+    def _apply_hero_color_for_source(self, source: str, pixmap: QPixmap) -> None:
+        cached = _artwork_color_cache.get(source)
+        if cached is not None:
+            self._apply_feed_hero_color(*cached)
+            return
+        try:
+            small = pixmap.scaled(
+                20,
+                20,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            img = small.toImage().convertToFormat(QImage.Format.Format_RGB888)
+            ptr = img.bits()
+            if ptr is None:
+                return
+            raw = bytes(ptr.asarray(img.width() * img.height() * 3))
+            n = img.width() * img.height()
+            if n == 0:
+                return
+            color = (
+                sum(raw[0::3]) // n,
+                sum(raw[1::3]) // n,
+                sum(raw[2::3]) // n,
+            )
+            _artwork_color_cache[source] = color
+            self._apply_feed_hero_color(*color)
+        except Exception:
+            pass
+
     def _apply_feed_hero_color(self, r: int, g: int, b: int) -> None:
         """Tint the hero header with the artwork's dominant color."""
         if Colors._active_mode == "light":
@@ -1783,118 +1896,95 @@ class PodcastBrowser(QFrame):
     def _feed_artwork_source(self, feed) -> str:
         return getattr(feed, "artwork_path", "") or getattr(feed, "artwork_url", "")
 
-    def _load_feed_artwork(self, source: str) -> None:
-        """Load feed artwork for the header panel in background."""
-        if source in _artwork_cache:
-            art_w = max(1, self._feed_art.width())
-            art_h = max(1, self._feed_art.height())
-            pm = scale_pixmap_for_display(
-                _artwork_cache[source],
-                art_w,
-                art_h,
-                widget=self._feed_art,
-                aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
-                transform_mode=Qt.TransformationMode.SmoothTransformation,
-            )
-            self._feed_art.setPixmap(pm)
-            self._feed_art.setText("")
-            self._apply_hero_color_from_pixmap(_artwork_cache[source])
-            return
-
-        if source and os.path.exists(source):
-            try:
-                with open(source, "rb") as f:
-                    data = f.read()
-            except OSError:
-                data = b""
-            if data:
-                self._on_feed_artwork_loaded(data, source)
-                return
-
+    def _request_artwork(
+        self,
+        source: str,
+        on_ready: Callable[[str, QPixmap], None],
+    ) -> None:
         if not source:
             return
 
-        import requests
+        cached = _artwork_cache.get(source)
+        if cached is not None:
+            on_ready(source, cached)
+            return
+
+        waiters = self._artwork_inflight.get(source)
+        if waiters is not None:
+            waiters.append(on_ready)
+            return
+
+        self._artwork_inflight[source] = [on_ready]
 
         from app_core.runtime import ThreadPoolSingleton, Worker
 
-        target_url = source
-
-        def _fetch():
-            resp = requests.get(target_url, timeout=10)
-            resp.raise_for_status()
-            return resp.content
+        def _fetch() -> tuple[str, bytes | None]:
+            return source, _load_artwork_bytes(source)
 
         worker = Worker(_fetch)
-        worker.signals.result.connect(lambda data, u=target_url: self._on_feed_artwork_loaded(data, u))
+        worker.signals.result.connect(self._on_artwork_request_finished)
         worker.signals.error.connect(
-            lambda _: log.debug("Failed to load artwork: %s", target_url)
+            lambda _, s=source: self._on_artwork_request_failed(s)
         )
         ThreadPoolSingleton.get_instance().start(worker)
 
-    def _on_feed_artwork_loaded(self, data: bytes, url: str) -> None:
+    def _on_artwork_request_finished(self, result: tuple[str, bytes | None]) -> None:
+        source, data = result
+        callbacks = self._artwork_inflight.pop(source, [])
+        if not data:
+            return
+
         img = QImage()
         if not img.loadFromData(data):
             return
+
         full_pm = QPixmap.fromImage(img)
-        _artwork_cache[url] = full_pm
+        _artwork_cache[source] = full_pm
 
-        # Update header art if still showing the same feed
-        if self._selected_feed and self._feed_artwork_source(self._selected_feed) == url:
-            art_w = max(1, self._feed_art.width())
-            art_h = max(1, self._feed_art.height())
-            pm = scale_pixmap_for_display(
-                full_pm,
-                art_w,
-                art_h,
-                widget=self._feed_art,
-                aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
-                transform_mode=Qt.TransformationMode.SmoothTransformation,
-            )
-            self._feed_art.setPixmap(pm)
-            self._feed_art.setText("")
-            self._apply_hero_color_from_pixmap(full_pm)
+        for callback in callbacks:
+            callback(source, full_pm)
 
-        # Update feed list item icon too
-        self._update_feed_list_icon(url, full_pm)
+    def _on_artwork_request_failed(self, source: str) -> None:
+        self._artwork_inflight.pop(source, None)
+        log.debug("Failed to load artwork: %s", source)
+
+    def _apply_feed_artwork_pixmap(self, source: str, full_pm: QPixmap) -> None:
+        art_w = max(1, self._feed_art.width())
+        art_h = max(1, self._feed_art.height())
+        pm = scale_pixmap_for_display(
+            full_pm,
+            art_w,
+            art_h,
+            widget=self._feed_art,
+            aspect_mode=Qt.AspectRatioMode.KeepAspectRatio,
+            transform_mode=Qt.TransformationMode.SmoothTransformation,
+        )
+        self._feed_art.setPixmap(pm)
+        self._feed_art.setText("")
+        self._apply_hero_color_for_source(source, full_pm)
+
+    def _load_feed_artwork(self, source: str) -> None:
+        """Load feed artwork for the header panel in background."""
+        def _apply_if_selected(loaded_source: str, full_pm: QPixmap) -> None:
+            if (
+                self._selected_feed
+                and self._feed_artwork_source(self._selected_feed) == loaded_source
+            ):
+                self._apply_feed_artwork_pixmap(loaded_source, full_pm)
+            self._update_feed_list_icon(loaded_source, full_pm)
+
+        self._request_artwork(source, _apply_if_selected)
 
     def _load_feed_list_artwork(self, source: str, row: int) -> None:
         """Load a feed's artwork for its list item thumbnail."""
-        if source and os.path.exists(source):
-            try:
-                with open(source, "rb") as f:
-                    data = f.read()
-            except OSError:
-                data = b""
-            if data:
-                self._on_list_artwork_loaded(data, source)
-                return
-
-        import requests
-
-        from app_core.runtime import ThreadPoolSingleton, Worker
-
-        target_url = source
-
-        def _fetch():
-            resp = requests.get(target_url, timeout=10)
-            resp.raise_for_status()
-            return resp.content
-
-        worker = Worker(_fetch)
-        worker.signals.result.connect(lambda data, u=target_url: self._on_list_artwork_loaded(data, u))
-        worker.signals.error.connect(
-            lambda _: log.debug("Failed to load list artwork: %s", target_url)
+        _ = row
+        self._request_artwork(
+            source,
+            lambda loaded_source, full_pm: self._update_feed_list_icon(
+                loaded_source,
+                full_pm,
+            ),
         )
-        ThreadPoolSingleton.get_instance().start(worker)
-
-    def _on_list_artwork_loaded(self, data: bytes, url: str) -> None:
-        img = QImage()
-        if not img.loadFromData(data):
-            return
-        full_pm = QPixmap.fromImage(img)
-        _artwork_cache[url] = full_pm
-        self._update_feed_list_icon(url, full_pm)
 
     def _update_feed_list_icon(self, url: str, full_pm: QPixmap) -> None:
         """Set the icon for all feed list items whose artwork URL matches."""

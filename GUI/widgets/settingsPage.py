@@ -9,19 +9,39 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QUrl
-
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox, QComboBox, QFrame, QScrollArea, QFileDialog,
-    QLineEdit, QStackedWidget, QProgressDialog, QSpinBox,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtGui import QFont, QDesktopServices
+
 from ..styles import (
-    Colors, FONT_FAMILY, Metrics, btn_css, danger_btn_css,
-    sidebar_nav_css, sidebar_nav_selected_css,
-    back_btn_css, input_css, combo_css, link_btn_css, make_scroll_area,
+    FONT_FAMILY,
+    Colors,
+    Metrics,
+    back_btn_css,
+    btn_css,
+    combo_css,
+    danger_btn_css,
+    input_css,
+    link_btn_css,
+    make_scroll_area,
     resolve_accent_color,
+    sidebar_nav_css,
+    sidebar_nav_selected_css,
 )
 
 if TYPE_CHECKING:
@@ -141,7 +161,7 @@ class ComboRow(SettingRow):
         super().__init__(title, description)
 
         self.combo = QComboBox()
-        self.combo.setFixedWidth((130))
+        self.combo.setFixedWidth(130)
         self.combo.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
         self.combo.setStyleSheet(combo_css())
         if options:
@@ -208,12 +228,12 @@ class FolderRow(SettingRow):
         self._text_layout.addWidget(self.open_btn)
 
         right_layout = QHBoxLayout()
-        right_layout.setSpacing((8))
+        right_layout.setSpacing(8)
 
         self.path_label = QLabel(self._truncate(path) if path else "Not set")
         self.path_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self.path_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
-        self.path_label.setMinimumWidth((120))
+        self.path_label.setMinimumWidth(120)
         self.path_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         right_layout.addWidget(self.path_label)
 
@@ -301,14 +321,14 @@ class ResettableFolderRow(SettingRow):
         self._text_layout.addWidget(self.open_btn)
 
         right_layout = QHBoxLayout()
-        right_layout.setSpacing((8))
+        right_layout.setSpacing(8)
 
         self.path_label = QLabel(self._truncate(path) if path else default_label)
         self.path_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self.path_label.setStyleSheet(
             f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;"
         )
-        self.path_label.setMinimumWidth((120))
+        self.path_label.setMinimumWidth(120)
         self.path_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -316,7 +336,7 @@ class ResettableFolderRow(SettingRow):
 
         self.browse_btn = QPushButton("Browse\u2026")
         self.browse_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.browse_btn.setFixedWidth((80))
+        self.browse_btn.setFixedWidth(80)
         self.browse_btn.setStyleSheet(btn_css(
             bg=Colors.SURFACE_RAISED,
             bg_hover=Colors.SURFACE_ACTIVE,
@@ -329,7 +349,7 @@ class ResettableFolderRow(SettingRow):
 
         self.clear_btn = QPushButton("\u2715")
         self.clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.clear_btn.setFixedWidth((28))
+        self.clear_btn.setFixedWidth(28)
         self.clear_btn.setToolTip("Reset to default")
         self.clear_btn.setStyleSheet(btn_css(
             bg="transparent",
@@ -411,7 +431,7 @@ class ActionRow(SettingRow):
 
         self.action_btn = QPushButton(button_text)
         self.action_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.action_btn.setFixedWidth((100))
+        self.action_btn.setFixedWidth(100)
         self.action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.action_btn.setStyleSheet(btn_css(
             bg=Colors.SURFACE_RAISED,
@@ -439,18 +459,18 @@ class FileRow(SettingRow):
         self._filter_str = filter_str
 
         right_layout = QHBoxLayout()
-        right_layout.setSpacing((8))
+        right_layout.setSpacing(8)
 
         self.path_label = QLabel(self._truncate(path) if path else "Auto-detect")
         self.path_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self.path_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; background: transparent; border: none;")
-        self.path_label.setMinimumWidth((120))
+        self.path_label.setMinimumWidth(120)
         self.path_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         right_layout.addWidget(self.path_label)
 
         self.browse_btn = QPushButton("Browse…")
         self.browse_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.browse_btn.setFixedWidth((80))
+        self.browse_btn.setFixedWidth(80)
         self.browse_btn.setStyleSheet(btn_css(
             bg=Colors.SURFACE_RAISED,
             bg_hover=Colors.SURFACE_ACTIVE,
@@ -463,7 +483,7 @@ class FileRow(SettingRow):
 
         self.clear_btn = QPushButton("✕")
         self.clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.clear_btn.setFixedWidth((28))
+        self.clear_btn.setFixedWidth(28)
         self.clear_btn.setToolTip("Reset to auto-detect")
         self.clear_btn.setStyleSheet(btn_css(
             bg="transparent",
@@ -524,14 +544,14 @@ class ToolRow(SettingRow):
         self._lossy_pills_wrap = QWidget()
         pills_layout = QHBoxLayout(self._lossy_pills_wrap)
         pills_layout.setContentsMargins(0, 2, 0, 0)
-        pills_layout.setSpacing((6))
+        pills_layout.setSpacing(6)
 
         self._lossy_pills: dict[str, QLabel] = {}
         for key in ("aac", "aac_at", "libfdk_aac", "libmp3lame", "libshine"):
             pill = QLabel(key)
             pill.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
             pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pill.setMinimumWidth((104))
+            pill.setMinimumWidth(104)
             self._lossy_pills[key] = pill
             pills_layout.addWidget(pill)
         pills_layout.addStretch(1)
@@ -540,7 +560,7 @@ class ToolRow(SettingRow):
         self._lossy_pills_wrap.hide()
 
         right_layout = QHBoxLayout()
-        right_layout.setSpacing((8))
+        right_layout.setSpacing(8)
 
         self.status_label = QLabel("Checking…")
         self.status_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
@@ -549,7 +569,7 @@ class ToolRow(SettingRow):
 
         self.download_btn = QPushButton("Download")
         self.download_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.download_btn.setFixedWidth((90))
+        self.download_btn.setFixedWidth(90)
         self.download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.download_btn.setStyleSheet(btn_css(
             bg=Colors.ACCENT,
@@ -638,7 +658,7 @@ class _TokenRow(SettingRow):
             self._text_layout.addWidget(link_btn)
 
         right_layout = QHBoxLayout()
-        right_layout.setSpacing((8))
+        right_layout.setSpacing(8)
 
         self.status_label = QLabel("")
         self.status_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
@@ -649,7 +669,7 @@ class _TokenRow(SettingRow):
 
         self.token_input = QLineEdit()
         self.token_input.setPlaceholderText("Paste token here…")
-        self.token_input.setFixedWidth((220))
+        self.token_input.setFixedWidth(220)
         self.token_input.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
         self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_input.setStyleSheet(input_css())
@@ -657,7 +677,7 @@ class _TokenRow(SettingRow):
 
         self.save_btn = QPushButton("Connect")
         self.save_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.save_btn.setFixedWidth((80))
+        self.save_btn.setFixedWidth(80)
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.setStyleSheet(btn_css(
             bg=Colors.ACCENT,
@@ -672,7 +692,7 @@ class _TokenRow(SettingRow):
 
         self.clear_btn = QPushButton("✕")
         self.clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self.clear_btn.setFixedWidth((28))
+        self.clear_btn.setFixedWidth(28)
         self.clear_btn.setToolTip("Disconnect")
         self.clear_btn.setStyleSheet(btn_css(
             bg="transparent",
@@ -766,6 +786,7 @@ class _CacheSizeRow(SettingRow):
 
     def _on_clear(self) -> None:
         from PyQt6.QtWidgets import QMessageBox
+
         from SyncEngine.transcode_cache import TranscodeCache
         reply = QMessageBox.question(
             self,
@@ -807,7 +828,7 @@ class _SettingsCard(QFrame):
         lay.setSpacing(0)
 
         self._rows: list[QWidget] = []
-        self._seps: list["QFrame | None"] = []
+        self._seps: list[QFrame | None] = []
 
         for i, row in enumerate(rows):
             sep = None
@@ -903,7 +924,7 @@ class SettingsPage(QWidget):
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("settingsSidebar")
-        sidebar.setFixedWidth((240))
+        sidebar.setFixedWidth(240)
         sidebar.setStyleSheet(f"""
             QFrame#settingsSidebar {{
                 background: {Colors.SURFACE};
@@ -913,7 +934,7 @@ class SettingsPage(QWidget):
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins((16), (16), (16), (16))
-        layout.setSpacing((4))
+        layout.setSpacing(4)
 
         # Back button
         back_btn = QPushButton("←")
@@ -931,9 +952,9 @@ class SettingsPage(QWidget):
             f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;"
         )
         layout.addWidget(title)
-        layout.addSpacing((8))
+        layout.addSpacing(8)
         layout.addWidget(self._build_scope_switch())
-        layout.addSpacing((12))
+        layout.addSpacing(12)
 
         # Navigation items
         self._nav_buttons: list[QPushButton] = []
@@ -1041,7 +1062,7 @@ class SettingsPage(QWidget):
             f"color: {Colors.TEXT_PRIMARY}; background: transparent; border: none;"
         )
         layout.addWidget(title_label)
-        layout.addSpacing((20))
+        layout.addSpacing(20)
 
         for item in items:
             if isinstance(item, str):
@@ -1053,10 +1074,10 @@ class SettingsPage(QWidget):
                 )
                 self._section_labels[(title, item)] = lbl
                 layout.addWidget(lbl)
-                layout.addSpacing((8))
+                layout.addSpacing(8)
             else:
                 layout.addWidget(item)
-                layout.addSpacing((20))
+                layout.addSpacing(20)
 
         layout.addStretch()
         scroll.setWidget(content)
@@ -1186,10 +1207,21 @@ class SettingsPage(QWidget):
         )
 
     def _build_sync_page(self) -> QScrollArea:
-        self.media_folder = FolderRow(
-            "Media Folder",
-            "Default PC media library folder for sync. "
-            "This is remembered between sessions.",
+        self.sync_workers = ComboRow(
+            "Parallel Workers",
+            "Overall concurrent sync work. This controls how many files can be "
+            "prepared, fingerprinted, transcoded, or copied at once. "
+            "Auto uses your CPU core count (capped at 8).",
+            options=["Auto", "1", "2", "4", "6", "8"],
+            current="Auto",
+        )
+        self.device_write_workers = ComboRow(
+            "Parallel Writes",
+            "Simultaneous writes to the iPod filesystem. "
+            "Set to 1 for HDD-based iPods to reduce fragmentation risk. "
+            "Auto uses an HDD-safe default when the device looks like a hard-drive iPod.",
+            options=["Auto", "1", "2", "4"],
+            current="Auto",
         )
         self.write_back = ToggleRow(
             "Write Back to PC",
@@ -1225,7 +1257,6 @@ class SettingsPage(QWidget):
         )
 
         self._sync_card = _SettingsCard(
-            self.media_folder,
             self.write_back,
             self.compute_sound_check,
             self.rotate_tall_photos,
@@ -1235,7 +1266,13 @@ class SettingsPage(QWidget):
 
         return self._make_page(
             "Sync",
+            "Behavior",
             self._sync_card,
+            "Performance",
+            _SettingsCard(
+                self.sync_workers,
+                self.device_write_workers,
+            ),
         )
 
     def _build_transcoding_page(self) -> QScrollArea:
@@ -1309,14 +1346,6 @@ class SettingsPage(QWidget):
             "but take much longer.",
             options=["ultrafast", "veryfast", "fast", "medium", "slow"],
             current="fast",
-        )
-        self.sync_workers = ComboRow(
-            "Parallel Workers",
-            "Number of files to transcode/copy simultaneously. "
-            "Auto uses your CPU core count (capped at 8). "
-            "More workers = faster syncs with many transcodes.",
-            options=["Auto", "1", "2", "4", "6", "8"],
-            current="Auto",
         )
         self.mono_for_spoken = ToggleRow(
             "Mono for Spoken Word",
@@ -1413,10 +1442,6 @@ class SettingsPage(QWidget):
                 self.video_crf,
                 self.video_preset,
             ),
-            "Performance",
-            _SettingsCard(
-                self.sync_workers,
-            ),
         )
 
     def _build_tools_page(self) -> QScrollArea:
@@ -1495,8 +1520,9 @@ class SettingsPage(QWidget):
             current="5 GB",
         )
         self.cache_status = _CacheSizeRow(self._settings_service)
-        from infrastructure.settings_paths import get_settings_dir, default_data_dir
         import os as _os
+
+        from infrastructure.settings_paths import default_data_dir, get_settings_dir
         self.settings_dir = ResettableFolderRow(
             "Settings Location",
             "Custom directory to store iOpenPod settings. Useful for "
@@ -1528,8 +1554,9 @@ class SettingsPage(QWidget):
         )
 
     def _build_backups_page(self) -> QScrollArea:
-        from infrastructure.settings_paths import default_data_dir as _ddd
         import os as _os2
+
+        from infrastructure.settings_paths import default_data_dir as _ddd
         self.backup_dir = FolderRow(
             "Backup Location",
             "Where full device backups are stored on your PC. "
@@ -1632,6 +1659,7 @@ class SettingsPage(QWidget):
             self.video_crf,
             self.video_preset,
             self.sync_workers,
+            self.device_write_workers,
             self.scrobble_on_sync,
             self.listenbrainz_token_row,
             self.backup_before_sync,
@@ -1652,6 +1680,7 @@ class SettingsPage(QWidget):
             self.fdk_afterburner, self.aac_tns, self.aac_pns,
             self.aac_ms_stereo, self.aac_intensity_stereo,
             self.video_crf, self.video_preset, self.sync_workers,
+            self.device_write_workers,
             self.scrobble_on_sync, self.listenbrainz_token_row,
             self.backup_before_sync,
         ]
@@ -1688,7 +1717,6 @@ class SettingsPage(QWidget):
         self._about_card.setVisible(not device_scope)
         self._set_section_visible("General", "About", not device_scope)
 
-        self._sync_card.set_row_visible(self.media_folder, not device_scope)
         self._backups_card.set_row_visible(self.backup_dir, not device_scope)
         self._backups_card.set_row_visible(self.max_backups, not device_scope)
 
@@ -1738,7 +1766,6 @@ class SettingsPage(QWidget):
         self._loading_settings = True
         self.use_global_settings.value = bool(state.use_global_settings) if state else False
 
-        self.media_folder.value = s.media_folder
         self.write_back.value = s.write_back_to_pc
         self.compute_sound_check.value = s.compute_sound_check
         self.rotate_tall_photos.value = s.rotate_tall_photos_for_device
@@ -1908,13 +1935,18 @@ class SettingsPage(QWidget):
         if idx >= 0:
             self.sync_workers.combo.setCurrentIndex(idx)
 
+        write_workers_map = {0: "Auto", 1: "1", 2: "2", 4: "4"}
+        dww_text = write_workers_map.get(s.device_write_workers, "Auto")
+        idx = self.device_write_workers.combo.findText(dww_text)
+        if idx >= 0:
+            self.device_write_workers.combo.setCurrentIndex(idx)
+
         self._apply_scope_visibility()
 
         # Connect signals to auto-save (only once)
         if not hasattr(self, '_signals_connected'):
             self._signals_connected = True
             self.use_global_settings.changed.connect(self._save)
-            self.media_folder.changed.connect(self._save)
             self.write_back.changed.connect(self._save)
             self.compute_sound_check.changed.connect(self._save)
             self.rotate_tall_photos.changed.connect(self._save)
@@ -1942,6 +1974,7 @@ class SettingsPage(QWidget):
             self.video_crf.changed.connect(self._save)
             self.video_preset.changed.connect(self._save)
             self.sync_workers.changed.connect(self._save)
+            self.device_write_workers.changed.connect(self._save)
             self.show_art.changed.connect(self._save)
             self.accent_color.changed.connect(self._save)
             self.theme_combo.changed.connect(self._save)
@@ -2076,10 +2109,10 @@ class SettingsPage(QWidget):
         self._advanced_aac_card.set_row_visible(self.fdk_afterburner, is_fdk)
 
         # PNS / TNS / M/S / IS are only controllable on the native aac encoder
-        self._advanced_aac_card.set_row_visible(self.aac_tns,               is_native)
-        self._advanced_aac_card.set_row_visible(self.aac_pns,               is_native)
-        self._advanced_aac_card.set_row_visible(self.aac_ms_stereo,         is_native)
-        self._advanced_aac_card.set_row_visible(self.aac_intensity_stereo,  is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_tns, is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_pns, is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_ms_stereo, is_native)
+        self._advanced_aac_card.set_row_visible(self.aac_intensity_stereo, is_native)
 
     def _on_bitrate_mode_changed(self, _: str) -> None:
         self._update_lossy_visibility()
@@ -2112,9 +2145,9 @@ class SettingsPage(QWidget):
     @staticmethod
     def _vbr_level_to_text(encoder: str, level: int) -> str:
         if encoder == "libfdk_aac":
-            l = max(1, min(5, level))
+            lbl = max(1, min(5, level))
             labels = {1: "VBR 1 (Low)", 5: "VBR 5 (High)"}
-            return labels.get(l, f"VBR {l}")
+            return labels.get(lbl, f"VBR {lbl}")
         elif encoder == "aac_at":
             q = max(0, min(14, level))
             labels = {0: "q0 (Best)", 14: "q14 (Lowest)"}
@@ -2128,8 +2161,6 @@ class SettingsPage(QWidget):
 
     def _read_controls_into_settings(self, s, include_global_only: bool) -> None:
         """Copy visible control values into an AppSettings object."""
-        if include_global_only:
-            s.media_folder = self.media_folder.value
         s.write_back_to_pc = self.write_back.value
         s.compute_sound_check = self.compute_sound_check.value
         s.rotate_tall_photos_for_device = self.rotate_tall_photos.value
@@ -2236,6 +2267,11 @@ class SettingsPage(QWidget):
         # Parse sync workers
         sw_text = self.sync_workers.value
         s.sync_workers = int(sw_text) if sw_text and sw_text != "Auto" else 0
+
+        dww_text = self.device_write_workers.value
+        s.device_write_workers = (
+            int(dww_text) if dww_text and dww_text != "Auto" else 0
+        )
 
         if include_global_only:
             # Font scale
@@ -2364,6 +2400,7 @@ class SettingsPage(QWidget):
     def _check_for_updates(self):
         """Check GitHub for a newer version in a background thread."""
         from PyQt6.QtWidgets import QMessageBox
+
         from GUI.auto_updater import UpdateChecker, UpdateResult
 
         self.version_row.action_btn.setEnabled(False)
@@ -2394,8 +2431,11 @@ class SettingsPage(QWidget):
     def _handle_update_result(self, result):
         """Show update-available UI and optionally download/install."""
         from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+
         from GUI.auto_updater import (
-            UpdateDownloader, stage_update, launch_bootstrap_and_exit,
+            UpdateDownloader,
+            launch_bootstrap_and_exit,
+            stage_update,
             update_log_path,
         )
 
@@ -2528,12 +2568,12 @@ class SettingsPage(QWidget):
 
     def _refresh_tool_status(self):
         """Check whether ffmpeg and fpcalc are reachable and update the UI."""
+        from SyncEngine.audio_fingerprint import find_fpcalc
         from SyncEngine.transcoder import (
-            find_ffmpeg,
             available_aac_encoders,
             available_mp3_encoders,
+            find_ffmpeg,
         )
-        from SyncEngine.audio_fingerprint import find_fpcalc
 
         settings = self._settings_service.get_effective_settings()
         ffmpeg = find_ffmpeg(settings.ffmpeg_path)
@@ -2561,7 +2601,8 @@ class SettingsPage(QWidget):
         def _do():
             from SyncEngine.dependency_manager import download_ffmpeg
             download_ffmpeg()
-            from PyQt6.QtCore import QMetaObject, Qt as QtCore_Qt
+            from PyQt6.QtCore import QMetaObject
+            from PyQt6.QtCore import Qt as QtCore_Qt
             QMetaObject.invokeMethod(
                 self, "_on_ffmpeg_downloaded",
                 QtCore_Qt.ConnectionType.QueuedConnection,
@@ -2577,7 +2618,8 @@ class SettingsPage(QWidget):
         def _do():
             from SyncEngine.dependency_manager import download_fpcalc
             download_fpcalc()
-            from PyQt6.QtCore import QMetaObject, Qt as QtCore_Qt
+            from PyQt6.QtCore import QMetaObject
+            from PyQt6.QtCore import Qt as QtCore_Qt
             QMetaObject.invokeMethod(
                 self, "_on_fpcalc_downloaded",
                 QtCore_Qt.ConnectionType.QueuedConnection,
@@ -2671,7 +2713,8 @@ class SettingsPage(QWidget):
                 key,
                 pending_use_global,
             )
-            from PyQt6.QtCore import QMetaObject, Qt as QtCore_Qt
+            from PyQt6.QtCore import QMetaObject
+            from PyQt6.QtCore import Qt as QtCore_Qt
             QMetaObject.invokeMethod(
                 self, "_on_listenbrainz_validate_result",
                 QtCore_Qt.ConnectionType.QueuedConnection,

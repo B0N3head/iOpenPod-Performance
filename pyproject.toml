@@ -40,6 +40,7 @@ dependencies = [
     "feedparser>=6.0.10",
     "requests>=2.31.0",
     "packaging>=23.0",
+    "tqdm>=4.67.3",
 ]
 
 [project.scripts]

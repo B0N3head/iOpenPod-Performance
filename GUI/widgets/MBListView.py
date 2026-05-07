@@ -9,6 +9,7 @@ robust against rapid user interactions (spam-clicking).
 from __future__ import annotations
 
 import logging
+import random
 import sys as _sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -170,6 +171,30 @@ def format_samples(val: int) -> str:
     if not val:
         return ""
     return f"{val:,}"
+
+
+def build_new_regular_playlist(
+    selected_tracks: list[dict],
+    *,
+    title: str = "New Playlist",
+) -> dict | None:
+    """Build a new regular playlist payload from selected tracks."""
+    items: list[dict[str, int]] = []
+    for track in selected_tracks:
+        track_id = track.get("track_id")
+        if track_id:
+            items.append({"track_id": int(track_id)})
+
+    if not items:
+        return None
+
+    return {
+        "Title": title,
+        "playlist_id": random.getrandbits(64),
+        "_isNew": True,
+        "_source": "regular",
+        "items": items,
+    }
 
 
 # =============================================================================
@@ -2223,7 +2248,15 @@ class MusicBrowserList(QFrame):
             if add_menu:
                 add_menu.setStyleSheet(menu_style)
 
+                new_playlist_act = add_menu.addAction("New Playlist")
+                if new_playlist_act:
+                    icon = glyph_icon("plus", 14, Colors.TEXT_PRIMARY)
+                    if icon is not None:
+                        new_playlist_act.setIcon(icon)
+                    new_playlist_act.triggered.connect(self._create_new_playlist_from_selected)
+
                 if regular:
+                    add_menu.addSeparator()
                     for pl in regular:
                         title = pl.get("Title", "Untitled")
                         act = add_menu.addAction(title)
@@ -2231,10 +2264,6 @@ class MusicBrowserList(QFrame):
                             act.triggered.connect(
                                 lambda _=False, p=pl: self._add_selected_to_playlist(p)
                             )
-                else:
-                    no_act = add_menu.addAction("(no playlists)")
-                    if no_act:
-                        no_act.setEnabled(False)
 
         # ── "Remove from Playlist" (only for editable regular playlists) ──
         if (self._is_playlist_mode and self._current_playlist
@@ -2684,6 +2713,30 @@ class MusicBrowserList(QFrame):
         title = playlist.get("Title", "Untitled")
         log.info("Added %d track(s) to playlist '%s' (id=0x%X)",
                  added, title, playlist.get("playlist_id", 0))
+
+    def _create_new_playlist_from_selected(self) -> None:
+        """Create a new regular playlist from the current selection."""
+        selected = self._get_selected_tracks()
+        if not selected:
+            return
+
+        cache = self._library_cache
+        if cache is None or not cache.is_ready():
+            return
+
+        playlist = build_new_regular_playlist(selected)
+        if playlist is None:
+            return
+
+        cache.save_user_playlist(playlist)
+        cache.playlist_quick_sync.emit()
+
+        log.info(
+            "Created playlist '%s' with %d track(s) (id=0x%X)",
+            playlist.get("Title", "Untitled"),
+            len(playlist.get("items", [])),
+            playlist.get("playlist_id", 0),
+        )
 
     def _remove_selected_from_playlist(self) -> None:
         """Remove selected tracks from the current playlist and save it."""
