@@ -6,9 +6,9 @@ including Apple's itunes: namespace extensions.
 
 from __future__ import annotations
 
+import calendar
 import logging
 import time
-import calendar
 
 import feedparser
 import requests
@@ -38,7 +38,7 @@ def fetch_feed(url: str, existing: PodcastFeed | None = None) -> PodcastFeed:
         ValueError: If the feed contains no entries or is unparseable.
     """
     resp = requests.get(url, timeout=_TIMEOUT, headers={
-        "User-Agent": "iOpenPod/1.0.46 (Podcast Manager)",
+        "User-Agent": "iOpenPod (Podcast Manager)",
     })
     resp.raise_for_status()
 
