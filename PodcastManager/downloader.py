@@ -11,14 +11,15 @@ import logging
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Protocol
-from urllib.parse import urlparse, unquote
+from typing import Protocol
+from urllib.parse import unquote, urlparse
 
 import requests
 
-from .models import PodcastEpisode, STATUS_DOWNLOADED, STATUS_DOWNLOADING
+from .models import STATUS_DOWNLOADED, STATUS_DOWNLOADING, PodcastEpisode
 
 log = logging.getLogger(__name__)
 
@@ -36,8 +37,8 @@ class CancelToken(Protocol):
 def download_episode(
     episode: PodcastEpisode,
     dest_dir: str,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-    cancel_token: Optional[CancelToken] = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_token: CancelToken | None = None,
 ) -> str:
     """Download a single podcast episode.
 
@@ -77,7 +78,7 @@ def download_episode(
         episode.audio_url,
         stream=True,
         timeout=_TIMEOUT,
-        headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
+        headers={"User-Agent": "iOpenPod (Podcast Manager)"},
     )
     resp.raise_for_status()
 
@@ -154,7 +155,7 @@ def embed_feed_artwork(file_path: str, artwork_url: str) -> bool:
             # Download the artwork image
             resp = requests.get(
                 artwork_url, timeout=15,
-                headers={"User-Agent": "iOpenPod/1.0.46 (Podcast Manager)"},
+                headers={"User-Agent": "iOpenPod (Podcast Manager)"},
             )
             resp.raise_for_status()
             art_data = resp.content
@@ -201,9 +202,9 @@ class DownloadedEpisodeInfo:
     size: int
     mtime: float
     extension: str
-    bitrate: Optional[int] = None
-    sample_rate: Optional[int] = None
-    duration_ms: Optional[int] = None
+    bitrate: int | None = None
+    sample_rate: int | None = None
+    duration_ms: int | None = None
 
 
 def download_and_probe_episode(
@@ -359,8 +360,8 @@ def _read_nero_chapters(file_path: str) -> list[dict] | None:
 
 def _read_qt_chapters_ffprobe(file_path: str) -> list[dict] | None:
     """Use ffprobe to extract QuickTime chapter tracks."""
-    import subprocess
     import json as _json
+    import subprocess
     import sys as _sys
 
     # Resolve ffprobe via the same search cascade as the transcoder

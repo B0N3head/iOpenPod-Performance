@@ -47,6 +47,20 @@ def parse_playlist(filepath: str | Path) -> tuple[list[str], str]:
     return paths, _derive_name(filepath)
 
 
+def resolve_existing_playlist_path(raw_path: str | Path) -> str | None:
+    """Return an existing filesystem path for a playlist entry if one exists.
+
+    Playlist files created by media players may encode the same file in a few
+    different ways: file URIs, percent-escaped paths, UNC-like network paths,
+    or Windows-style backslash separators on POSIX systems. This helper tries a
+    few safe variants and returns the first real file it finds.
+    """
+    for candidate in _path_candidates(raw_path):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Name derivation
 # ---------------------------------------------------------------------------
@@ -69,7 +83,7 @@ def _resolve_path(raw: str, base_dir: Path) -> str:
     - Absolute paths (Unix / or Windows drive letter)
     - Relative paths (resolved against base_dir)
     """
-    raw = raw.strip()
+    raw = raw.strip().strip("\"'")
     if not raw:
         return ""
 
@@ -77,6 +91,8 @@ def _resolve_path(raw: str, base_dir: Path) -> str:
     lower = raw.lower()
     if lower.startswith("http://") or lower.startswith("https://"):
         return ""
+
+    raw = unquote(raw)
 
     # file:// URI
     if lower.startswith("file://"):
@@ -95,12 +111,78 @@ def _resolve_path(raw: str, base_dir: Path) -> str:
         except Exception:
             return ""
 
+    if os.name != "nt" and "\\" in raw:
+        raw = raw.replace("\\", "/")
+
     p = Path(raw)
     if p.is_absolute():
         return str(p)
 
     # Relative — resolve against playlist directory
     return str((base_dir / raw).resolve())
+
+
+def _path_candidates(raw_path: str | Path) -> list[Path]:
+    raw = str(raw_path).strip().strip("\"'")
+    if not raw:
+        return []
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        text = candidate.strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        candidates.append(Path(text).expanduser())
+
+    _add(raw)
+
+    decoded = unquote(raw)
+    if decoded != raw:
+        _add(decoded)
+
+    if os.name != "nt" and "\\" in decoded:
+        _add(decoded.replace("\\", "/"))
+
+    if "://" not in raw:
+        return candidates
+
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        return []
+
+    decoded_path = unquote(parsed.path or "")
+
+    if parsed.scheme == "file":
+        if decoded_path:
+            if (
+                os.name == "nt"
+                and decoded_path.startswith("/")
+                and len(decoded_path) > 2
+                and decoded_path[2] == ":"
+            ):
+                decoded_path = decoded_path[1:]
+            _add(decoded_path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost" and decoded_path:
+            if os.name == "nt":
+                _add(
+                    "\\\\"
+                    + parsed.netloc
+                    + decoded_path.replace("/", "\\")
+                )
+            else:
+                _add("//" + parsed.netloc + decoded_path)
+        return candidates
+
+    if parsed.netloc and decoded_path:
+        if os.name == "nt":
+            _add("\\\\" + parsed.netloc + decoded_path.replace("/", "\\"))
+        else:
+            _add("//" + parsed.netloc + decoded_path)
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------

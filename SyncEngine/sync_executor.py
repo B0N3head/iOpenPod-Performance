@@ -20,33 +20,37 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from pathlib import Path
-from typing import Optional, Callable
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from .contracts import SyncOutcome, SyncProgress, SyncRequest
-from .fingerprint_diff_engine import SyncPlan, SyncItem
-from .mapping import MappingManager, MappingFile
-from .transcoder import (
-    TranscodeOptions,
-    clear_caches as _clear_transcoder_caches,
-    needs_transcoding,
-    quality_to_nominal_bitrate,
-    resolve_transcode_plan,
-    transcode,
-)
-from .audio_fingerprint import get_or_compute_fingerprint
-from .itunes_prefs import protect_from_itunes
-from .photos import apply_photo_sync_plan, read_photo_db
+from pathlib import Path
+from typing import Optional
 
-from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Shared.constants import (
     MEDIA_TYPE_MUSIC_VIDEO,
     MEDIA_TYPE_TV_SHOW,
     MEDIA_TYPE_VIDEO,
     MEDIA_TYPE_VIDEO_PODCAST,
 )
+from iTunesDB_Writer.mhit_writer import TrackInfo
 from iTunesDB_Writer.mhyp_writer import PlaylistInfo
+
+from .audio_fingerprint import get_or_compute_fingerprint
+from .contracts import SyncOutcome, SyncProgress, SyncRequest
+from .fingerprint_diff_engine import SyncItem, SyncPlan
+from .itunes_prefs import protect_from_itunes
+from .mapping import MappingFile, MappingManager
+from .photos import apply_photo_sync_plan, read_photo_db
+from .transcoder import (
+    TranscodeOptions,
+    needs_transcoding,
+    quality_to_nominal_bitrate,
+    resolve_transcode_plan,
+    transcode,
+)
+from .transcoder import (
+    clear_caches as _clear_transcoder_caches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,18 +112,18 @@ class _SyncContext:
     # ── Inputs (set once, read-only during sync) ────────────────────
     plan: SyncPlan
     mapping: MappingFile
-    progress_callback: Optional[Callable[["SyncProgress"], None]]
+    progress_callback: Callable[["SyncProgress"], None] | None
     dry_run: bool
     write_back_to_pc: bool
-    _is_cancelled: Optional[Callable[[], bool]]
+    _is_cancelled: Callable[[], bool] | None
 
     # ── GUI-decoupled inputs (passed forward, not pulled from GUI) ──
     user_playlists: list[dict] = field(default_factory=list)
-    on_sync_complete: Optional[Callable[[], None]] = None
+    on_sync_complete: Callable[[], None] | None = None
     compute_sound_check: bool = False
     scrobble_on_sync: bool = False
     listenbrainz_token: str = ""
-    _is_scrobble_cancelled: Optional[Callable[[], bool]] = None
+    _is_scrobble_cancelled: Callable[[], bool] | None = None
 
     # ── Result accumulator ──────────────────────────────────────────
     result: SyncOutcome = field(default_factory=lambda: SyncOutcome(success=True))
@@ -179,12 +183,14 @@ class SyncExecutor:
     def __init__(
         self,
         ipod_path: str | Path,
-        cache_dir: Optional[Path] = None,
+        cache_dir: Path | None = None,
         max_workers: int = 0,
+        max_device_write_workers: int = 0,
         max_cache_size_gb: float = 5.0,
         fpcalc_path: str = "",
         photo_sync_settings: dict[str, bool] | None = None,
         transcode_options: TranscodeOptions | None = None,
+        device_info: object | None = None,
     ):
         from .transcode_cache import TranscodeCache
 
@@ -198,6 +204,7 @@ class SyncExecutor:
         self.fpcalc_path = fpcalc_path
         self.photo_sync_settings = photo_sync_settings
         self.transcode_options = transcode_options or TranscodeOptions()
+        self.device_info = device_info
 
         self._folder_counter = 0
         self._folder_lock = threading.Lock()
@@ -207,6 +214,48 @@ class SyncExecutor:
             self._max_workers = min(os.cpu_count() or 4, 8)
         else:
             self._max_workers = max_workers
+        self._max_device_write_workers = self._resolve_device_write_workers(
+            max_device_write_workers,
+            self._max_workers,
+            device_info,
+        )
+        self._device_write_semaphore = threading.Semaphore(
+            self._max_device_write_workers
+        )
+
+    @staticmethod
+    def _is_likely_hdd_device(device_info: object | None) -> bool:
+        if device_info is None:
+            return False
+
+        family = str(getattr(device_info, "model_family", "") or "").strip().lower()
+        if not family:
+            return False
+
+        if any(token in family for token in ("nano", "shuffle")):
+            return False
+        if any(token in family for token in ("classic", "video", "photo", "mini")):
+            return True
+        return family.startswith("ipod")
+
+    @classmethod
+    def _resolve_device_write_workers(
+        cls,
+        configured_write_workers: int,
+        max_workers: int,
+        device_info: object | None,
+    ) -> int:
+        overall_workers = max(1, max_workers)
+        if configured_write_workers > 0:
+            return max(1, min(configured_write_workers, overall_workers))
+
+        if device_info is None:
+            return overall_workers
+
+        auto_workers = (
+            1 if cls._is_likely_hdd_device(device_info) else min(overall_workers, 4)
+        )
+        return max(1, min(auto_workers, overall_workers))
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -237,18 +286,18 @@ class SyncExecutor:
         self,
         plan: SyncPlan,
         mapping: MappingFile,
-        progress_callback: Optional[Callable[[SyncProgress], None]] = None,
+        progress_callback: Callable[[SyncProgress], None] | None = None,
         dry_run: bool = False,
-        is_cancelled: Optional[Callable[[], bool]] = None,
+        is_cancelled: Callable[[], bool] | None = None,
         write_back_to_pc: bool = False,
         *,
-        user_playlists: Optional[list[dict]] = None,
-        on_sync_complete: Optional[Callable[[], None]] = None,
+        user_playlists: list[dict] | None = None,
+        on_sync_complete: Callable[[], None] | None = None,
         compute_sound_check: bool = False,
         scrobble_on_sync: bool = False,
         listenbrainz_token: str = "",
-        is_scrobble_cancelled: Optional[Callable[[], bool]] = None,
-        on_cancel_with_partial: Optional[Callable[[int, int], bool]] = None,
+        is_scrobble_cancelled: Callable[[], bool] | None = None,
+        on_cancel_with_partial: Callable[[int, int], bool] | None = None,
     ) -> SyncOutcome:
         """Execute the sync plan.
 
@@ -274,6 +323,12 @@ class SyncExecutor:
             scrobble_on_sync=scrobble_on_sync,
             listenbrainz_token=listenbrainz_token,
             _is_scrobble_cancelled=is_scrobble_cancelled,
+        )
+
+        logger.info(
+            "Sync executor using %d overall workers and %d device write workers",
+            self._max_workers,
+            self._max_device_write_workers,
         )
 
         if not self._preflight_checks(ctx):
@@ -422,8 +477,8 @@ class SyncExecutor:
     def quick_write_playlists(
         self,
         user_playlists: list[dict],
-        progress_callback: Optional[Callable[["SyncProgress"], None]] = None,
-        on_complete: Optional[Callable[[], None]] = None,
+        progress_callback: Callable[["SyncProgress"], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
     ) -> SyncOutcome:
         """Rewrite the iPod database with only playlist changes (no file ops)."""
 
@@ -699,7 +754,7 @@ class SyncExecutor:
                     ctx.existing_playlists_raw.append(upl)
             logger.info("Merged user playlist '%s' (id=%s, new=%s)",
                         upl.get("Title", "?"),
-                        ("0x%X" % pid) if pid is not None else "new",
+                        (f"0x{pid:X}") if pid is not None else "new",
                         is_new)
             ctx.progress("playlists", idx + 1, len(user_pls),
                          message=f"Merged playlist: {upl.get('Title', '?')}")
@@ -733,8 +788,8 @@ class SyncExecutor:
         """Mark added podcast episodes as on_ipod and removed ones as downloaded
         in the subscription store so the state persists across sessions."""
         try:
+            from PodcastManager.models import STATUS_DOWNLOADED, STATUS_ON_IPOD
             from PodcastManager.subscription_store import SubscriptionStore
-            from PodcastManager.models import STATUS_ON_IPOD, STATUS_DOWNLOADED
         except ImportError:
             return
 
@@ -901,7 +956,7 @@ class SyncExecutor:
                 size_progress=size_frac,
             )
 
-        def _do_copy(item: SyncItem, worker_id: int) -> tuple[SyncItem, bool, Optional[Path], bool, str]:
+        def _do_copy(item: SyncItem, worker_id: int) -> tuple[SyncItem, bool, Path | None, bool, str]:
             if item.pc_track is None:
                 logger.error("_do_copy called with None pc_track for %s", item.description)
                 return (item, False, None, False, "No source track")
@@ -919,8 +974,8 @@ class SyncExecutor:
                 if ctx.progress_callback:
                     ctx.progress_callback(_build_progress())
 
-            transcode_cb: Optional[Callable[[float], None]] = None
-            copy_cb: Optional[Callable[[float], None]] = None
+            transcode_cb: Callable[[float], None] | None = None
+            copy_cb: Callable[[float], None] | None = None
             if ctx.progress_callback:
                 filename = source_path.name
 
@@ -1153,7 +1208,7 @@ class SyncExecutor:
     # Metadata field name → (TrackInfo attribute, coercion).
     # Coercion: None = pass-through, "int" = int-or-0, "int1" = int-or-1,
     #           "bool" = bool().
-    _META_FIELD_MAP: dict[str, tuple[str, Optional[str]]] = {
+    _META_FIELD_MAP: dict[str, tuple[str, str | None]] = {
         # Core string fields
         "title": ("title", None),
         "artist": ("artist", None),
@@ -1319,6 +1374,7 @@ class SyncExecutor:
         )
 
         from PodcastManager.downloader import download_and_probe_episode
+
         from ._formats import IPOD_NATIVE_AUDIO
 
         failed_items: list[SyncItem] = []
@@ -1638,8 +1694,7 @@ class SyncExecutor:
         # Determine music_dirs from device capabilities
         music_dirs = _DEFAULT_MUSIC_DIRS
         try:
-            from ipod_device import get_current_device
-            from ipod_device import capabilities_for_family_gen
+            from ipod_device import capabilities_for_family_gen, get_current_device
             dev = get_current_device()
             if dev and dev.model_family:
                 caps = capabilities_for_family_gen(
@@ -1658,7 +1713,7 @@ class SyncExecutor:
         return folder
 
     def _generate_ipod_filename(self, _original_name: str, extension: str,
-                                dest_folder: Optional[Path] = None) -> str:
+                                dest_folder: Path | None = None) -> str:
         """Generate a unique filename for iPod storage.
 
         Uses 4 random alphanumeric chars (36^4 = 1.7M combinations).
@@ -1687,12 +1742,12 @@ class SyncExecutor:
         self,
         source_path: Path,
         needs_transcode: bool,
-        fingerprint: Optional[str] = None,
-        transcode_progress: Optional[Callable[[float], None]] = None,
-        copy_progress: Optional[Callable[[float], None]] = None,
-        is_cancelled: Optional[Callable[[], bool]] = None,
-        expected_write_bytes: Optional[int] = None,
-    ) -> tuple[bool, Optional[Path], bool, str]:
+        fingerprint: str | None = None,
+        transcode_progress: Callable[[float], None] | None = None,
+        copy_progress: Callable[[float], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+        expected_write_bytes: int | None = None,
+    ) -> tuple[bool, Path | None, bool, str]:
         """
         Copy or transcode a file to iPod, using cache when possible.
 
@@ -1728,19 +1783,30 @@ class SyncExecutor:
             )
             target_format = plan.cache_target_format
             bitrate = plan.cache_bitrate_kbps
+            cache_source_hash = None
+            cache_source_mtime = 0.0
+            if fingerprint:
+                cache_source_hash, cache_source_mtime = (
+                    self.transcode_cache.describe_source(source_path)
+                )
 
             # Check transcode cache
             if fingerprint:
                 cached_path = self.transcode_cache.get(
-                    fingerprint, target_format, source_size, bitrate,
+                    fingerprint,
+                    target_format,
+                    source_size,
+                    bitrate,
                     source_path=source_path,
+                    source_hash=cache_source_hash,
+                    source_mtime=cache_source_mtime,
                 )
                 if cached_path:
                     ext = cached_path.suffix
                     new_name = self._generate_ipod_filename(source_path.stem, ext, dest_folder)
                     final_path = dest_folder / new_name
                     try:
-                        self._copy_file_chunked(
+                        self._copy_file_to_device(
                             cached_path, final_path,
                             copy_progress,
                             is_cancelled=is_cancelled,
@@ -1757,7 +1823,10 @@ class SyncExecutor:
             # avoid a redundant copy.  Only the USB copy to iPod remains.
             if fingerprint:
                 cache_path = self.transcode_cache.reserve(
-                    fingerprint, target_format, bitrate,
+                    fingerprint,
+                    target_format,
+                    bitrate,
+                    source_hash=cache_source_hash,
                 )
                 output_dir = cache_path.parent
                 output_filename = cache_path.stem
@@ -1787,6 +1856,8 @@ class SyncExecutor:
                         source_size=source_size,
                         bitrate=bitrate,
                         source_path=source_path,
+                        source_hash=cache_source_hash,
+                        source_mtime=cache_source_mtime,
                     )
 
                 # Copy to iPod (the actual bottleneck — USB I/O)
@@ -1794,7 +1865,12 @@ class SyncExecutor:
                     source_path.stem, result.output_path.suffix, dest_folder,
                 )
                 final_path = dest_folder / new_name
-                self._copy_file_chunked(result.output_path, final_path, copy_progress, is_cancelled=is_cancelled)
+                self._copy_file_to_device(
+                    result.output_path,
+                    final_path,
+                    copy_progress,
+                    is_cancelled=is_cancelled,
+                )
 
                 # Clean up temp dir for non-fingerprinted tracks
                 if not fingerprint:
@@ -1815,7 +1891,12 @@ class SyncExecutor:
             new_name = self._generate_ipod_filename(source_path.stem, source_path.suffix, dest_folder)
             dest_path = dest_folder / new_name
             try:
-                self._copy_file_chunked(source_path, dest_path, copy_progress, is_cancelled=is_cancelled)
+                self._copy_file_to_device(
+                    source_path,
+                    dest_path,
+                    copy_progress,
+                    is_cancelled=is_cancelled,
+                )
                 return True, dest_path, False, ""
             except _OutOfSpaceError:
                 raise
@@ -1823,12 +1904,28 @@ class SyncExecutor:
                 logger.error("Copy failed: %s", e)
                 return False, None, False, str(e)
 
+    def _copy_file_to_device(
+        self,
+        src: Path,
+        dst: Path,
+        progress: Callable[[float], None] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        with self._device_write_semaphore:
+            self._copy_file_chunked(
+                src,
+                dst,
+                progress,
+                is_cancelled=is_cancelled,
+            )
+
     @staticmethod
     def _copy_file_chunked(
         src: Path, dst: Path,
-        progress: Optional[Callable[[float], None]] = None,
+        progress: Callable[[float], None] | None = None,
         chunk_size: int = 256 * 1024,
-        is_cancelled: Optional[Callable[[], bool]] = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> None:
         """Copy *src* to *dst* in chunks, calling *progress(0.0‒1.0)* periodically."""
         total = src.stat().st_size
@@ -2038,7 +2135,7 @@ class SyncExecutor:
         return track_dict_to_info(t)
 
     def _pc_track_to_info(self, pc_track, ipod_location: str, was_transcoded: bool,
-                          ipod_file_path: Optional[Path] = None) -> TrackInfo:
+                          ipod_file_path: Path | None = None) -> TrackInfo:
         """Convert PCTrack to TrackInfo for writing."""
         from ._track_conversion import pc_track_to_info
         return pc_track_to_info(
@@ -2048,7 +2145,7 @@ class SyncExecutor:
         )
 
     @staticmethod
-    def _decode_raw_blob(value) -> Optional[bytes]:
+    def _decode_raw_blob(value) -> bytes | None:
         """Decode a raw MHOD blob from parsed playlist data."""
         from ._playlist_builder import decode_raw_blob
         return decode_raw_blob(value)
@@ -2077,11 +2174,11 @@ class SyncExecutor:
     def _write_database(
         self,
         tracks: list[TrackInfo],
-        pc_file_paths: Optional[dict] = None,
-        playlists: Optional[list[PlaylistInfo]] = None,
-        smart_playlists: Optional[list[PlaylistInfo]] = None,
+        pc_file_paths: dict | None = None,
+        playlists: list[PlaylistInfo] | None = None,
+        smart_playlists: list[PlaylistInfo] | None = None,
         master_playlist_name: str = "iPod",
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> bool:
         """Write tracks to iTunesDB (and ArtworkDB/SQLite if applicable)."""
         from ._db_io import write_database

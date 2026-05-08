@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iopenpod"
-version = "1.0.48"
+version = "1.0.49"
 description = "Open-source iPod Classic sync tool — manage your iPod media library without iTunes. Reads and writes iTunesDB directly."
 authors = [
     {name = "John Gibbons", email = "johngibbons167@gmail.com"}
@@ -40,6 +40,7 @@ dependencies = [
     "feedparser>=6.0.10",
     "requests>=2.31.0",
     "packaging>=23.0",
+    "tqdm>=4.67.3",
 ]
 
 [project.scripts]
@@ -82,14 +83,14 @@ only-include = [
 # Allow line breaks before binary operators (W503) — matches Black's style
 extend-ignore = ["W503"]
 # Keep line length reasonable; adjust if you prefer a different value
-max-line-length = 88
+max-line-length = 320
 
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider"
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 88
+line-length = 320
 target-version = "py311"
 extend-exclude = ["compendium", "vendor"]
 

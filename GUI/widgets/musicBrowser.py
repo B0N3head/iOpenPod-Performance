@@ -3,16 +3,17 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtWidgets import QFrame, QSplitter, QVBoxLayout, QSizePolicy, QStackedWidget
+from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtWidgets import QFrame, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout
+
+from ..styles import Colors, make_scroll_area
+from .gridHeaderBar import GridHeaderBar
 from .MBGridView import MusicBrowserGrid
 from .MBListView import MusicBrowserList
+from .photoBrowser import PhotoBrowserWidget
 from .playlistBrowser import PlaylistBrowser
 from .podcastBrowser import PodcastBrowser
-from .photoBrowser import PhotoBrowserWidget
 from .trackListTitleBar import TrackListTitleBar
-from .gridHeaderBar import GridHeaderBar
-from ..styles import Colors, make_scroll_area
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ class MusicBrowser(QFrame):
             handle.setEnabled(True)
         self.gridTrackSplitter.setCollapsible(0, True)
         self.gridTrackSplitter.setCollapsible(1, True)
-        self.gridTrackSplitter.setHandleWidth((3))
+        self.gridTrackSplitter.setHandleWidth(3)
         self.gridTrackSplitter.setStretchFactor(0, 2)
         self.gridTrackSplitter.setStretchFactor(1, 1)
         self.gridTrackSplitter.setMinimumSize(0, 0)
@@ -185,10 +186,17 @@ class MusicBrowser(QFrame):
         """Mark heavy tabs dirty when cache-backed data changes."""
         try:
             cache = self._library_cache
-            cache.playlists_changed.connect(lambda: self._mark_tab_dirty("Playlists"))
+            cache.playlists_changed.connect(self._on_playlists_changed)
             cache.photos_changed.connect(lambda: self._mark_tab_dirty("Photos"))
         except Exception:
             pass
+
+    def _on_playlists_changed(self) -> None:
+        """Refresh the playlists view in place when playlist data changes."""
+        self._mark_tab_dirty("Playlists")
+        if self._current_category == "Playlists" and self._tab_loaded["Playlists"]:
+            self.playlistBrowser.refreshFromCache()
+            self._tab_dirty["Playlists"] = False
 
     def _mark_tab_dirty(self, tab_name: str) -> None:
         if tab_name in self._tab_dirty:

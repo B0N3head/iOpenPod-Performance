@@ -15,13 +15,12 @@ import platform
 import shutil
 import stat
 import sys
+import tarfile
 import tempfile
 import zipfile
-import tarfile
 from pathlib import Path
-from typing import Optional
-from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +106,7 @@ def _download(url: str, dest: Path, progress_callback=None) -> bool:
     """Download a URL to a file. Returns True on success."""
     logger.info(f"Downloading {url}")
     try:
-        req = Request(url, headers={"User-Agent": "iOpenPod/1.0.46"})
+        req = Request(url, headers={"User-Agent": "iOpenPod"})
         with urlopen(req, timeout=120) as resp:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
@@ -128,7 +127,7 @@ def _download(url: str, dest: Path, progress_callback=None) -> bool:
         return False
 
 
-def _extract_binary(archive: Path, binary_name: str, dest_dir: Path) -> Optional[Path]:
+def _extract_binary(archive: Path, binary_name: str, dest_dir: Path) -> Path | None:
     """
     Extract a specific binary from a zip or tar archive.
     Returns the path to the extracted binary, or None.
@@ -174,7 +173,7 @@ def _extract_binary(archive: Path, binary_name: str, dest_dir: Path) -> Optional
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def get_bundled_ffmpeg() -> Optional[str]:
+def get_bundled_ffmpeg() -> str | None:
     """Return path to bundled ffmpeg binary if it exists."""
     bin_dir = get_bin_dir()
     if sys.platform == "win32":
@@ -184,7 +183,7 @@ def get_bundled_ffmpeg() -> Optional[str]:
     return str(path) if path.exists() else None
 
 
-def get_bundled_fpcalc() -> Optional[str]:
+def get_bundled_fpcalc() -> str | None:
     """Return path to bundled fpcalc binary if it exists."""
     bin_dir = get_bin_dir()
     if sys.platform == "win32":
@@ -194,7 +193,7 @@ def get_bundled_fpcalc() -> Optional[str]:
     return str(path) if path.exists() else None
 
 
-def download_ffmpeg(progress_callback=None) -> Optional[str]:
+def download_ffmpeg(progress_callback=None) -> str | None:
     """
     Download a static FFmpeg build for the current platform.
 
@@ -240,7 +239,7 @@ def download_ffmpeg(progress_callback=None) -> Optional[str]:
             tmp_path.unlink()
 
 
-def download_fpcalc(progress_callback=None) -> Optional[str]:
+def download_fpcalc(progress_callback=None) -> str | None:
     """
     Download fpcalc (Chromaprint) for the current platform.
 

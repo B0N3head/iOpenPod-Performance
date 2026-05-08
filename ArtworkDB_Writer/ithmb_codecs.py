@@ -6,7 +6,6 @@ and decode artwork without assuming every format is RGB565 little-endian.
 
 from __future__ import annotations
 
-from typing import Optional
 import io
 
 import numpy as np
@@ -51,7 +50,7 @@ def expected_size_bytes(
     format_id: int,
     width: int,
     height: int,
-    stride_pixels: Optional[int] = None,
+    stride_pixels: int | None = None,
     fmt_override=None,
 ) -> int:
     pf = format_pixel_format(format_id, fmt_override=fmt_override)
@@ -111,6 +110,18 @@ def _rgb555_to_rgb(arr16: np.ndarray) -> np.ndarray:
     g = ((arr16 >> 5) & 0x1F).astype(np.uint8)
     b = (arr16 & 0x1F).astype(np.uint8)
     return np.stack(((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)), axis=2)
+
+
+def _pad_packed_rows(arr16: np.ndarray, stride_pixels: int) -> np.ndarray:
+    """Pad packed 16-bit rows to the on-disk stride, if needed."""
+    stride = max(1, int(stride_pixels))
+    height, width = arr16.shape[:2]
+    if stride <= width:
+        return arr16
+
+    padded = np.zeros((height, stride), dtype=arr16.dtype)
+    padded[:, :width] = arr16
+    return padded
 
 
 def _resolve_packed_geometry(
@@ -347,8 +358,8 @@ def _crop_visible_region(
 def encode_image_for_format(
     source_img: Image.Image,
     format_id: int,
-    target_width: Optional[int] = None,
-    target_height: Optional[int] = None,
+    target_width: int | None = None,
+    target_height: int | None = None,
     fmt_override=None,
 ) -> dict:
     pf = format_pixel_format(format_id, fmt_override=fmt_override)
@@ -358,55 +369,60 @@ def encode_image_for_format(
         int(target_height or source_img.height),
         fmt_override=fmt_override,
     )
+    stride = default_stride_pixels(format_id, w, fmt_override=fmt_override)
 
     base = source_img.convert("RGB").resize((w, h), Image.Resampling.LANCZOS)
 
     if pf == "RGB565_BE_90":
         rotated = base.transpose(Image.Transpose.ROTATE_270)
         arr16 = _rgb565_array_from_image(rotated)
+        arr16 = _pad_packed_rows(arr16, stride)
         raw = arr16.astype(">u2").tobytes()
         return {
             "data": raw,
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
     if pf == "RGB565_BE":
         arr16 = _rgb565_array_from_image(base)
+        arr16 = _pad_packed_rows(arr16, stride)
         raw = arr16.astype(">u2").tobytes()
         return {
             "data": raw,
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
     if pf == "RGB555_BE":
         arr16 = _rgb555_array_from_image(base)
+        arr16 = _pad_packed_rows(arr16, stride)
         raw = arr16.astype(">u2").tobytes()
         return {
             "data": raw,
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
     if pf in ("RGB555_LE", "REC_RGB555_LE"):
         arr16 = _rgb555_array_from_image(base)
+        arr16 = _pad_packed_rows(arr16, stride)
         raw = arr16.astype("<u2").tobytes()
         return {
             "data": raw,
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
@@ -420,7 +436,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
@@ -449,7 +465,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
@@ -475,7 +491,7 @@ def encode_image_for_format(
             "width": w,
             "height": h,
             "size": len(raw),
-            "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+            "stride_pixels": stride,
             "pixel_format": pf,
         }
 
@@ -484,13 +500,14 @@ def encode_image_for_format(
 
     # Default and common path: RGB565 little-endian.
     arr16 = _rgb565_array_from_image(base)
+    arr16 = _pad_packed_rows(arr16, stride)
     raw = arr16.astype("<u2").tobytes()
     return {
         "data": raw,
         "width": w,
         "height": h,
         "size": len(raw),
-        "stride_pixels": default_stride_pixels(format_id, w, fmt_override=fmt_override),
+        "stride_pixels": stride,
         "pixel_format": "RGB565_LE",
     }
 
@@ -502,7 +519,7 @@ def decode_pixels_for_format(
     height: int,
     hpad: int = 0,
     vpad: int = 0,
-) -> Optional[Image.Image]:
+) -> Image.Image | None:
     pf = format_pixel_format(format_id)
     width = max(1, int(width))
     height = max(1, int(height))

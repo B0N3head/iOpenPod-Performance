@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..styles import Colors, FONT_FAMILY, Metrics
+from ..styles import FONT_FAMILY, Colors, Metrics
 
 
 def pil_to_pixmap(img) -> QPixmap:
@@ -41,6 +41,7 @@ class PhotoViewerPane(QFrame):
         self._empty_title = empty_title
         self._empty_summary = empty_summary
         self._source_pixmap = QPixmap()
+        self._preview_placeholder_text = "Select a photo"
 
         self.setStyleSheet(f"""
             QFrame#photoViewer {{
@@ -201,8 +202,9 @@ class PhotoViewerPane(QFrame):
         meta_sections: list[tuple[str, list[tuple[str, str]]]] | None = None,
     ) -> None:
         self._source_pixmap = QPixmap()
+        self._preview_placeholder_text = "Select a photo"
         self.preview_label.clear()
-        self.preview_label.setText("Select a photo")
+        self.preview_label.setText(self._preview_placeholder_text)
         self.title_label.setText(title or self._empty_title)
         self.summary_label.setText(summary or self._empty_summary)
         self._set_meta_content(meta_lines=meta_lines, meta_sections=meta_sections)
@@ -219,8 +221,20 @@ class PhotoViewerPane(QFrame):
         self.title_label.setText(title or self._empty_title)
         self.summary_label.setText(summary or "")
         self._set_meta_content(meta_lines=meta_lines, meta_sections=meta_sections)
+        self._preview_placeholder_text = "Preview unavailable"
         self._source_pixmap = pixmap if pixmap and not pixmap.isNull() else QPixmap()
         self._apply_scaled_pixmap()
+
+    def setPreviewPixmap(self, pixmap: QPixmap | None) -> None:
+        self._preview_placeholder_text = "Preview unavailable"
+        self._source_pixmap = pixmap if pixmap and not pixmap.isNull() else QPixmap()
+        self._apply_scaled_pixmap()
+
+    def setPreviewPlaceholder(self, text: str) -> None:
+        self._source_pixmap = QPixmap()
+        self._preview_placeholder_text = text
+        self.preview_label.clear()
+        self.preview_label.setText(text)
 
     def _set_meta_content(
         self,
@@ -343,7 +357,7 @@ class PhotoViewerPane(QFrame):
     def _apply_scaled_pixmap(self) -> None:
         if self._source_pixmap.isNull():
             self.preview_label.clear()
-            self.preview_label.setText("Preview unavailable")
+            self.preview_label.setText(self._preview_placeholder_text)
             return
         self.preview_label.setText("")
         target_size = self.preview_label.contentsRect().size()

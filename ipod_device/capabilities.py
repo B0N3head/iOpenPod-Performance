@@ -11,12 +11,11 @@ writing, artwork generation, or sync behaviour.  It is the single
 authority for "what does this device support?" questions.
 """
 
-from dataclasses import dataclass, replace
-from typing import Optional
+from dataclasses import dataclass
 
 from .artwork_presets import (
     ARTWORK_FORMATS_BY_ID,
-    CLASSIC_1G_80GB_COVER_ART_FORMATS,
+    CLASSIC_COVER_ART_FORMATS,
     NANO_7G_COVER_ART_FORMATS,
     ArtworkFormat,
 )
@@ -121,18 +120,6 @@ class DeviceCapabilities:
     """H.264 Baseline Profile level to target when encoding video.
     Most iPods support Level 3.0.  iPod Classic supports 3.1.
     Nano 3G/4G are limited to Level 1.3 by their hardware decoder."""
-
-
-@dataclass(frozen=True)
-class DeviceCapabilityOverride:
-    """Targeted corrections for model/capacity-specific hardware variants."""
-
-    family: str
-    generation: str = ""
-    capacity: str = ""
-    model_numbers: tuple[str, ...] = ()
-    cover_art_formats: tuple[ArtworkFormat, ...] | None = None
-    photo_formats: tuple[ArtworkFormat, ...] | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -297,12 +284,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=(
-            ARTWORK_FORMATS_BY_ID[1061],
-            ARTWORK_FORMATS_BY_ID[1055],
-            ARTWORK_FORMATS_BY_ID[1068],
-            ARTWORK_FORMATS_BY_ID[1060],
-        ),
+        cover_art_formats=CLASSIC_COVER_ART_FORMATS,
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -321,12 +303,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=(
-            ARTWORK_FORMATS_BY_ID[1061],
-            ARTWORK_FORMATS_BY_ID[1055],
-            ARTWORK_FORMATS_BY_ID[1068],
-            ARTWORK_FORMATS_BY_ID[1060],
-        ),
+        cover_art_formats=CLASSIC_COVER_ART_FORMATS,
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -345,12 +322,7 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
         ),
         supports_chapter_image=True,
         supports_sparse_artwork=True,
-        cover_art_formats=(
-            ARTWORK_FORMATS_BY_ID[1061],
-            ARTWORK_FORMATS_BY_ID[1055],
-            ARTWORK_FORMATS_BY_ID[1068],
-            ARTWORK_FORMATS_BY_ID[1060],
-        ),
+        cover_art_formats=CLASSIC_COVER_ART_FORMATS,
         music_dirs=50,
         db_version=0x30,
         max_video_width=640,
@@ -576,125 +548,25 @@ _FAMILY_GEN_CAPABILITIES: dict[tuple[str, str], DeviceCapabilities] = {
 }
 
 
-_MODEL_CAPABILITY_OVERRIDES: tuple[DeviceCapabilityOverride, ...] = (
-    DeviceCapabilityOverride(
-        family="iPod Classic",
-        generation="1st Gen",
-        capacity="80GB",
-        model_numbers=("MB029", "MB147"),
-        cover_art_formats=CLASSIC_1G_80GB_COVER_ART_FORMATS,
-    ),
-)
-
-
-def _normalize_capacity(capacity: str | None) -> str:
-    return (capacity or "").replace(" ", "").upper()
-
-
-def _normalize_model_number(model_number: str | None) -> str:
-    return (model_number or "").strip().upper()
-
-
-def _override_matches(
-    override: DeviceCapabilityOverride,
-    family: str,
-    generation: str,
-    capacity: str | None,
-    model_number: str | None,
-) -> bool:
-    if override.family != family:
-        return False
-    if override.generation and override.generation != generation:
-        return False
-
-    capacity_norm = _normalize_capacity(capacity)
-    model_norm = _normalize_model_number(model_number)
-    model_numbers = {_normalize_model_number(m) for m in override.model_numbers}
-
-    capacity_match = bool(
-        override.capacity
-        and _normalize_capacity(override.capacity) == capacity_norm
-    )
-    model_match = bool(model_norm and model_norm in model_numbers)
-
-    if override.capacity or override.model_numbers:
-        return capacity_match or model_match
-    return True
-
-
-def _apply_capability_overrides(
-    base: DeviceCapabilities,
-    family: str,
-    generation: str,
-    capacity: str | None,
-    model_number: str | None,
-) -> DeviceCapabilities:
-    caps = base
-    for override in _MODEL_CAPABILITY_OVERRIDES:
-        if not _override_matches(override, family, generation, capacity, model_number):
-            continue
-
-        updates = {}
-        if override.cover_art_formats is not None:
-            updates["cover_art_formats"] = override.cover_art_formats
-        if override.photo_formats is not None:
-            updates["photo_formats"] = override.photo_formats
-        if updates:
-            caps = replace(caps, **updates)
-    return caps
-
-
 def capabilities_for_family_gen(
     family: str,
     generation: str,
     *,
     capacity: str | None = None,
     model_number: str | None = None,
-) -> Optional[DeviceCapabilities]:
+) -> DeviceCapabilities | None:
     """Return the device capabilities for a (family, generation) pair.
 
     If the exact pair is not found but *generation* is empty/unknown,
     checks whether all known generations of *family* share identical
     capabilities and returns those.
 
-    Optional *capacity* and *model_number* hints select hardware variants
-    within the same marketing generation without forcing call sites to carry
-    one-off artwork tables.
-
     Returns ``None`` if the pair is not in the lookup table and the
     family-level fallback is ambiguous.
     """
     caps = _FAMILY_GEN_CAPABILITIES.get((family, generation))
     if caps is not None:
-        return _apply_capability_overrides(
-            caps,
-            family,
-            generation,
-            capacity,
-            model_number,
-        )
-
-    if family and not generation and (capacity or model_number):
-        for override in _MODEL_CAPABILITY_OVERRIDES:
-            if not override.generation:
-                continue
-            if not _override_matches(
-                override,
-                family,
-                override.generation,
-                capacity,
-                model_number,
-            ):
-                continue
-            base = _FAMILY_GEN_CAPABILITIES.get((family, override.generation))
-            if base is not None:
-                return _apply_capability_overrides(
-                    base,
-                    family,
-                    override.generation,
-                    capacity,
-                    model_number,
-                )
+        return caps
 
     if family and not generation:
         family_caps = [
@@ -710,7 +582,7 @@ def capabilities_for_family_gen(
 def checksum_type_for_family_gen(
     family: str,
     generation: str,
-) -> Optional[ChecksumType]:
+) -> ChecksumType | None:
     """Return the checksum type for a (family, generation) pair.
 
     Derives the answer from ``_FAMILY_GEN_CAPABILITIES``.  If the exact

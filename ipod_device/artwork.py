@@ -6,7 +6,6 @@ from .artwork_presets import (
 )
 from .capabilities import capabilities_for_family_gen
 
-
 ITHMB_FORMAT_MAP = ARTWORK_FORMATS_BY_ID
 """Fallback lookup of ithmb correlation ID -> ``ArtworkFormat``.
 
@@ -55,7 +54,7 @@ def cover_art_format_definitions_for_device(
     """Return rich, device-specific cover-art format definitions.
 
     This preserves device-specific meanings for reused IDs, such as Nano 7G
-    ``1015``/``1016`` and Classic 1G 80GB ``1044``.
+    ``1015``/``1016`` and Classic ``1044``.
     """
 
     caps = capabilities_for_family_gen(

@@ -82,13 +82,14 @@ ARTWORK_FORMATS_BY_ID: dict[int, ArtworkFormat] = {
 }
 
 
-CLASSIC_1G_80GB_COVER_ART_FORMATS = (
+CLASSIC_COVER_ART_FORMATS = (
     ARTWORK_FORMATS_BY_ID[1061],
     ARTWORK_FORMATS_BY_ID[1044],
+    ARTWORK_FORMATS_BY_ID[1055],
     ARTWORK_FORMATS_BY_ID[1068],
     ARTWORK_FORMATS_BY_ID[1060],
 )
-"""Cover-art formats used by the 2007 80GB iPod Classic models."""
+"""Cover-art formats used by click-wheel iPod Classic generations."""
 
 
 NANO_7G_COVER_ART_FORMATS = (
@@ -104,7 +105,7 @@ def artwork_format_candidates() -> tuple[ArtworkFormat, ...]:
     """Return every known format definition, including duplicate-ID variants."""
     candidates = [
         *ARTWORK_FORMATS_BY_ID.values(),
-        *CLASSIC_1G_80GB_COVER_ART_FORMATS,
+        *CLASSIC_COVER_ART_FORMATS,
         *NANO_7G_COVER_ART_FORMATS,
     ]
     unique: dict[tuple[int, int, int, str], ArtworkFormat] = {}

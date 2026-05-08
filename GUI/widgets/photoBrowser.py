@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QFont, QPixmap
+from PyQt6.QtGui import QCursor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QInputDialog,
@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
-    QSizePolicy,
 )
 
+from ipod_device.artwork import ITHMB_FORMAT_MAP
 from SyncEngine.photos import (
     PhotoDB,
     PhotoEditState,
@@ -31,7 +31,6 @@ from SyncEngine.photos import (
     merge_photo_sync_plan,
     write_photo_db_metadata_only,
 )
-from ipod_device.artwork import ITHMB_FORMAT_MAP
 
 from ..styles import (
     FONT_FAMILY,
@@ -48,9 +47,8 @@ from .browserChrome import (
 )
 from .formatters import format_size
 from .gridHeaderBar import GridHeaderBar
-from .MBGridView import _FlowLayout
-from .photoTile import PhotoGridTile
-from .photoViewer import PhotoViewerPane, pil_to_pixmap
+from .photoViewer import PhotoViewerPane
+from .pooledPhotoGrid import PhotoTileModel, PooledPhotoGridView
 
 if TYPE_CHECKING:
     from app_core.services import (
@@ -61,92 +59,11 @@ if TYPE_CHECKING:
     )
 
 
-class PhotoGridView(QFrame):
-    currentIndexChanged = pyqtSignal(int)
-    checkedChanged = pyqtSignal(int, bool)
+PhotoListItem = tuple[int, PhotoEntry]
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._flow = _FlowLayout(self, spacing=14)
-        self._flow.setContentsMargins(14, 14, 14, 14)
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._tiles: list[PhotoGridTile] = []
-        self._selected_index = -1
-
-    def clearGrid(self) -> None:
-        self._selected_index = -1
-        while self._flow.count():
-            item = self._flow.takeAt(0)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
-        self._tiles.clear()
-        self.setMinimumHeight(0)
-
-    def addPhoto(
-        self,
-        title: str,
-        pixmap: QPixmap | None,
-        *,
-        checkable: bool = False,
-        checked: bool = False,
-    ) -> None:
-        index = len(self._tiles)
-        tile = PhotoGridTile(title, checkable=checkable, parent=self)
-        tile.setPixmap(pixmap)
-        if checkable:
-            tile.setChecked(checked)
-            tile.checked_changed.connect(
-                lambda state, idx=index: self.checkedChanged.emit(idx, state)
-            )
-        tile.clicked.connect(lambda idx=index: self.setCurrentIndex(idx))
-        self._tiles.append(tile)
-        self._flow.addWidget(tile)
-
-    def setTilePixmap(self, index: int, pixmap: QPixmap | None) -> None:
-        if index < 0 or index >= len(self._tiles):
-            return
-        self._tiles[index].setPixmap(pixmap)
-
-    def setTileChecked(self, index: int, checked: bool) -> None:
-        if index < 0 or index >= len(self._tiles):
-            return
-        self._tiles[index].setChecked(checked)
-
-    def count(self) -> int:
-        return len(self._tiles)
-
-    def currentIndex(self) -> int:
-        return self._selected_index
-
-    def setCurrentIndex(self, index: int) -> None:
-        if index < 0 or index >= len(self._tiles):
-            index = -1
-        if self._selected_index == index:
-            return
-        self._selected_index = index
-        for i, tile in enumerate(self._tiles):
-            tile.setSelected(i == index)
-        self.currentIndexChanged.emit(index)
-
-    def resizeEvent(self, a0):
-        super().resizeEvent(a0)
-        width = a0.size().width() if a0 else self.width()
-        if width > 0 and self._flow.count():
-            self.setMinimumHeight(self._flow.heightForWidth(width))
-
-    def showEvent(self, a0):
-        super().showEvent(a0)
-        if self._flow.count():
-            QTimer.singleShot(0, self._force_relayout)
-
-    def _force_relayout(self) -> None:
-        width = self.width()
-        if width > 0 and self._flow.count():
-            self._flow.setGeometry(self.rect())
-            self.setMinimumHeight(self._flow.heightForWidth(width))
+_THUMB_DECODE_BATCH_SIZE = 6
+_THUMB_PREFETCH_AHEAD = 6
+_MAX_THUMB_WORKERS = 2
 
 
 class _PhotoWriteWorker(QThread):
@@ -289,7 +206,7 @@ class PhotoBrowserWidget(QFrame):
         self._library_cache: LibraryCacheLike = libraries.cache()
         self._current_album = ""
         self._device_db: PhotoDB | None = None
-        self._filtered_items: list[tuple[str, PhotoEntry]] = []
+        self._filtered_items: list[PhotoListItem] = []
         self._current_preview_photo: PhotoEntry | None = None
         self._current_format_ids: list[int] = []
         self._bound_cache = None
@@ -301,11 +218,17 @@ class PhotoBrowserWidget(QFrame):
         self._write_worker: _PhotoWriteWorker | None = None
         self._tile_pixmap_cache: dict[int, QPixmap] = {}
         self._preview_pixmap_cache: dict[tuple[int, int], QPixmap] = {}
+        self._preview_pending: set[tuple[int, int]] = set()
         self._cache_marker: tuple[str, int, int] | None = None
-        self._thumb_queue: deque[tuple[int, PhotoEntry, int]] = deque()
+        self._thumb_queue: deque[tuple[int, PhotoEntry, int | None, int]] = deque()
+        self._queued_thumb_ids: set[int] = set()
+        self._thumb_in_flight_ids: set[int] = set()
+        self._thumb_workers_in_flight = 0
         self._grid_load_token = 0
         self._grid_device_path = ""
         self._pending_grid_device_path = ""
+        self._current_preview_format_id: int | None = None
+        self._preview_request_token = 0
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.timeout.connect(self._reload_now)
@@ -389,7 +312,7 @@ class PhotoBrowserWidget(QFrame):
 
         self.photo_scroll = make_scroll_area()
         self.photo_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.photo_grid = PhotoGridView()
+        self.photo_grid = PooledPhotoGridView()
         self.photo_scroll.setWidget(self.photo_grid)
         self._grid_panel.addWidget(self.photo_scroll, 1)
         splitter.addWidget(self._grid_panel)
@@ -404,6 +327,9 @@ class PhotoBrowserWidget(QFrame):
         splitter.setSizes([240, 760, 340])
 
         self.photo_grid.currentIndexChanged.connect(self._on_photo_changed)
+        self.photo_grid.visibleIndicesChanged.connect(
+            self._on_visible_photo_indices_changed
+        )
         self.viewer.variantSelected.connect(self._on_variant_selected)
         self.new_album_btn.clicked.connect(self._create_album)
         self.add_to_album_btn.clicked.connect(self._add_to_album)
@@ -427,11 +353,17 @@ class PhotoBrowserWidget(QFrame):
         self._clear_album_sidebar()
         self.photo_grid.clearGrid()
         self._current_preview_photo = None
+        self._current_preview_format_id = None
         self._current_format_ids = []
         self.viewer.clearPreview()
-        self._filtered_items = []
+        self._filtered_items.clear()
         self._thumb_queue.clear()
+        self._queued_thumb_ids.clear()
+        self._thumb_in_flight_ids.clear()
+        self._preview_pending.clear()
+        self._thumb_workers_in_flight = 0
         self._grid_load_token += 1
+        self._preview_request_token += 1
         self._tile_pixmap_cache.clear()
         self._preview_pixmap_cache.clear()
         self._cache_marker = None
@@ -450,6 +382,7 @@ class PhotoBrowserWidget(QFrame):
         if marker != self._cache_marker:
             self._tile_pixmap_cache.clear()
             self._preview_pixmap_cache.clear()
+            self._preview_pending.clear()
             self._cache_marker = marker
 
         album_names = self._album_names()
@@ -466,10 +399,10 @@ class PhotoBrowserWidget(QFrame):
             return []
         return sorted(album.name for album in self._device_db.albums if album.album_type != 1)
 
-    def _all_items(self) -> list[tuple[str, PhotoEntry]]:
+    def _all_items(self) -> list[PhotoListItem]:
         if self._device_db is None:
             return []
-        return [(photo.visual_hash or str(photo.image_id), photo) for photo in self._device_db.photos.values()]
+        return [(int(photo.image_id), photo) for photo in self._device_db.photos.values()]
 
     def _on_search_changed(self, query: str):
         self._search_query = query.strip().lower()
@@ -493,7 +426,10 @@ class PhotoBrowserWidget(QFrame):
         haystack = " ".join(part for part in parts if part).lower()
         return self._search_query in haystack
 
-    def _sort_items(self, items: list[tuple[str, PhotoEntry]]) -> list[tuple[str, PhotoEntry]]:
+    def _sort_items(
+        self,
+        items: list[PhotoListItem],
+    ) -> list[PhotoListItem]:
         if self._sort_key == "size":
             key_fn = self._size_sort_key
         elif self._sort_key == "album_count":
@@ -502,15 +438,15 @@ class PhotoBrowserWidget(QFrame):
             key_fn = self._title_sort_key
         return sorted(items, key=key_fn, reverse=self._sort_reverse)
 
-    def _size_sort_key(self, item: tuple[str, PhotoEntry]) -> tuple[int, str]:
+    def _size_sort_key(self, item: PhotoListItem) -> tuple[int, str]:
         photo = item[1]
         return self._device_storage_size(photo), self._device_photo_title(photo).lower()
 
-    def _album_count_sort_key(self, item: tuple[str, PhotoEntry]) -> tuple[int, str]:
+    def _album_count_sort_key(self, item: PhotoListItem) -> tuple[int, str]:
         photo = item[1]
         return len(getattr(photo, "album_names", set())), self._device_photo_title(photo).lower()
 
-    def _title_sort_key(self, item: tuple[str, PhotoEntry]) -> tuple[str, int]:
+    def _title_sort_key(self, item: PhotoListItem) -> tuple[str, int]:
         photo = item[1]
         return self._device_photo_title(photo).lower(), self._device_storage_size(photo)
 
@@ -578,26 +514,72 @@ class PhotoBrowserWidget(QFrame):
         total += sum(max(0, int(ref.size)) for ref in photo.thumbs.values())
         return total
 
+    @staticmethod
+    def _preview_cache_key(photo: PhotoEntry, format_id: int | None) -> tuple[int, int]:
+        return photo.image_id, int(format_id) if format_id is not None else -1
+
     def _preview_pixmap(self, photo: PhotoEntry, *, format_id: int | None = None) -> QPixmap:
-        cache_key = (photo.image_id, int(format_id) if format_id is not None else -1)
-        cached = self._preview_pixmap_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        cache_key = self._preview_cache_key(photo, format_id)
+        return self._preview_pixmap_cache.get(cache_key, QPixmap())
 
-        pixmap = QPixmap()
-        try:
-            img = load_photo_preview(
-                photo,
-                self._current_device_path(),
-                format_id=format_id,
-            )
-            if img is not None:
-                pixmap = pil_to_pixmap(img)
-        except Exception:
-            pixmap = QPixmap()
+    @staticmethod
+    def _pixmap_from_rgba_bytes(width: int, height: int, rgba: bytes) -> QPixmap:
+        qimg = QImage(rgba, width, height, width * 4, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(qimg.copy())
 
-        self._preview_pixmap_cache[cache_key] = pixmap
-        return pixmap
+    @staticmethod
+    def _encode_loaded_image(
+        image,
+        *,
+        thumbnail_size: tuple[int, int] | None = None,
+    ) -> tuple[int, int, bytes] | None:
+        if image is None:
+            return None
+        if thumbnail_size is not None:
+            image.thumbnail(thumbnail_size)
+        image = image.convert("RGBA")
+        return image.width, image.height, image.tobytes("raw", "RGBA")
+
+    @staticmethod
+    def _load_thumb_batch(
+        requests: list[tuple[int, PhotoEntry, int | None]],
+        device_path: str,
+    ) -> dict[int, tuple[int, int, bytes] | None]:
+        results: dict[int, tuple[int, int, bytes] | None] = {}
+        for photo_id, photo, format_id in requests:
+            try:
+                image = load_photo_preview(
+                    photo,
+                    device_path,
+                    format_id=format_id,
+                )
+                if image is None:
+                    image = load_photo_preview(photo, device_path)
+                results[photo_id] = PhotoBrowserWidget._encode_loaded_image(
+                    image,
+                    thumbnail_size=(132, 132),
+                )
+            except Exception:
+                results[photo_id] = None
+        return results
+
+    @staticmethod
+    def _load_preview_batch(
+        requests: list[tuple[tuple[int, int], PhotoEntry, int | None]],
+        device_path: str,
+    ) -> dict[tuple[int, int], tuple[int, int, bytes] | None]:
+        results: dict[tuple[int, int], tuple[int, int, bytes] | None] = {}
+        for cache_key, photo, format_id in requests:
+            try:
+                image = load_photo_preview(
+                    photo,
+                    device_path,
+                    format_id=format_id,
+                )
+                results[cache_key] = PhotoBrowserWidget._encode_loaded_image(image)
+            except Exception:
+                results[cache_key] = None
+        return results
 
     def _format_usage_label(self, role: str, description: str) -> str:
         usage_map = {
@@ -722,6 +704,7 @@ class PhotoBrowserWidget(QFrame):
         self._current_format_ids = format_ids
         if selected_format_id is None or selected_format_id not in format_ids:
             selected_format_id = self._default_preview_format_id(format_ids)
+        self._current_preview_format_id = selected_format_id
 
         summary_parts = [self._photo_subtitle(photo)]
         if format_ids:
@@ -730,9 +713,10 @@ class PhotoBrowserWidget(QFrame):
         if total_device_size:
             summary_parts.append(f"{format_size(total_device_size)} on device")
 
+        preview_pixmap = self._preview_pixmap(photo, format_id=selected_format_id)
         self.viewer.setPhoto(
             title=self._device_photo_title(photo),
-            pixmap=self._preview_pixmap(photo, format_id=selected_format_id),
+            pixmap=preview_pixmap,
             summary=" · ".join(part for part in summary_parts if part),
             meta_sections=self._format_meta_sections(photo, selected_format_id, format_ids),
         )
@@ -741,6 +725,9 @@ class PhotoBrowserWidget(QFrame):
             selected_id=selected_format_id,
             label="Formats",
         )
+        if preview_pixmap.isNull():
+            self.viewer.setPreviewPlaceholder("Loading preview...")
+            self._request_preview_async(photo, selected_format_id)
 
     def _schedule_grid_reload(self, device_path: str) -> None:
         self._pending_grid_device_path = device_path
@@ -752,12 +739,16 @@ class PhotoBrowserWidget(QFrame):
     def _reload_grid(self, device_path: str):
         self._thumb_timer.stop()
         self._thumb_queue.clear()
+        self._queued_thumb_ids.clear()
+        self._thumb_in_flight_ids.clear()
+        self._preview_pending.clear()
+        self._thumb_workers_in_flight = 0
         self._grid_load_token += 1
+        self._preview_request_token += 1
         load_token = self._grid_load_token
         self._grid_device_path = device_path
 
-        self.photo_grid.clearGrid()
-        self._filtered_items = []
+        self._filtered_items.clear()
         album_name = "" if self._current_album in ("", "All Photos") else self._current_album
 
         for key, photo in self._all_items():
@@ -771,70 +762,195 @@ class PhotoBrowserWidget(QFrame):
 
         self._filtered_items = self._sort_items(self._filtered_items)
 
-        for index, (_key, photo) in enumerate(self._filtered_items):
+        records: list[PhotoTileModel] = []
+        for _index, (photo_id, photo) in enumerate(self._filtered_items):
             cached = self._tile_pixmap_cache.get(photo.image_id)
-            self.photo_grid.addPhoto(
-                self._device_photo_title(photo),
-                cached if cached is not None else QPixmap(),
+            records.append(
+                PhotoTileModel(
+                    key=photo_id,
+                    title=self._device_photo_title(photo),
+                    pixmap=cached if cached is not None else QPixmap(),
+                )
             )
-            if cached is None and device_path:
-                self._thumb_queue.append((index, photo, load_token))
-
-        if self._thumb_queue:
-            self._thumb_timer.start(0)
+        self.photo_grid.setRecords(
+            records,
+            reset_scroll=True,
+            preserve_selection=True,
+            fallback_index=0 if records else -1,
+        )
+        self._queue_visible_thumbnails(load_token)
 
         self._update_collection_summary()
-        if self.photo_grid.count():
-            self.photo_grid.setCurrentIndex(0)
-        else:
+        if not records:
             self.viewer.clearPreview(
                 title="No photos found",
                 summary="Try another album or broaden the search.",
             )
             self._update_action_states()
 
-    def _process_thumb_batch(self) -> None:
-        if not self._thumb_queue:
+    def _on_visible_photo_indices_changed(self, _indices: object) -> None:
+        self._queue_visible_thumbnails(self._grid_load_token)
+
+    def _request_preview_async(self, photo: PhotoEntry, format_id: int | None) -> None:
+        device_path = self._current_device_path()
+        if not device_path:
             return
 
-        batch_size = 3
-        for _ in range(batch_size):
+        cache_key = self._preview_cache_key(photo, format_id)
+        if cache_key in self._preview_pixmap_cache or cache_key in self._preview_pending:
+            return
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
+
+        self._preview_request_token += 1
+        request_token = self._preview_request_token
+        self._preview_pending.add(cache_key)
+        load_token = self._grid_load_token
+        worker = Worker(
+            self._load_preview_batch,
+            [(cache_key, photo, format_id)],
+            device_path,
+        )
+        worker.signals.result.connect(
+            lambda result, lid=load_token, rid=request_token: self._on_preview_loaded(
+                result, lid, rid
+            )
+        )
+        ThreadPoolSingleton.get_instance().start(worker)
+
+    def _on_preview_loaded(
+        self,
+        results: dict[tuple[int, int], tuple[int, int, bytes] | None] | None,
+        load_token: int,
+        request_token: int,
+    ) -> None:
+        if results is None:
+            return
+
+        if (
+            load_token != self._grid_load_token
+            or request_token != self._preview_request_token
+        ):
+            for cache_key in results:
+                self._preview_pending.discard(cache_key)
+            return
+
+        for cache_key, data in results.items():
+            self._preview_pending.discard(cache_key)
+            pixmap = QPixmap()
+            if data is not None:
+                width, height, rgba = data
+                pixmap = self._pixmap_from_rgba_bytes(width, height, rgba)
+            self._preview_pixmap_cache[cache_key] = pixmap
+
+            if self._current_preview_photo is None:
+                continue
+            current_key = self._preview_cache_key(
+                self._current_preview_photo,
+                self._current_preview_format_id,
+            )
+            if current_key == cache_key:
+                self.viewer.setPreviewPixmap(pixmap)
+
+    def _queue_visible_thumbnails(self, load_token: int) -> None:
+        if not self._grid_device_path:
+            return
+
+        visible_indices = list(self.photo_grid.visibleIndices())
+        if not visible_indices:
+            return
+
+        first_index = min(visible_indices)
+        last_index = max(visible_indices)
+        prefetch_start = max(0, first_index - (_THUMB_PREFETCH_AHEAD // 2))
+        prefetch_stop = min(
+            len(self._filtered_items),
+            last_index + 1 + _THUMB_PREFETCH_AHEAD,
+        )
+        prioritized_indices = list(range(prefetch_start, prefetch_stop))
+
+        next_queue: deque[tuple[int, PhotoEntry, int | None, int]] = deque()
+        next_queued_ids: set[int] = set()
+        for index in prioritized_indices:
+            if not (0 <= index < len(self._filtered_items)):
+                continue
+            photo_id, photo = self._filtered_items[index]
+            if (
+                photo_id in self._tile_pixmap_cache
+                or photo_id in self._thumb_in_flight_ids
+            ):
+                continue
+            next_queued_ids.add(photo_id)
+            next_queue.append(
+                (photo_id, photo, self._default_tile_format_id(photo), load_token)
+            )
+        self._thumb_queue = next_queue
+        self._queued_thumb_ids = next_queued_ids
+        if self._thumb_queue and not self._thumb_timer.isActive():
+            self._thumb_timer.start(0)
+
+    def _process_thumb_batch(self) -> None:
+        if not self._thumb_queue or self._thumb_workers_in_flight >= _MAX_THUMB_WORKERS:
+            return
+
+        from app_core.runtime import ThreadPoolSingleton, Worker
+
+        batch: list[tuple[int, PhotoEntry, int | None]] = []
+        load_token = self._grid_load_token
+        for _ in range(_THUMB_DECODE_BATCH_SIZE):
             if not self._thumb_queue:
                 break
-            index, photo, token = self._thumb_queue.popleft()
+            photo_id, photo, format_id, token = self._thumb_queue.popleft()
             if token != self._grid_load_token:
-                return
+                self._queued_thumb_ids.discard(photo_id)
+                continue
+            self._queued_thumb_ids.discard(photo_id)
+            self._thumb_in_flight_ids.add(photo_id)
+            batch.append((photo_id, photo, format_id))
 
-            pixmap = self._tile_pixmap_cache.get(photo.image_id)
-            if pixmap is None:
-                pixmap = QPixmap()
-                try:
-                    if self._grid_device_path:
-                        tile_format_id = self._default_tile_format_id(photo)
-                        img = load_photo_preview(
-                            photo,
-                            self._grid_device_path,
-                            format_id=tile_format_id,
-                        )
-                        if img is None:
-                            img = load_photo_preview(photo, self._grid_device_path)
-                        if img is not None:
-                            img.thumbnail((132, 132))
-                            pixmap = pil_to_pixmap(img)
-                except Exception:
-                    pixmap = QPixmap()
-                self._tile_pixmap_cache[photo.image_id] = pixmap
+        if not batch:
+            if self._thumb_queue and not self._thumb_timer.isActive():
+                self._thumb_timer.start(1)
+            return
 
-            if token == self._grid_load_token:
-                self.photo_grid.setTilePixmap(index, pixmap)
+        self._thumb_workers_in_flight += 1
+        worker = Worker(self._load_thumb_batch, batch, self._grid_device_path)
+        worker.signals.result.connect(
+            lambda result, lid=load_token: self._on_thumb_batch_loaded(result, lid)
+        )
+        ThreadPoolSingleton.get_instance().start(worker)
 
-        if self._thumb_queue:
+        if self._thumb_queue and not self._thumb_timer.isActive():
             self._thumb_timer.start(1)
+
+    def _on_thumb_batch_loaded(
+        self,
+        results: dict[int, tuple[int, int, bytes] | None] | None,
+        load_token: int,
+    ) -> None:
+        self._thumb_workers_in_flight = max(0, self._thumb_workers_in_flight - 1)
+        if results is None or load_token != self._grid_load_token:
+            if results is not None:
+                for photo_id in results:
+                    self._thumb_in_flight_ids.discard(photo_id)
+            return
+
+        for photo_id, data in results.items():
+            self._thumb_in_flight_ids.discard(photo_id)
+            pixmap = QPixmap()
+            if data is not None:
+                width, height, rgba = data
+                pixmap = self._pixmap_from_rgba_bytes(width, height, rgba)
+            self._tile_pixmap_cache[photo_id] = pixmap
+            self.photo_grid.setRecordPixmap(photo_id, pixmap)
+
+        if self._thumb_queue and not self._thumb_timer.isActive():
+            self._thumb_timer.start(0)
 
     def _update_collection_summary(self):
         pass
 
-    def _current_photo(self) -> tuple[str | None, PhotoEntry | None]:
+    def _current_photo(self) -> tuple[int | None, PhotoEntry | None]:
         row = self.photo_grid.currentIndex()
         if row < 0 or row >= len(self._filtered_items):
             return None, None
@@ -895,6 +1011,7 @@ class PhotoBrowserWidget(QFrame):
     def _on_photo_changed(self, row: int):
         if row < 0 or row >= len(self._filtered_items):
             self._current_preview_photo = None
+            self._current_preview_format_id = None
             self._current_format_ids = []
             self.viewer.clearPreview()
             self._update_action_states()
@@ -975,6 +1092,7 @@ class PhotoBrowserWidget(QFrame):
             self._device_db = photodb
             self._tile_pixmap_cache.clear()
             self._preview_pixmap_cache.clear()
+            self._preview_pending.clear()
             self._cache_marker = None
             self._library_cache.replace_photo_db(photodb)
         self._show_save_indicator("saved")

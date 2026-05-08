@@ -9,7 +9,7 @@ from typing import Any
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 from .jobs import AutoRestoreDeviceWorker, QuickMetadataWorker, QuickPlaylistSyncWorker
-from .services import DeviceManagerLike, LibraryCacheLike
+from .services import DeviceManagerLike, LibraryCacheLike, is_device_info_like
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,12 @@ class StartupDeviceRestoreController(QObject):
     @pyqtSlot(str, object)
     def _on_found(self, path: str, ipod: object) -> None:
         if self._cancelled or self._device_manager.device_path:
+            return
+        if not is_device_info_like(ipod):
+            logger.warning(
+                "Fast resume identification returned an unexpected device payload for '%s'",
+                path,
+            )
             return
         self._device_manager.discovered_ipod = ipod
         self._device_manager.device_path = path
@@ -238,7 +244,6 @@ class QuickWriteController(QObject):
         worker = QuickPlaylistSyncWorker(
             ipod_path=ipod_path,
             user_playlists=user_playlists,
-            on_complete=self._library_cache.clear_pending_playlists,
         )
         self._playlist_worker = worker
         worker.completed.connect(self._on_playlist_done)
@@ -317,6 +322,7 @@ class QuickWriteController(QObject):
             self._playlist_worker = None
         if result.success:
             logger.info("Quick playlist sync completed successfully")
+            self._library_cache.commit_user_playlists()
             self.save_status_changed.emit("saved")
         else:
             errors = "; ".join(msg for _, msg in result.errors)
