@@ -598,6 +598,7 @@ class BackSyncWorker(QThread):
         return text[:keep] + "..."
 
     def run(self) -> None:
+        _finished_emitted = False
         try:
             from SyncEngine._formats import MEDIA_EXTENSIONS
             from SyncEngine.audio_fingerprint import get_or_compute_fingerprint
@@ -614,53 +615,55 @@ class BackSyncWorker(QThread):
             pc_tracks = list(pc_library.scan(include_video=True))
             total_pc = len(pc_tracks)
 
-            self.progress.emit(
-                "backsync_pc_fingerprint",
-                0,
-                total_pc,
-                (
-                    f"Building fingerprints for {total_pc:,} PC track"
-                    f"{'s' if total_pc != 1 else ''}."
-                ),
-            )
             pc_fps: set[str] = set()
             pc_fingerprint_errors: list[str] = []
-            workers = min(os.cpu_count() or 4, 8)
 
-            def _fp_pc(path: str) -> str | None:
-                return get_or_compute_fingerprint(path, write_to_file=False)
+            if total_pc > 0:
+                self.progress.emit(
+                    "backsync_pc_fingerprint",
+                    0,
+                    total_pc,
+                    (
+                        f"Building fingerprints for {total_pc:,} PC track"
+                        f"{'s' if total_pc != 1 else ''}."
+                    ),
+                )
+                workers = min(os.cpu_count() or 4, 8)
 
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_fp_pc, track.path): track
-                    for track in pc_tracks
-                }
-                done = 0
-                for fut in as_completed(futures):
-                    if self.isInterruptionRequested():
-                        for pending in futures:
-                            pending.cancel()
-                        return
-                    done += 1
-                    pc_track = futures[fut]
-                    try:
-                        fp = fut.result()
-                    except Exception as exc:
-                        fp = None
-                        pc_fingerprint_errors.append(f"{pc_track.filename}: {exc}")
-                    if fp:
-                        pc_fps.add(fp)
-                    if done == total_pc or done % 25 == 0:
-                        self.progress.emit(
-                            "backsync_pc_fingerprint",
-                            done,
-                            total_pc,
-                            (
-                                f"{done:,}/{total_pc:,} checked - "
-                                f"{len(pc_fps):,} usable fingerprints - "
-                                f"{self._short_label(pc_track.filename)}"
-                            ),
-                        )
+                def _fp_pc(path: str) -> str | None:
+                    return get_or_compute_fingerprint(path, write_to_file=False)
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(_fp_pc, track.path): track
+                        for track in pc_tracks
+                    }
+                    done = 0
+                    for fut in as_completed(futures):
+                        if self.isInterruptionRequested():
+                            for pending in futures:
+                                pending.cancel()
+                            return
+                        done += 1
+                        pc_track = futures[fut]
+                        try:
+                            fp = fut.result()
+                        except Exception as exc:
+                            fp = None
+                            pc_fingerprint_errors.append(f"{pc_track.filename}: {exc}")
+                        if fp:
+                            pc_fps.add(fp)
+                        if done == total_pc or done % 25 == 0:
+                            self.progress.emit(
+                                "backsync_pc_fingerprint",
+                                done,
+                                total_pc,
+                                (
+                                    f"{done:,}/{total_pc:,} checked - "
+                                    f"{len(pc_fps):,} usable fingerprints - "
+                                    f"{self._short_label(pc_track.filename)}"
+                                ),
+                            )
 
             ipod_candidates: list[tuple[dict, Path]] = []
             unresolved_ipod_tracks = 0
@@ -680,39 +683,67 @@ class BackSyncWorker(QThread):
                 ipod_candidates.append((track, ipod_file))
 
             total_ipod = len(ipod_candidates)
-            self.progress.emit(
-                "backsync_ipod_fingerprint",
-                0,
-                total_ipod,
-                (
-                    f"Comparing {total_ipod:,} iPod media file"
-                    f"{'s' if total_ipod != 1 else ''} against your PC library."
-                ),
-            )
-
             to_export: list[tuple[dict, Path]] = []
             ipod_fingerprint_errors: list[str] = []
-            for idx, (track, ipod_file) in enumerate(ipod_candidates, start=1):
-                if self.isInterruptionRequested():
-                    return
-                title = track.get("Title") or ipod_file.name
-                try:
-                    fp = get_or_compute_fingerprint(ipod_file, write_to_file=False)
-                except Exception as exc:
-                    fp = None
-                    ipod_fingerprint_errors.append(f"{title}: {exc}")
-                if fp and fp not in pc_fps:
-                    to_export.append((track, ipod_file))
+
+            if not pc_fps:
+                # PC folder is empty (or all fingerprints failed) — every iPod
+                # track is missing by definition; skip fingerprinting entirely.
+                to_export = list(ipod_candidates)
                 self.progress.emit(
                     "backsync_ipod_fingerprint",
-                    idx,
+                    total_ipod,
+                    total_ipod,
+                    f"PC library empty — all {total_ipod:,} iPod tracks will be exported.",
+                )
+            else:
+                self.progress.emit(
+                    "backsync_ipod_fingerprint",
+                    0,
                     total_ipod,
                     (
-                        f"{idx:,}/{total_ipod:,} checked - "
-                        f"{len(to_export):,} missing so far - "
-                        f"{self._short_label(title)}"
+                        f"Comparing {total_ipod:,} iPod media file"
+                        f"{'s' if total_ipod != 1 else ''} against your PC library."
                     ),
                 )
+
+                def _fp_ipod(pair: tuple[dict, Path]) -> tuple[dict, Path, str | None, str]:
+                    track, ipod_file = pair
+                    title = track.get("Title") or ipod_file.name
+                    try:
+                        fp = get_or_compute_fingerprint(ipod_file, write_to_file=False)
+                    except Exception as exc:
+                        ipod_fingerprint_errors.append(f"{title}: {exc}")
+                        fp = None
+                    return track, ipod_file, fp, title
+
+                # Cap USB workers at 3 — USB 2.0 saturates quickly with concurrent reads.
+                ipod_workers = min(3, total_ipod or 1)
+                with ThreadPoolExecutor(max_workers=ipod_workers) as pool:
+                    futures = {
+                        pool.submit(_fp_ipod, pair): pair for pair in ipod_candidates
+                    }
+                    done = 0
+                    for fut in as_completed(futures):
+                        if self.isInterruptionRequested():
+                            for pending in futures:
+                                pending.cancel()
+                            return
+                        done += 1
+                        track, ipod_file, fp, title = fut.result()
+                        if fp and fp not in pc_fps:
+                            to_export.append((track, ipod_file))
+                        if done == total_ipod or done % 10 == 0:
+                            self.progress.emit(
+                                "backsync_ipod_fingerprint",
+                                done,
+                                total_ipod,
+                                (
+                                    f"{done:,}/{total_ipod:,} checked - "
+                                    f"{len(to_export):,} missing so far - "
+                                    f"{self._short_label(title)}"
+                                ),
+                            )
 
             output_root = Path(request.pc_folder) / "iOpenPod Back Sync"
             output_root.mkdir(parents=True, exist_ok=True)
@@ -783,6 +814,7 @@ class BackSyncWorker(QThread):
                         ),
                     )
 
+            _finished_emitted = True
             self.finished.emit(
                 {
                     "pc_scanned": total_pc,
@@ -801,10 +833,15 @@ class BackSyncWorker(QThread):
                 }
             )
         except Exception as exc:
+            _finished_emitted = True
             if self.isInterruptionRequested():
+                self.finished.emit({"cancelled": True})
                 return
             logger.exception("BackSyncWorker failed")
             self.error.emit(str(exc))
+        finally:
+            if not _finished_emitted:
+                self.finished.emit({"cancelled": True})
 
     def _resolve_location_to_path(self, location: str) -> Path | None:
         if not location:

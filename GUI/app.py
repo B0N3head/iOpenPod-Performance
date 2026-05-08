@@ -471,9 +471,9 @@ class MainWindow(QMainWindow):
         thread_pool = ThreadPoolSingleton.get_instance()
         thread_pool.clear()
 
-        from .imgMaker import clear_artworkdb_cache
+        from .imgMaker import clear_artwork_api
         from .widgets.MBGridViewItem import clear_pixmap_cache
-        clear_artworkdb_cache()
+        clear_artwork_api()
         clear_pixmap_cache()
 
         if self._apply_effective_theme():
@@ -755,9 +755,9 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to clear music browser before eject", exc_info=True)
 
         try:
-            from .imgMaker import clear_artworkdb_cache
+            from .imgMaker import clear_artwork_api
             from .widgets.MBGridViewItem import clear_pixmap_cache
-            clear_artworkdb_cache()
+            clear_artwork_api()
             clear_pixmap_cache()
         except Exception:
             logger.debug("Failed to clear artwork cache before eject", exc_info=True)
@@ -1208,8 +1208,12 @@ class MainWindow(QMainWindow):
         self.syncReview.show_error(error_msg)
 
     def _onBackSyncComplete(self, result: dict):
-        """Called when Back Sync export completes."""
+        """Called when Back Sync export completes or is cancelled."""
         self._back_sync_worker = None
+
+        if result.get("cancelled"):
+            self.hideSyncReview()
+            return
 
         exported = int(result.get("exported", 0) or 0)
         missing = int(result.get("missing_on_pc", 0) or 0)
@@ -1481,9 +1485,9 @@ class MainWindow(QMainWindow):
         cache.clear()
 
         # Clear artwork cache — sync may have added/changed album art
-        from .imgMaker import clear_artworkdb_cache
+        from .imgMaker import clear_artwork_api
         from .widgets.MBGridViewItem import clear_pixmap_cache
-        clear_artworkdb_cache()
+        clear_artwork_api()
         clear_pixmap_cache()
 
         # Clear UI so the reload starts from a clean slate

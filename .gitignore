@@ -178,3 +178,4 @@ cython_debug/
 # Claude Code
 .claude/
 CLAUDE.md
+uv.lock

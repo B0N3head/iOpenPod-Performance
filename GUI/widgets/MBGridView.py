@@ -1,7 +1,8 @@
 import difflib
 import logging
 from collections import Counter, deque
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from PyQt6.QtCore import QEvent, QRect, QSize, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QLayout, QLayoutItem, QScrollArea, QSizePolicy
@@ -136,6 +137,35 @@ _VIRTUAL_ROW_BUFFER = 1  # extra rows above/below viewport
 _VIRTUAL_SCROLL_THROTTLE_MS = 16
 
 
+# ---------------------------------------------------------------------------
+# Public types used by subclasses (e.g. selectiveSyncBrowser.PCMusicBrowserGrid)
+# ---------------------------------------------------------------------------
+
+class ArtworkResult(NamedTuple):
+    """Decoded artwork ready to apply to a grid item."""
+    image: Any          # PIL.Image.Image
+    dominant_color: tuple[int, int, int]
+    album_colors: dict
+
+
+# Sentinel: artwork key is known but the image hasn't been decoded yet.
+# Distinct from None (= no artwork for this item at all).
+_ART_CACHE_UNSET = object()
+
+
+@dataclass
+class GridRecord:
+    """Lightweight descriptor for a single grid item that needs artwork."""
+    artwork_key: Any    # int (iPod mhiiLink) or str (PC _grid_art_key) or None
+
+
+# Return type of _load_cached_artwork:
+#   ArtworkResult      → in RAM cache, ready to apply
+#   None               → no artwork (item has no key, or confirmed missing)
+#   _ART_CACHE_UNSET   → key present, not yet loaded; caller should queue a load
+CachedArtworkLookup = ArtworkResult | None
+
+
 class MusicBrowserGrid(QFrame):
     """Grid view that displays albums, artists, or genres as clickable items."""
     item_selected = pyqtSignal(dict)  # Emits when an item is clicked
@@ -185,6 +215,7 @@ class MusicBrowserGrid(QFrame):
         self._items_by_link: dict[int, list[MusicBrowserGridItem]] = {}  # mhiiLink -> items waiting for art
         self._art_pending: set[int] = set()  # links currently being loaded
         self._art_seen: set[int] = set()  # links confirmed missing artwork
+        self._art_cache: dict = {}  # per-instance cache (used by PC subclass)
 
         # Sort / filter state
         self._all_items: list[dict] = []
@@ -360,6 +391,7 @@ class MusicBrowserGrid(QFrame):
             "filter_value": item.get("filter_value", title),
             "album": item.get("album"),
             "artist": item.get("artist"),
+            "_grid_art_key": item.get("_grid_art_key"),
         }
         return title, subtitle, mhiiLink, item_data
 
@@ -503,6 +535,70 @@ class MusicBrowserGrid(QFrame):
 
         except RuntimeError:
             pass  # Widget deleted
+
+    # ── Extended API used by subclasses ──────────────────────────────────────
+
+    def _set_source_items(self, items: list[dict], *, reset_scroll: bool = False) -> None:
+        """Set source items directly and re-apply filter/sort."""
+        self._all_items = items
+        self._apply_filter_and_sort()
+        if reset_scroll and self._scroll_area is not None:
+            self._scroll_area.verticalScrollBar().setValue(0)
+
+    def _load_cached_artwork(self, record: GridRecord) -> CachedArtworkLookup:
+        """Check the RAM cache for *record*'s artwork (iPod mode).
+
+        Returns ArtworkResult if cached, None if confirmed missing,
+        or _ART_CACHE_UNSET if the key exists but hasn't been decoded yet.
+        """
+        key = record.artwork_key
+        if key is None:
+            return None
+        if key in self._art_seen:
+            return None
+        try:
+            from ..imgMaker import get_artwork
+            result = get_artwork(int(key), mode="cache_only")
+            if result is not None:
+                img, dcol, colors = result
+                return ArtworkResult(img, dcol, colors)
+        except Exception:
+            pass
+        return _ART_CACHE_UNSET
+
+    def _visible_records_needing_art(self) -> list[GridRecord]:
+        """Return a GridRecord for each visible item that still needs artwork."""
+        records: list[GridRecord] = []
+        seen: set = set()
+        for widget in self.gridItems:
+            art_key = widget.item_data.get("_grid_art_key")
+            if art_key is None and widget.mhiiLink is not None:
+                art_key = int(widget.mhiiLink)
+            if art_key is None:
+                continue
+            if art_key in seen or art_key in self._art_seen:
+                continue
+            if getattr(widget, "_art_applied_link", None) == widget.mhiiLink:
+                continue
+            if isinstance(art_key, str) and art_key in self._art_cache:
+                continue
+            seen.add(art_key)
+            records.append(GridRecord(artwork_key=art_key))
+        return records
+
+    def _apply_art_to_visible_widgets(self, key) -> None:
+        """Apply cached artwork for *key* to all visible widgets that want it."""
+        art = self._art_cache.get(key)
+        for widget in self.gridItems:
+            widget_key = widget.item_data.get("_grid_art_key")
+            if widget_key is None and widget.mhiiLink is not None:
+                widget_key = int(widget.mhiiLink)
+            if widget_key != key:
+                continue
+            if art is None:
+                widget.applyImageResult(None, None, None)
+            else:
+                widget.applyImageResult(art.image, art.dominant_color, art.album_colors)
 
     def _onItemClicked(self, item_data: dict):
         """Handle grid item click."""
@@ -845,6 +941,7 @@ class MusicBrowserGrid(QFrame):
         self._items_by_link.clear()
         self._art_pending.clear()
         self._art_seen.clear()
+        self._art_cache.clear()
         self._item_widgets_by_key.clear()
         self._item_order_keys = []
         self._virtual_items = []
