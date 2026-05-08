@@ -867,9 +867,9 @@ class MainWindow(QMainWindow):
             return None
 
         try:
-            from GUI.imgMaker import find_image_by_img_id, get_artworkdb_cached
+            from GUI.imgMaker import configure_artwork_api, get_artwork
 
-            db, idx = get_artworkdb_cached(str(artworkdb_path))
+            configure_artwork_api(str(artworkdb_path), str(artwork_folder))
             artwork_folder_str = str(artwork_folder)
         except Exception:
             logger.debug("Back Sync artwork context unavailable", exc_info=True)
@@ -887,12 +887,7 @@ class MainWindow(QMainWindow):
             try:
                 import io
 
-                result = find_image_by_img_id(
-                    db,
-                    artwork_folder_str,
-                    int(img_id),
-                    img_id_index=idx,
-                )
+                result = get_artwork(int(img_id), mode="with_colors")
                 if not result:
                     return None
                 img = result[0].convert("RGB")
