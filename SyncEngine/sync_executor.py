@@ -588,6 +588,61 @@ class SyncExecutor:
         logger.debug("ART: starting with %d matched PC paths from sync plan",
                      len(ctx.pc_file_paths))
 
+    @staticmethod
+    def _normalize_artwork_pc_paths(
+        ctx: _SyncContext,
+        all_tracks: list[TrackInfo],
+    ) -> dict[int, str]:
+        """Normalize artwork source paths to db_track_id -> absolute source path."""
+        normalized: dict[int, str] = {}
+
+        for db_track_id, path in ctx.pc_file_paths.items():
+            try:
+                normalized[int(db_track_id)] = str(path)
+            except (TypeError, ValueError):
+                continue
+
+        new_track_by_obj = {id(track): track for track in all_tracks}
+        for obj_key, info in ctx.new_track_info.items():
+            track = new_track_by_obj.get(obj_key)
+            if track is None or not track.db_track_id:
+                continue
+            pc_track, _ipod_path, _was_transcoded = info
+            normalized[track.db_track_id] = str(pc_track.path)
+
+        return normalized
+
+    @staticmethod
+    def _annotate_artwork_sync_hints(
+        ctx: _SyncContext,
+        all_tracks: list[TrackInfo],
+        normalized_pc_paths: dict[int, str],
+    ) -> None:
+        """Attach per-track hints for the ArtworkDB writer fast-path."""
+        update_artwork_ids: set[int] = set()
+        clear_art_ids: set[int] = set()
+        for item in ctx.plan.to_update_artwork:
+            if not item.db_track_id:
+                continue
+            update_artwork_ids.add(item.db_track_id)
+            if not item.new_art_hash:
+                clear_art_ids.add(item.db_track_id)
+
+        new_track_ids = {
+            track.db_track_id
+            for track in ctx.new_tracks
+            if track.db_track_id
+        }
+
+        for track in all_tracks:
+            hint = ""
+            if track.db_track_id in clear_art_ids:
+                hint = "clear_art"
+            elif track.db_track_id in normalized_pc_paths:
+                if track.db_track_id not in update_artwork_ids and track.db_track_id not in new_track_ids:
+                    hint = "preserve_existing"
+            track._iop_artwork_sync_hint = hint
+
     def _execute_write_and_finalize(self, ctx: _SyncContext) -> None:
         """Stage 7: assemble final track list, write database, backpatch and finalize."""
         # Define sub-steps so the progress bar advances smoothly through
@@ -646,8 +701,10 @@ class SyncExecutor:
                 for t in album_tracks:
                     t.gapless_album_flag = 1
 
-        logger.debug("ART: pc_file_paths total=%d, all_tracks=%d",
-                     len(ctx.pc_file_paths), len(all_tracks))
+        normalized_pc_paths = self._normalize_artwork_pc_paths(ctx, all_tracks)
+        self._annotate_artwork_sync_hints(ctx, all_tracks, normalized_pc_paths)
+        logger.debug("ART: normalized pc_file_paths total=%d, all_tracks=%d",
+                     len(normalized_pc_paths), len(all_tracks))
 
         # ── Merge user-created playlists ──────────────────────────
         self._merge_gui_playlists(ctx)
@@ -667,7 +724,7 @@ class SyncExecutor:
                 _step += 1
 
             db_ok = self._write_database(
-                all_tracks, pc_file_paths=ctx.pc_file_paths,
+                all_tracks, pc_file_paths=normalized_pc_paths,
                 playlists=playlists, smart_playlists=smart_playlists,
                 master_playlist_name=master_playlist_name,
                 progress_callback=_db_progress,

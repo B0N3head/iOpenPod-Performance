@@ -59,31 +59,17 @@ Cross-referenced against:
   - libgpod itdb_itunesdb.c: mk_mhbd() / parse_mhbd()
 """
 
-import struct
-import random
-import os
-import shutil
-import time
 import logging
+import os
+import random
+import shutil
+import struct
+import time
 import zlib
-from typing import Callable, List, Optional
-
-from .mhlt_writer import write_mhlt
-from .mhsd_writer import (
-    write_mhsd_type1, write_mhsd_type2, write_mhsd_type4,
-    write_mhsd_type3, write_mhsd_smart_type5,
-    write_mhsd_type8, write_mhsd_empty_stub,
-)
-from .mhlp_writer import write_mhlp_with_playlists, write_mhlp_smart
-from .mhla_writer import write_mhla
-from .mhli_writer import write_mhli
+from collections.abc import Callable
 from dataclasses import replace as _dc_replace
-from .mhit_writer import TrackInfo
-from .mhyp_writer import PlaylistInfo, generate_playlist_id
-from ipod_device import ChecksumType, DeviceCapabilities
-from ipod_device import detect_checksum_type
-from .hash58 import write_hash58
-from .hashab import write_hashab
+
+from ipod_device import ChecksumType, DeviceCapabilities, detect_checksum_type
 from iTunesDB_Shared.field_base import (
     read_fields,
     write_fields,
@@ -93,6 +79,24 @@ from iTunesDB_Shared.mhbd_defs import (
     MHBD_HEADER_SIZE,
     MHBD_OFFSET_HASHING_SCHEME,
 )
+
+from .hash58 import write_hash58
+from .hashab import write_hashab
+from .mhit_writer import TrackInfo
+from .mhla_writer import write_mhla
+from .mhli_writer import write_mhli
+from .mhlp_writer import write_mhlp_smart, write_mhlp_with_playlists
+from .mhlt_writer import write_mhlt
+from .mhsd_writer import (
+    write_mhsd_empty_stub,
+    write_mhsd_smart_type5,
+    write_mhsd_type1,
+    write_mhsd_type2,
+    write_mhsd_type3,
+    write_mhsd_type4,
+    write_mhsd_type8,
+)
+from .mhyp_writer import PlaylistInfo, generate_playlist_id
 
 logger = logging.getLogger(__name__)
 
@@ -207,14 +211,14 @@ def generate_database_id() -> int:
 
 
 def write_mhbd(
-    tracks: List[TrackInfo],
-    db_id: Optional[int] = None,
+    tracks: list[TrackInfo],
+    db_id: int | None = None,
     language: str = "en",
-    reference_info: Optional[dict] = None,
-    playlists_type2: Optional[List[PlaylistInfo]] = None,
-    playlists_type5: Optional[List[PlaylistInfo]] = None,
-    preserved_mhsd_blobs: Optional[List[bytes]] = None,
-    capabilities: Optional[DeviceCapabilities] = None,
+    reference_info: dict | None = None,
+    playlists_type2: list[PlaylistInfo] | None = None,
+    playlists_type5: list[PlaylistInfo] | None = None,
+    preserved_mhsd_blobs: list[bytes] | None = None,
+    capabilities: DeviceCapabilities | None = None,
     master_playlist_name: str = "iPod",
 ) -> bytes:
     """
@@ -594,18 +598,18 @@ def write_mhbd(
 
 def write_itunesdb(
     ipod_path: str,
-    tracks: List[TrackInfo],
-    db_id: Optional[int] = None,
+    tracks: list[TrackInfo],
+    db_id: int | None = None,
     backup: bool = True,
-    force_checksum: Optional[ChecksumType] = None,
-    firewire_id: Optional[bytes] = None,
-    reference_itdb_path: Optional[str] = None,
-    pc_file_paths: Optional[dict] = None,
-    playlists: Optional[List[PlaylistInfo]] = None,
-    smart_playlists: Optional[List[PlaylistInfo]] = None,
-    capabilities: Optional[DeviceCapabilities] = None,
+    force_checksum: ChecksumType | None = None,
+    firewire_id: bytes | None = None,
+    reference_itdb_path: str | None = None,
+    pc_file_paths: dict | None = None,
+    playlists: list[PlaylistInfo] | None = None,
+    smart_playlists: list[PlaylistInfo] | None = None,
+    capabilities: DeviceCapabilities | None = None,
     master_playlist_name: str = "iPod",
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> bool:
     """
     Write a complete iTunesDB to an iPod.
@@ -638,7 +642,7 @@ def write_itunesdb(
     Returns:
         True if successful
     """
-    from ipod_device import resolve_itdb_path, itdb_write_filename
+    from ipod_device import itdb_write_filename, resolve_itdb_path
 
     def _progress(msg: str) -> None:
         if progress_callback is not None:
@@ -653,8 +657,7 @@ def write_itunesdb(
     # Auto-detect capabilities from the centralized device store
     if capabilities is None:
         try:
-            from ipod_device import get_current_device
-            from ipod_device import capabilities_for_family_gen
+            from ipod_device import capabilities_for_family_gen, get_current_device
             dev = get_current_device()
             if dev and dev.model_family:
                 capabilities = capabilities_for_family_gen(
@@ -780,30 +783,11 @@ def write_itunesdb(
         if track.db_track_id == 0:
             track.db_track_id = generate_db_track_id()
 
-    # --- Write ArtworkDB if PC file paths provided ---
+    # --- Write ArtworkDB if the caller requested artwork reconciliation ---
     pending_artwork = None  # PendingArtworkWrite if defer_commit used
-    if pc_file_paths:
+    if pc_file_paths is not None:
         logger.debug("ART: pc_file_paths has %d entries, tracks has %d tracks",
                      len(pc_file_paths), len(tracks))
-
-        # Remap pc_file_paths: the sync executor may have used id(track_info) as keys
-        # because db_track_ids weren't assigned yet. Now that db_track_ids are assigned, remap.
-        remapped_paths: dict[int, str] = {}
-        obj_id_to_db_track_id = {id(t): t.db_track_id for t in tracks}
-        remap_count = 0
-        for key, path in pc_file_paths.items():
-            if key in obj_id_to_db_track_id:
-                # Key is an object id — remap to db_track_id
-                remapped_paths[obj_id_to_db_track_id[key]] = path
-                remap_count += 1
-            elif isinstance(key, int) and key > 0:
-                # Key is already a db_track_id (from matched_pc_paths)
-                remapped_paths[key] = path
-
-        logger.debug("ART: remapped %d new-track paths from object-id to db_track_id, "
-                     "%d existing-track paths kept by db_track_id",
-                     remap_count, len(remapped_paths) - remap_count)
-        pc_file_paths = remapped_paths
 
         # Log sample of pc_file_paths
         for i, (db_track_id, path) in enumerate(list(pc_file_paths.items())[:5]):
@@ -820,7 +804,7 @@ def write_itunesdb(
         logger.debug("ART: %d/%d tracks have a PC source path", matched, len(tracks))
 
         try:
-            from ArtworkDB_Writer.artwork_writer import write_artworkdb, PendingArtworkWrite
+            from ArtworkDB_Writer.artwork_writer import PendingArtworkWrite, write_artworkdb
             ref_artdb = os.path.join(ipod_path, "iPod_Control", "Artwork", "ArtworkDB")
             ref_artdb_path = ref_artdb if os.path.exists(ref_artdb) else None
 
@@ -841,30 +825,27 @@ def write_itunesdb(
                 pending_artwork = None
                 db_track_id_to_img_id = art_result
 
-            if db_track_id_to_img_id:
-                # Update mhii_link and artwork_size on tracks
-                art_count = 0
-                for track in tracks:
-                    art_info = db_track_id_to_img_id.get(track.db_track_id)
-                    if art_info:
-                        img_id, src_img_size = art_info
-                        track.mhii_link = img_id
-                        track.artwork_count = 1
-                        track.artwork_size = src_img_size
-                        art_count += 1
-                    else:
-                        # Clear stale art references — ArtworkDB was rewritten
-                        # so old img_ids no longer exist
-                        track.mhii_link = 0
-                        track.artwork_count = 0
-                        track.artwork_size = 0
-                logger.debug("ART: linked %d/%d tracks to %d unique images",
-                             art_count, len(tracks), len(db_track_id_to_img_id))
-                for t in tracks[:5]:
-                    logger.debug("ART:   '%s' mhii_link=%d artwork_count=%d artwork_size=%d",
-                                 t.title, t.mhii_link, t.artwork_count, t.artwork_size)
-            else:
-                logger.warning("ART: write_artworkdb returned empty dict — no artwork was generated")
+            # Update mhii_link and artwork_size on every track. The artwork
+            # writer always converges the device to its final state, including
+            # the zero-art case, so any missing entry here must clear stale refs.
+            art_count = 0
+            for track in tracks:
+                art_info = db_track_id_to_img_id.get(track.db_track_id)
+                if art_info:
+                    img_id, src_img_size = art_info
+                    track.mhii_link = img_id
+                    track.artwork_count = 1
+                    track.artwork_size = src_img_size
+                    art_count += 1
+                else:
+                    track.mhii_link = 0
+                    track.artwork_count = 0
+                    track.artwork_size = 0
+            logger.debug("ART: linked %d/%d tracks to %d unique images",
+                         art_count, len(tracks), len(db_track_id_to_img_id))
+            for t in tracks[:5]:
+                logger.debug("ART:   '%s' mhii_link=%d artwork_count=%d artwork_size=%d",
+                             t.title, t.mhii_link, t.artwork_count, t.artwork_size)
         except Exception as e:
             logger.error("ART: ArtworkDB write failed: %s", e, exc_info=True)
     else:
@@ -959,7 +940,7 @@ def write_itunesdb(
 
         # Step 1: Write HASH72 first (if reference has it)
         if source_itdb and len(source_itdb) >= 0xA0 and source_itdb[0x72:0x74] == bytes([0x01, 0x00]):
-            from .hash72 import extract_hash_info_to_dict, _compute_itunesdb_sha1, _hash_generate
+            from .hash72 import _compute_itunesdb_sha1, _hash_generate, extract_hash_info_to_dict
             hash_dict = extract_hash_info_to_dict(source_itdb)
             if hash_dict:
                 sha1 = _compute_itunesdb_sha1(itdb_data)
@@ -991,7 +972,7 @@ def write_itunesdb(
 
     elif checksum_type == ChecksumType.HASH72:
         # Try to get hash info from centralized store first, then fall back to disk
-        from .hash72 import extract_hash_info_to_dict, read_hash_info, _compute_itunesdb_sha1, _hash_generate, HashInfo
+        from .hash72 import HashInfo, _compute_itunesdb_sha1, _hash_generate, extract_hash_info_to_dict, read_hash_info
 
         hash_info = None
         try:
