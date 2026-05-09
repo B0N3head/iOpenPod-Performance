@@ -17,9 +17,7 @@ Usage::
 
 import logging
 import os
-from typing import Optional
 
-from .parser import parse_itunesdb
 from iTunesDB_Shared.extraction import (
     extract_datasets,
     extract_mhod_strings,
@@ -27,11 +25,13 @@ from iTunesDB_Shared.extraction import (
 )
 from iTunesDB_Shared.field_base import filetype_to_string
 
+from .parser import parse_itunesdb
+
 logger = logging.getLogger(__name__)
 
 
 def load_ipod_library(itunesdb_path: str,
-                      merge_playcounts: bool = True) -> Optional[dict]:
+                      merge_playcounts: bool = True) -> dict | None:
     """Parse an iTunesDB file and return normalised data.
 
     Args:
@@ -122,8 +122,8 @@ def _inline_artist_strings(data: dict) -> None:
 
 def _merge_play_counts(data: dict, itunesdb_path: str) -> None:
     try:
-        from .playcounts import parse_playcounts
         from .playcounts import merge_playcounts as _merge
+        from .playcounts import parse_playcounts
 
         pc_path = os.path.join(os.path.dirname(itunesdb_path), "Play Counts")
         entries = parse_playcounts(pc_path)

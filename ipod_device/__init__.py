@@ -7,21 +7,6 @@ historically spread across multiple legacy modules.
 
 # flake8: noqa: F401
 
-# ── checksum ─────────────────────────────────────────────────────────
-from .checksum import (
-    ChecksumType,
-    CHECKSUM_MHBD_SCHEME,
-    MHBD_SCHEME_TO_CHECKSUM,
-)
-
-# ── capabilities ─────────────────────────────────────────────────────
-from .capabilities import (
-    ArtworkFormat,
-    DeviceCapabilities,
-    capabilities_for_family_gen,
-    checksum_type_for_family_gen,
-)
-
 # ── artwork ──────────────────────────────────────────────────────────
 from .artwork import (
     ARTWORK_FORMATS_BY_ID,
@@ -34,48 +19,72 @@ from .artwork import (
     resolve_cover_art_format_definitions_for_device,
 )
 
-# ── models ───────────────────────────────────────────────────────────
-from .models import (
-    IPOD_MODELS,
-    USB_PID_TO_MODEL,
-    IPOD_USB_PIDS,
-    SERIAL_LAST3_TO_MODEL,
+# ── authority ────────────────────────────────────────────────────────
+from .authority import (
+    AUTHORITY_FILENAME,
+    SOURCE_RANK,
+    SYSINFO_FIELDS,
+    cache_sysinfo_extended,
+    check_authority_coverage,
+    read_authority,
+    update_sysinfo,
 )
 
-# ── lookup ───────────────────────────────────────────────────────────
-from .lookup import (
-    extract_model_number,
-    get_model_info,
-    get_friendly_model_name,
-    lookup_by_serial,
-    infer_generation,
+# ── capabilities ─────────────────────────────────────────────────────
+from .capabilities import (
+    ArtworkFormat,
+    DeviceCapabilities,
+    capabilities_for_family_gen,
+    checksum_type_for_family_gen,
+)
+from .checksum import (
+    CHECKSUM_MHBD_SCHEME,
+    MHBD_SCHEME_TO_CHECKSUM,
+    ChecksumType,
 )
 
 # ── images ───────────────────────────────────────────────────────────
 from .images import (
     COLOR_MAP,
-    MODEL_IMAGE,
     FAMILY_FALLBACK,
     GENERIC_IMAGE,
     IMAGE_COLORS,
+    MODEL_IMAGE,
     color_for_image,
-    resolve_image_filename,
     image_for_model,
+    resolve_image_filename,
 )
 
 # ── info (device_info) ───────────────────────────────────────────────
 from .info import (
     DeviceInfo,
-    get_current_device,
-    set_current_device,
     clear_current_device,
     detect_checksum_type,
-    get_firewire_id,
     enrich,
-    resolve_itdb_path,
+    generate_library_id,
+    get_current_device,
+    get_firewire_id,
     itdb_write_filename,
     read_sysinfo,
-    generate_library_id,
+    resolve_itdb_path,
+    set_current_device,
+)
+
+# ── lookup ───────────────────────────────────────────────────────────
+from .lookup import (
+    extract_model_number,
+    get_friendly_model_name,
+    get_model_info,
+    infer_generation,
+    lookup_by_serial,
+)
+
+# ── models ───────────────────────────────────────────────────────────
+from .models import (
+    IPOD_MODELS,
+    IPOD_USB_PIDS,
+    SERIAL_LAST3_TO_MODEL,
+    USB_PID_TO_MODEL,
 )
 
 # ── sysinfo parsing/evidence ─────────────────────────────────────────
@@ -89,28 +98,24 @@ from .sysinfo import (
     parse_sysinfo_text,
 )
 
-# ── authority ────────────────────────────────────────────────────────
-from .authority import (
-    SOURCE_RANK,
-    SYSINFO_FIELDS,
-    AUTHORITY_FILENAME,
-    cache_sysinfo_extended,
-    check_authority_coverage,
-    update_sysinfo,
-    read_authority,
+# ── checksum ─────────────────────────────────────────────────────────
+from .vpd_libusb import (
+    identify_via_vpd,
+)
+from .vpd_libusb import (
+    query_all_ipods as usb_query_all_ipods,
 )
 
 # ── vpd_libusb ───────────────────────────────────────────────────────
 from .vpd_libusb import (
     query_ipod_vpd as usb_query_ipod_vpd,
-    query_all_ipods as usb_query_all_ipods,
-    write_sysinfo as usb_write_sysinfo,
-    identify_via_vpd,
 )
-
+from .vpd_libusb import (
+    write_sysinfo as usb_write_sysinfo,
+)
 from .vpd_usb_control import (
-    query_ipod_usb_sysinfo_extended,
     query_all_ipod_usb_sysinfo_extended,
+    query_ipod_usb_sysinfo_extended,
 )
 
 try:

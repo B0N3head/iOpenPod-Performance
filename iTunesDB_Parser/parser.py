@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import zlib
-from typing import Any, BinaryIO, Union
+from typing import Any, BinaryIO
 
 from ._parsing import UINT32_LE
 from .exceptions import CorruptHeaderError
@@ -74,7 +74,7 @@ def decompress_itunescdb(data: bytes | bytearray) -> bytes | bytearray:
     return data[:header_length] + decompressed
 
 
-def parse_itunesdb(file: Union[str, os.PathLike[str], BinaryIO]) -> dict[str, Any]:
+def parse_itunesdb(file: str | os.PathLike[str] | BinaryIO) -> dict[str, Any]:
     """Parse an iTunesDB (or iTunesCDB) file into a nested dict tree.
 
     Args:

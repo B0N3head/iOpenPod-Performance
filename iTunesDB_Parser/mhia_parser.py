@@ -8,6 +8,7 @@ metadata (album_id, SQL ID, compilation flag) plus MHOD string children
 from __future__ import annotations
 
 import iTunesDB_Shared as idb
+
 from ._parsing import ParseResult
 from .chunk_parser import parse_children
 

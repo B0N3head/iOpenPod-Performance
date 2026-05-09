@@ -7,7 +7,6 @@ accent color for the "Match iPod" theme setting.
 
 from .models import IPOD_MODELS
 
-
 # Key: (model_family_lower, generation_lower, color_lower) → filename
 COLOR_MAP: dict[tuple[str, str, str], str] = {
     # ── iPod (1G–4G) ────────────────────────────────────────

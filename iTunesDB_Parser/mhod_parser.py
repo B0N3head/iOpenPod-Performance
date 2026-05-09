@@ -38,6 +38,7 @@ import struct
 from typing import Any
 
 import iTunesDB_Shared as idb
+
 from ._parsing import UINT16_LE, UINT32_LE, ParseResult
 
 logger = logging.getLogger(__name__)

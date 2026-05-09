@@ -129,7 +129,21 @@ def _prepare_windows_volume_for_eject(drive: str) -> tuple[bool, str]:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Prefer WinDLL when available (gives use_last_error semantics),
+    # otherwise fall back to windll.kernel32. Use getattr to avoid
+    # static-analysis attribute complaints in type checkers.
+    WinDLL = getattr(ctypes, "WinDLL", None)
+    if WinDLL:
+        kernel32 = WinDLL("kernel32", use_last_error=True)
+    else:
+        windll = getattr(ctypes, "windll", None)
+        kernel32 = getattr(windll, "kernel32", None)
+
+    if kernel32 is None:
+        # This function should only be called on Windows where kernel32 is
+        # available; fail fast to satisfy static analysis and avoid None
+        # attribute access below.
+        raise RuntimeError("Windows kernel32 API not available on this platform")
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -256,9 +270,10 @@ def _windows_device_io_control(
 def _windows_last_error_message() -> str:
     import ctypes
 
-    code = ctypes.get_last_error()
+    # Use getattr to guard against static-analysis missing attributes.
+    code = getattr(ctypes, "get_last_error", lambda: 0)()
     try:
-        text = ctypes.FormatError(code).strip()
+        text = getattr(ctypes, "FormatError", lambda c: "Unknown Windows error")(code).strip()
     except Exception:
         text = "Unknown Windows error"
     return f"{text} (Win32 error {code})"
@@ -730,7 +745,7 @@ def _find_block_device(mount_path: str) -> str | None:
     # Fallback: scan /proc/mounts for the longest matching mountpoint.
     best: str | None = None
     try:
-        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
             best_len = -1
             for line in f:
                 parts = line.split()
@@ -923,7 +938,7 @@ def _linux_path_is_mounted(mount_path: str, device: str | None = None) -> bool:
 def _linux_mount_entries() -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = []
     try:
-        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2:

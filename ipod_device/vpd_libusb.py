@@ -42,15 +42,14 @@ From code::
 
 from __future__ import annotations
 
-import logging
 import importlib.util
+import logging
 import os
 import plistlib
 import re
 import struct
 import subprocess
 import sys
-from typing import Optional
 
 from .diagnostic_log import CAPABILITY_FIELDS, IDENTITY_FIELDS, format_fields
 from .models import IPOD_USB_PIDS as IPOD_PIDS
@@ -267,7 +266,7 @@ def _read_standard_inquiry(dev, ep_out, ep_in) -> dict:
 def query_ipod_vpd(
     usb_pid: int = 0,
     serial_filter: str = "",
-) -> Optional[dict]:
+) -> dict | None:
     """Query a single iPod's device information via SCSI VPD pages.
 
     Parameters
@@ -563,7 +562,7 @@ def identify_via_vpd(
     firewire_guid: str = "",
     *,
     write_sysinfo_to_device: bool = True,
-) -> Optional[dict]:
+) -> dict | None:
     """Full iPod identification via SCSI VPD + model lookup + SysInfo write.
 
     Tries **IOKit** (macOS, no root, no unmount) first, then falls back to
@@ -705,10 +704,10 @@ def _vpd_query_any_platform(
     mount_path: str = "",
     *,
     include_usb_vendor: bool | None = None,
-) -> Optional[dict]:
+) -> dict | None:
     """Try live SysInfoExtended transports, returning one merged raw dict."""
-    scsi_vpd: Optional[dict] = None
-    usb_vendor: Optional[dict] = None
+    scsi_vpd: dict | None = None
+    usb_vendor: dict | None = None
 
     if include_usb_vendor is None:
         # Windows keeps the iPod bound to USBSTOR while mounted.  The vendored
@@ -848,9 +847,9 @@ def _vpd_query_any_platform(
 
 
 def _merge_live_sysinfoextended(
-    primary: Optional[dict],
-    secondary: Optional[dict],
-) -> Optional[dict]:
+    primary: dict | None,
+    secondary: dict | None,
+) -> dict | None:
     """Merge live SCSI and USB vendor SysInfoExtended results.
 
     The primary transport wins conflicts; the secondary fills missing fields and
@@ -925,7 +924,7 @@ def _wait_for_remount(
 # Mount-point resolution — per-platform implementations
 # ──────────────────────────────────────────────────────────────────────
 
-def _get_mount_point_diskutil(dev_identifier: str) -> Optional[str]:
+def _get_mount_point_diskutil(dev_identifier: str) -> str | None:
     """macOS: get mount point for a BSD device identifier like 'disk4s2'."""
     import plistlib as _plistlib
     import subprocess
@@ -945,12 +944,12 @@ def _get_mount_point_diskutil(dev_identifier: str) -> Optional[str]:
     return None
 
 
-def _find_mount_macos(usb_serial: str) -> Optional[str]:
+def _find_mount_macos(usb_serial: str) -> str | None:
     """macOS: find iPod mount point via ioreg + diskutil."""
     import subprocess
 
     serial_upper = usb_serial.upper()
-    bsd_disk: Optional[str] = None
+    bsd_disk: str | None = None
 
     try:
         proc = subprocess.run(
@@ -1025,7 +1024,7 @@ def _find_mount_macos(usb_serial: str) -> Optional[str]:
     return None
 
 
-def _find_mount_linux(usb_serial: str) -> Optional[str]:
+def _find_mount_linux(usb_serial: str) -> str | None:
     """Linux: find iPod mount point via /proc/mounts + sysfs.
 
     Scans all mounted FAT/HFS+ volumes, traces each back through sysfs
@@ -1034,7 +1033,7 @@ def _find_mount_linux(usb_serial: str) -> Optional[str]:
     serial_upper = usb_serial.upper()
 
     try:
-        with open("/proc/mounts", "r") as f:
+        with open("/proc/mounts") as f:
             mounts = f.readlines()
     except Exception:
         return None
@@ -1091,7 +1090,7 @@ def _find_mount_linux(usb_serial: str) -> Optional[str]:
     return None
 
 
-def _find_mount_windows(usb_serial: str) -> Optional[str]:
+def _find_mount_windows(usb_serial: str) -> str | None:
     """Windows: find iPod drive letter via WMI.
 
     Queries Win32_DiskDrive (USBSTOR) → Win32_DiskDriveToDiskPartition →
@@ -1156,7 +1155,7 @@ def _find_mount_windows(usb_serial: str) -> Optional[str]:
     return _find_mount_windows_ps(usb_serial)
 
 
-def _find_mount_windows_ps(usb_serial: str) -> Optional[str]:
+def _find_mount_windows_ps(usb_serial: str) -> str | None:
     """Windows: find iPod drive letter via PowerShell.
 
     Uses CIM/WMI cmdlets to trace USB disk → partition → logical disk.
@@ -1199,7 +1198,7 @@ def _find_mount_windows_ps(usb_serial: str) -> Optional[str]:
     return None
 
 
-def _find_mount_point_for_usb_serial(usb_serial: str) -> Optional[str]:
+def _find_mount_point_for_usb_serial(usb_serial: str) -> str | None:
     """Find the iPod mount point matching a USB serial (FireWire GUID).
 
     Dispatches to the platform-specific implementation:
