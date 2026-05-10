@@ -40,10 +40,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+
+from iTunesDB_Shared.field_base import MAC_EPOCH_OFFSET
 
 from ._parsing import UINT32_LE
-from iTunesDB_Shared.field_base import MAC_EPOCH_OFFSET
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class PlayCountEntry:
         return self.last_skipped_mac - MAC_EPOCH_OFFSET
 
 
-def parse_playcounts(path: str | Path) -> Optional[list[PlayCountEntry]]:
+def parse_playcounts(path: str | Path) -> list[PlayCountEntry] | None:
     """
     Parse an iPod Play Counts file.
 

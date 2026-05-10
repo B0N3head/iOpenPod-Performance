@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -296,7 +296,7 @@ def read_authority(ipod_path: str) -> dict:
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return data
@@ -324,7 +324,7 @@ def _read_sysinfo_raw(ipod_path: str) -> dict[str, str]:
     if not os.path.exists(path):
         return result
     try:
-        with open(path, "r", errors="replace") as f:
+        with open(path, errors="replace") as f:
             for line in f:
                 if ":" in line:
                     key, val = line.split(":", 1)
@@ -405,7 +405,7 @@ def cache_sysinfo_extended(
         return False
 
     authority = read_authority(ipod_path)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     files = authority.setdefault("files", {})
     files["SysInfoExtended"] = {
         "source": source,
@@ -479,7 +479,7 @@ def _detect_external_modification(
         "authority sources to 'sysinfo'",
         ", ".join(tampered),
     )
-    for sysinfo_key, entry in fields.items():
+    for _sysinfo_key, entry in fields.items():
         if isinstance(entry, dict) and entry.get("source") != "sysinfo":
             entry["source"] = "sysinfo"
             entry["updated"] = now
@@ -541,7 +541,7 @@ def update_sysinfo(info: DeviceInfo) -> None:
     existing_sysinfo = _read_sysinfo_raw(ipod_path)
     authority = read_authority(ipod_path)
     fields = authority.get("fields", {})
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     # ── Tamper detection: hash SysInfo / SysInfoExtended ──────────
     _detect_external_modification(ipod_path, authority, fields, now)

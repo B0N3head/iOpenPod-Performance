@@ -8,9 +8,10 @@ NOTE: This chunk shares the ``mhii`` magic with ArtworkDB image items,
 but in the iTunesDB context it represents an artist record.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import iTunesDB_Shared as idb
+
 from ._parsing import ParseResult
 from .chunk_parser import parse_children
 

@@ -12,15 +12,14 @@ import ctypes
 import logging
 import os
 import sys
-from typing import Optional
 
 from .diagnostic_log import CAPABILITY_FIELDS, IDENTITY_FIELDS, format_fields
 from .sysinfo import normalize_guid, parse_sysinfo_extended
 
 logger = logging.getLogger(__name__)
 
-if sys.platform == "win32":
-    import ctypes.wintypes as wt
+# Win32 wintypes are imported inside Windows-only functions to satisfy
+# static analysis and keep runtime imports platform-local.
 
 
 _GENERIC_READ = 0x80000000
@@ -54,6 +53,7 @@ class _SCSI_PASS_THROUGH_DIRECT(ctypes.Structure):
 def _setup_win32_prototypes() -> None:
     if sys.platform != "win32":
         return
+    from ctypes import wintypes as wt
     ctypes.windll.kernel32.CreateFileW.argtypes = [  # type: ignore[attr-defined]
         wt.LPCWSTR,
         wt.DWORD,
@@ -103,13 +103,14 @@ def _open_drive(drive_letter: str):
     )
     invalid = ctypes.c_void_p(-1).value
     if handle == invalid:
-        err = ctypes.get_last_error()
+        err = getattr(ctypes, "get_last_error", lambda: 0)()
         logger.info("Windows SCSI VPD: cannot open %s (err=%d)", path, err)
         return None
     return handle
 
 
 def _scsi_inquiry(handle, *, evpd: bool, page: int, alloc_len: int = 255) -> bytes:
+    from ctypes import wintypes as wt
     data_buf = ctypes.create_string_buffer(alloc_len)
     sptd = _SCSI_PASS_THROUGH_DIRECT()
     sptd.Length = ctypes.sizeof(_SCSI_PASS_THROUGH_DIRECT)
@@ -144,7 +145,7 @@ def _scsi_inquiry(handle, *, evpd: bool, page: int, alloc_len: int = 255) -> byt
         None,
     )
     if not ok:
-        err = ctypes.get_last_error()
+        err = getattr(ctypes, "get_last_error", lambda: 0)()
         raise OSError(err, f"DeviceIoControl INQUIRY failed for page 0x{page:02X}")
     if sptd.ScsiStatus != 0:
         raise OSError(sptd.ScsiStatus, f"SCSI status for page 0x{page:02X}")
@@ -216,7 +217,7 @@ def query_ipod_vpd_for_path(
     *,
     usb_pid: int = 0,
     serial_filter: str = "",
-) -> Optional[dict]:
+) -> dict | None:
     """Read SCSI VPD SysInfoExtended from the selected Windows drive."""
     if sys.platform != "win32":
         return None

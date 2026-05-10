@@ -13,23 +13,31 @@ iPod hardware limits enforced on every output:
   Bit depth    ≤ 16-bit   (ALAC only — AAC/MP3 are inherently ≤16-bit)
 """
 
-from ._formats import (
-    IPOD_NATIVE_FORMATS,
-    NON_NATIVE_LOSSLESS as _NON_NATIVE_LOSSLESS_EXTS,
-    NON_NATIVE_LOSSY as _NON_NATIVE_LOSSY_EXTS,
-    NON_NATIVE_VIDEO as _NON_NATIVE_VIDEO_EXTS,
-)
 import json as _json
 import logging
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import ClassVar, Callable, Optional
+from typing import ClassVar
+
+from ._formats import (
+    IPOD_NATIVE_FORMATS,
+)
+from ._formats import (
+    NON_NATIVE_LOSSLESS as _NON_NATIVE_LOSSLESS_EXTS,
+)
+from ._formats import (
+    NON_NATIVE_LOSSY as _NON_NATIVE_LOSSY_EXTS,
+)
+from ._formats import (
+    NON_NATIVE_VIDEO as _NON_NATIVE_VIDEO_EXTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +281,7 @@ class TranscodePlan:
         return self.source_path.suffix.lstrip(".")
 
     @property
-    def cache_bitrate_kbps(self) -> Optional[int]:
+    def cache_bitrate_kbps(self) -> int | None:
         if self.target == TranscodeTarget.AAC:
             return self._nominal_lossy_bitrate(self.effective_quality)
         if self.target == TranscodeTarget.MP3:
@@ -368,9 +376,9 @@ class TranscodePlan:
 def resolve_transcode_plan(
     filepath: str | Path,
     *,
-    aac_quality: Optional[str] = None,
-    prefer_lossy: Optional[bool] = None,
-    options: Optional[TranscodeOptions] = None,
+    aac_quality: str | None = None,
+    prefer_lossy: bool | None = None,
+    options: TranscodeOptions | None = None,
 ) -> TranscodePlan:
     """Resolve the full transcode policy for *filepath*.
 
@@ -434,7 +442,7 @@ def _resolve_effective_quality(
     source_path: Path,
     target: TranscodeTarget,
     *,
-    aac_quality: Optional[str],
+    aac_quality: str | None,
     smart_quality_by_type: bool,
 ) -> str:
     """Resolve legacy quality hint plus spoken-word auto-detection."""
@@ -459,10 +467,10 @@ class TranscodeResult:
     """Outcome of a single transcode / copy operation."""
     success: bool
     source_path: Path
-    output_path: Optional[Path]
+    output_path: Path | None
     target_format: TranscodeTarget
     was_transcoded: bool
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     @property
     def ipod_format(self) -> str:
@@ -482,7 +490,7 @@ def clear_caches() -> None:
 # Binary discovery
 # ═══════════════════════════════════════════════════════════════════════════
 
-def find_ffmpeg(ffmpeg_path: Optional[str] = None) -> Optional[str]:
+def find_ffmpeg(ffmpeg_path: str | None = None) -> str | None:
     """Locate ffmpeg (user setting → bundled → PATH → common dirs)."""
     if ffmpeg_path and Path(ffmpeg_path).is_file():
         return ffmpeg_path
@@ -508,12 +516,12 @@ def find_ffmpeg(ffmpeg_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
-def is_ffmpeg_available(ffmpeg_path: Optional[str] = None) -> bool:
+def is_ffmpeg_available(ffmpeg_path: str | None = None) -> bool:
     return find_ffmpeg(ffmpeg_path) is not None
 
 
 @lru_cache(maxsize=1)
-def _find_ffprobe() -> Optional[str]:
+def _find_ffprobe() -> str | None:
     """Locate ffprobe (sibling of ffmpeg, then PATH)."""
     ffmpeg = find_ffmpeg()
     if ffmpeg:
@@ -525,7 +533,7 @@ def _find_ffprobe() -> Optional[str]:
 
 
 @lru_cache(maxsize=8)
-def available_aac_encoders(ffmpeg_path: Optional[str] = None) -> set[str]:
+def available_aac_encoders(ffmpeg_path: str | None = None) -> set[str]:
     """Return the set of AAC encoders exposed by the current ffmpeg build."""
     ffmpeg = find_ffmpeg(ffmpeg_path)
     if not ffmpeg:
@@ -548,7 +556,7 @@ def available_aac_encoders(ffmpeg_path: Optional[str] = None) -> set[str]:
 
 
 @lru_cache(maxsize=8)
-def _best_aac_encoder(ffmpeg_path: Optional[str] = None) -> str:
+def _best_aac_encoder(ffmpeg_path: str | None = None) -> str:
     """Return the best available AAC encoder.
 
     Preference: libfdk_aac (Fraunhofer) > aac_at (macOS AudioToolbox) > aac.
@@ -562,7 +570,7 @@ def _best_aac_encoder(ffmpeg_path: Optional[str] = None) -> str:
 
 
 @lru_cache(maxsize=8)
-def available_mp3_encoders(ffmpeg_path: Optional[str] = None) -> set[str]:
+def available_mp3_encoders(ffmpeg_path: str | None = None) -> set[str]:
     """Return the set of MP3 encoders exposed by the current ffmpeg build."""
     ffmpeg = find_ffmpeg(ffmpeg_path)
     if not ffmpeg:
@@ -585,7 +593,7 @@ def available_mp3_encoders(ffmpeg_path: Optional[str] = None) -> set[str]:
 
 
 @lru_cache(maxsize=8)
-def _best_mp3_encoder(ffmpeg_path: Optional[str] = None) -> str:
+def _best_mp3_encoder(ffmpeg_path: str | None = None) -> str:
     """Return the best available MP3 encoder.
 
     Preference: libmp3lame > libshine.
@@ -602,7 +610,7 @@ def _best_mp3_encoder(ffmpeg_path: Optional[str] = None) -> str:
 # Probing
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _run_ffprobe(args: list[str], timeout: int = 30) -> Optional[dict]:
+def _run_ffprobe(args: list[str], timeout: int = 30) -> dict | None:
     """Run ffprobe with *args*, return parsed JSON or None."""
     probe = _find_ffprobe()
     if not probe:
@@ -685,7 +693,7 @@ def probe_audio(filepath: str | Path) -> AudioProperties:
 
 def probe_video_needs_transcode(
     filepath: str | Path,
-    ffprobe_path: Optional[str] = None,
+    ffprobe_path: str | None = None,
 ) -> bool:
     """True if a video file needs re-encoding for iPod compatibility."""
     probe = ffprobe_path or _find_ffprobe()
@@ -798,8 +806,7 @@ def _get_video_caps() -> tuple[int, int, int, int, str]:
     device is connected or the model is unrecognised.
     """
     try:
-        from ipod_device import get_current_device
-        from ipod_device import capabilities_for_family_gen
+        from ipod_device import capabilities_for_family_gen, get_current_device
         dev = get_current_device()
         if dev and dev.model_family:
             caps = capabilities_for_family_gen(
@@ -832,8 +839,7 @@ def _device_supports_alac() -> bool:
     the model is unrecognised — avoids unnecessary re-encodes.
     """
     try:
-        from ipod_device import get_current_device
-        from ipod_device import capabilities_for_family_gen
+        from ipod_device import capabilities_for_family_gen, get_current_device
         dev = get_current_device()
         if dev and dev.model_family:
             caps = capabilities_for_family_gen(
@@ -849,8 +855,8 @@ def _device_supports_alac() -> bool:
 def get_transcode_target(
     filepath: str | Path,
     *,
-    prefer_lossy: Optional[bool] = None,
-    options: Optional[TranscodeOptions] = None,
+    prefer_lossy: bool | None = None,
+    options: TranscodeOptions | None = None,
 ) -> TranscodeTarget:
     """Determine the target format for *filepath*.
 
@@ -932,7 +938,7 @@ def get_transcode_target(
 def needs_transcoding(
     filepath: str | Path,
     *,
-    prefer_lossy: Optional[bool] = None,
+    prefer_lossy: bool | None = None,
 ) -> bool:
     """True if the file needs any conversion before it can go on iPod."""
     return get_transcode_target(filepath, prefer_lossy=prefer_lossy) != TranscodeTarget.COPY
@@ -944,7 +950,7 @@ def needs_transcoding(
 
 def quality_to_nominal_bitrate(
     quality: str,
-    options: Optional[TranscodeOptions] = None,
+    options: TranscodeOptions | None = None,
 ) -> int:
     """Return the nominal bitrate (kbps) for display / cache-key purposes."""
     options = options or TranscodeOptions()
@@ -1005,9 +1011,9 @@ def resolve_effective_encoder(options: TranscodeOptions) -> tuple[TranscodeTarge
 
 def _aac_quality_args(
     quality: str,
-    options: Optional[TranscodeOptions] = None,
+    options: TranscodeOptions | None = None,
     *,
-    encoder: Optional[str] = None,
+    encoder: str | None = None,
 ) -> list[str]:
     """Build encoder-specific ffmpeg flags from user settings."""
     options = (options or TranscodeOptions()).normalized()
@@ -1059,8 +1065,8 @@ def _aac_quality_args(
         if is_manual:
             args += ["-aac_pns", "1" if options.aac_pns else "0"]
             args += ["-aac_tns", "1" if options.aac_tns else "0"]
-            args += ["-aac_ms",  "1" if options.aac_ms_stereo else "0"]
-            args += ["-aac_is",  "1" if options.aac_intensity_stereo else "0"]
+            args += ["-aac_ms", "1" if options.aac_ms_stereo else "0"]
+            args += ["-aac_is", "1" if options.aac_intensity_stereo else "0"]
             if options.aac_cutoff > 0:
                 args += ["-cutoff", str(options.aac_cutoff)]
         else:
@@ -1071,9 +1077,9 @@ def _aac_quality_args(
 
 def _mp3_quality_args(
     quality: str,
-    options: Optional[TranscodeOptions] = None,
+    options: TranscodeOptions | None = None,
     *,
-    encoder: Optional[str] = None,
+    encoder: str | None = None,
 ) -> list[str]:
     """Build encoder-specific ffmpeg flags for MP3 output."""
     options = (options or TranscodeOptions()).normalized()
@@ -1103,7 +1109,7 @@ def _mp3_quality_args(
 # FFmpeg command builders
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _target_sample_rate(source_rate: int, normalize: bool) -> Optional[int]:
+def _target_sample_rate(source_rate: int, normalize: bool) -> int | None:
     """Return the ``-ar`` value to pass to ffmpeg, or ``None`` to omit the flag.
 
     Rules:
@@ -1127,13 +1133,16 @@ def _cmd_alac(ffmpeg: str, src: str, dst: str, normalize_sr: bool = False) -> li
     props = probe_audio(src)
     target_sr = _target_sample_rate(props.sample_rate, normalize_sr)
     ar_args = ["-ar", str(target_sr)] if target_sr is not None else []
+    # Preserve source channel count when possible (mono stays mono, stereo stays stereo).
+    # Cap at IPOD_MAX_CHANNELS (2) in case source has 5.1 or surround.
+    channels = min(props.channels, IPOD_MAX_CHANNELS) if props.channels > 0 else IPOD_MAX_CHANNELS
     return [
         ffmpeg, "-i", src,
         "-vn",
         "-acodec", "alac",
         *ar_args,
         "-sample_fmt", "s16p",
-        "-ac", str(IPOD_MAX_CHANNELS),
+        "-ac", str(channels),
         "-movflags", "+faststart",
         "-y", dst,
     ]
@@ -1143,9 +1152,9 @@ def _cmd_aac(
     ffmpeg: str, src: str, dst: str, quality: str,
     normalize_sr: bool = False,
     mono: bool = False,
-    options: Optional[TranscodeOptions] = None,
+    options: TranscodeOptions | None = None,
     *,
-    encoder: Optional[str] = None,
+    encoder: str | None = None,
 ) -> list[str]:
     props = probe_audio(src)
     target_sr = _target_sample_rate(props.sample_rate, normalize_sr)
@@ -1170,9 +1179,9 @@ def _cmd_mp3(
     ffmpeg: str, src: str, dst: str, quality: str,
     normalize_sr: bool = False,
     mono: bool = False,
-    options: Optional[TranscodeOptions] = None,
+    options: TranscodeOptions | None = None,
     *,
-    encoder: Optional[str] = None,
+    encoder: str | None = None,
 ) -> list[str]:
     props = probe_audio(src)
     target_sr = _target_sample_rate(props.sample_rate, normalize_sr)
@@ -1325,14 +1334,14 @@ def _build_ffmpeg_command(
 def transcode(
     source_path: str | Path,
     output_dir: str | Path,
-    output_filename: Optional[str] = None,
-    ffmpeg_path: Optional[str] = None,
+    output_filename: str | None = None,
+    ffmpeg_path: str | None = None,
     aac_quality: str = "normal",
-    progress_callback: Optional[Callable[[float], None]] = None,
+    progress_callback: Callable[[float], None] | None = None,
     *,
-    prefer_lossy: Optional[bool] = None,
-    options: Optional[TranscodeOptions] = None,
-    is_cancelled: Optional[Callable[[], bool]] = None,
+    prefer_lossy: bool | None = None,
+    options: TranscodeOptions | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> TranscodeResult:
     """Transcode (or copy) *source_path* into *output_dir*.
 
@@ -1398,8 +1407,8 @@ def _run_transcode(
     source_path: Path,
     output_path: Path,
     target: TranscodeTarget,
-    progress_callback: Optional[Callable[[float], None]],
-    is_cancelled: Optional[Callable[[], bool]] = None,
+    progress_callback: Callable[[float], None] | None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> TranscodeResult:
     """Run an ffmpeg command and return a TranscodeResult."""
     try:
@@ -1509,7 +1518,7 @@ def _run_ffmpeg_with_progress(
     duration_us: int,
     progress_callback: Callable[[float], None],
     timeout: int,
-    is_cancelled: Optional[Callable[[], bool]] = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, str]:
     """Run ffmpeg with ``-progress pipe:1`` and stream progress."""
     import threading

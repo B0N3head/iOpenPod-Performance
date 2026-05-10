@@ -17,10 +17,9 @@ Cross-referenced against:
   - iPodLinux wiki MHIT documentation
 """
 
-import time
 import random
+import time
 from dataclasses import dataclass
-from typing import Optional
 
 from iTunesDB_Shared.constants import (
     AUDIO_FORMAT_FLAG_DEFAULT,
@@ -35,6 +34,7 @@ from iTunesDB_Shared.constants import (
 )
 from iTunesDB_Shared.field_base import write_fields, write_generic_header
 from iTunesDB_Shared.mhit_defs import MHIT_HEADER_SIZE, mhit_header_size_for_version
+
 from .mhod_writer import write_track_mhods
 
 
@@ -63,12 +63,12 @@ class TrackInfo:
     vbr: bool = False
 
     # Metadata
-    artist: Optional[str] = None
-    album: Optional[str] = None
-    album_artist: Optional[str] = None
-    genre: Optional[str] = None
-    composer: Optional[str] = None
-    comment: Optional[str] = None
+    artist: str | None = None
+    album: str | None = None
+    album_artist: str | None = None
+    genre: str | None = None
+    composer: str | None = None
+    comment: str | None = None
     year: int = 0
     track_number: int = 0
     total_tracks: int = 0
@@ -106,8 +106,8 @@ class TrackInfo:
     explicit_flag: int = 0  # 0=none, 1=explicit, 2=clean
     purchased_aac_flag: int = 0  # 0x93: 1 for M4A/iTunes purchases, 0 for most MP3s
     has_lyrics: bool = False  # True if track has embedded lyrics
-    lyrics: Optional[str] = None  # Full lyrics text (MHOD type 10)
-    eq_setting: Optional[str] = None  # EQ preset name (MHOD type 7), e.g. "Bass Booster"
+    lyrics: str | None = None  # Full lyrics text (MHOD type 10)
+    eq_setting: str | None = None  # EQ preset name (MHOD type 7), e.g. "Bass Booster"
 
     # Timestamps (Unix)
     date_added: int = 0  # Will be set to now if 0
@@ -128,32 +128,32 @@ class TrackInfo:
     album_id: int = 0  # Links to MHIA album entry
 
     # Sorting
-    sort_artist: Optional[str] = None
-    sort_name: Optional[str] = None
-    sort_album: Optional[str] = None
-    sort_album_artist: Optional[str] = None
-    sort_composer: Optional[str] = None
+    sort_artist: str | None = None
+    sort_name: str | None = None
+    sort_album: str | None = None
+    sort_album_artist: str | None = None
+    sort_composer: str | None = None
 
     # Extra string metadata
-    grouping: Optional[str] = None
-    keywords: Optional[str] = None  # MHOD type 24 (track keywords)
+    grouping: str | None = None
+    keywords: str | None = None  # MHOD type 24 (track keywords)
 
     # Podcast string metadata (written as MHODs)
-    podcast_enclosure_url: Optional[str] = None  # MHOD type 15
-    podcast_rss_url: Optional[str] = None        # MHOD type 16
-    category: Optional[str] = None               # MHOD type 9
+    podcast_enclosure_url: str | None = None  # MHOD type 15
+    podcast_rss_url: str | None = None        # MHOD type 16
+    category: str | None = None               # MHOD type 9
 
     # Video string metadata (written as MHODs)
-    description: Optional[str] = None       # MHOD type 14
-    subtitle: Optional[str] = None          # MHOD type 18
-    show_name: Optional[str] = None         # MHOD type 19 (TV show name)
-    episode_id: Optional[str] = None        # MHOD type 20 (e.g. "S01E05")
-    network_name: Optional[str] = None      # MHOD type 21 (TV network)
-    sort_show: Optional[str] = None         # MHOD type 31
-    show_locale: Optional[str] = None       # MHOD type 25 (show locale, e.g. "en_US")
+    description: str | None = None       # MHOD type 14
+    subtitle: str | None = None          # MHOD type 18
+    show_name: str | None = None         # MHOD type 19 (TV show name)
+    episode_id: str | None = None        # MHOD type 20 (e.g. "S01E05")
+    network_name: str | None = None      # MHOD type 21 (TV network)
+    sort_show: str | None = None         # MHOD type 31
+    show_locale: str | None = None       # MHOD type 25 (show locale, e.g. "en_US")
 
     # Filetype description
-    filetype_desc: Optional[str] = None  # e.g., "MPEG audio file"
+    filetype_desc: str | None = None  # e.g., "MPEG audio file"
 
     # Round-trip fields (preserved from existing iPod database)
     user_id: int = 0      # 0x64: DRM user ID (preserved for round-trip)
@@ -173,7 +173,14 @@ class TrackInfo:
     composer_id: int = 0  # Links to composer entry (assigned by writer)
 
     # Chapter data (MHOD type 17) — list of {"startpos": ms, "title": str}
-    chapter_data: Optional[dict] = None
+    chapter_data: dict | None = None
+
+    # Internal sync hint (transient, not written to database)
+    # Used by ArtworkDB writer to determine preservation strategy:
+    # "preserve_existing" = use existing art without re-encoding
+    # "clear_art" = remove art for this track
+    # "" (empty) = normal processing
+    _iop_artwork_sync_hint: str = ""
 
     @property
     def db_id(self) -> int:

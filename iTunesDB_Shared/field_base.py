@@ -12,13 +12,14 @@ import time by :mod:`iTunesDB_Shared.__init__` from those modules.
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
-
+from typing import Any
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  1. Exception Hierarchy
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 class WriteError(Exception):
     """Base exception for iTunesDB write-time errors."""
@@ -148,11 +149,11 @@ class FieldDef:
     offset: int
     size: int
     struct_format: str
-    read_transform: Optional[Callable[..., Any]] = None
-    write_transform: Optional[Callable[..., Any]] = None
+    read_transform: Callable[..., Any] | None = None
+    write_transform: Callable[..., Any] | None = None
     default: Any = 0
-    validator: Optional[Callable[..., None]] = None
-    min_header_length: Optional[int] = None
+    validator: Callable[..., None] | None = None
+    min_header_length: int | None = None
     required: bool = False
     section_type: str = ""
 

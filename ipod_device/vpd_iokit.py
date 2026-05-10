@@ -30,7 +30,6 @@ from ctypes import (
     cast,
     create_string_buffer,
 )
-from typing import Optional
 
 if sys.platform != "darwin":
     raise ImportError("ipod_device.vpd_iokit is macOS-only")
@@ -165,7 +164,7 @@ def _vt_call(obj: c_void_p, slot: int, restype, argtypes, *args):
 
 # ── IOKit registry helpers ───────────────────────────────────────────
 
-def _cf_property_string(entry: int, key: str) -> Optional[str]:
+def _cf_property_string(entry: int, key: str) -> str | None:
     """Read a string property from an IOKit registry entry."""
     cf_key = _cf.CFStringCreateWithCString(
         None, key.encode(), kCFStringEncodingUTF8
@@ -189,7 +188,7 @@ def _cf_property_string(entry: int, key: str) -> Optional[str]:
         _cf.CFRelease(cf_key)
 
 
-def _cf_property_int(entry: int, key: str) -> Optional[int]:
+def _cf_property_int(entry: int, key: str) -> int | None:
     """Read an integer property from an IOKit registry entry."""
     cf_key = _cf.CFStringCreateWithCString(
         None, key.encode(), kCFStringEncodingUTF8
@@ -256,8 +255,8 @@ class _SCSISession:
 
     def __init__(self, service: int):
         self._service = service
-        self._plugin: Optional[c_void_p] = None
-        self._device_if: Optional[c_void_p] = None
+        self._plugin: c_void_p | None = None
+        self._device_if: c_void_p | None = None
         self._task = None
         self._exclusive = False
 
@@ -340,7 +339,7 @@ class _SCSISession:
     def __exit__(self, *_):
         self.close()
 
-    def inquiry(self, evpd: bool, page: int, alloc_len: int = 255) -> Optional[bytes]:
+    def inquiry(self, evpd: bool, page: int, alloc_len: int = 255) -> bytes | None:
         """Send SCSI INQUIRY. Returns response bytes or None on failure."""
         if not self._task:
             return None
@@ -477,7 +476,7 @@ def _parse_vpd_regex(raw: bytes) -> dict:
 
 def query_ipod_vpd(
     usb_pid: int = 0, serial_filter: str = ""
-) -> Optional[dict]:
+) -> dict | None:
     """
     Query a single iPod's device info via IOKit SCSI VPD.
 
@@ -563,7 +562,7 @@ def query_all_ipods() -> list[dict]:
 
 def _query_one_service(
     service: int, usb_pid: int, serial_filter: str
-) -> Optional[dict]:
+) -> dict | None:
     """Query one iPod IOKit service.  Returns dict or None."""
     # Get USB info from IOKit registry parents
     usb_info = _walk_parents_for_usb_info(service)

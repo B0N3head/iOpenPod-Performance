@@ -12,25 +12,24 @@ ArtworkDB structure:
       mhsd type=3 → mhlf → mhif[] (one per image format, describes ithmb file sizes)
 """
 
-import struct
-import os
 import logging
-from collections import defaultdict
-from collections import Counter
+import os
+import struct
+from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from enum import StrEnum
 
-from .rgb565 import (image_from_bytes,
-                     IPOD_STRIDE_OVERRIDE,
-                     get_artwork_format_definitions,
-                     get_artwork_formats)
+from ipod_device import ArtworkFormat
+
+from .art_extractor import art_hash, extract_art_with_folder
 from .ithmb_codecs import (
     decode_pixels_for_format,
     encode_image_for_format,
     expected_size_bytes,
 )
-from .art_extractor import extract_art_with_folder, art_hash
+from .rgb565 import IPOD_STRIDE_OVERRIDE, get_artwork_format_definitions, get_artwork_formats, image_from_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +50,7 @@ class ArtworkEntry:
     """Represents a unique album art image for the ArtworkDB."""
     img_id: int
     db_track_id: int  # db_track_id of one associated track
-    art_hash: str  # MD5 hash for deduplication
+    art_hash: str | None  # MD5 hash for deduplication when sourced from PC
     src_img_size: int  # Size of original source image
     formats: dict = field(default_factory=dict)  # Per-format converted data: {format_id: {data, width, height, size, ...}}
     db_track_ids: list = field(default_factory=list)  # Track db_track_ids that use this artwork
@@ -77,13 +76,50 @@ class PendingArtworkWrite:
     """
     db_track_id_to_art_info: dict          # db_track_id → (img_id, src_img_size)
     _pending_renames: list = field(default_factory=list)  # [(temp, final), ...]
-    _post_commit_cleanup: Optional[Callable[[], None]] = None
+    _post_commit_cleanup: Callable[[], None] | None = None
     _committed: bool = False
 
     @property
     def db_id_to_art_info(self) -> dict:
         """Backward-compatible alias for db_track_id_to_art_info."""
         return self.db_track_id_to_art_info
+
+    # Dict-like interface for compatibility with code expecting a plain dict
+    def __getitem__(self, key):
+        """Allow indexing like a dict: pending_aw[track_id] → (img_id, size)"""
+        return self.db_track_id_to_art_info[key]
+
+    def __setitem__(self, key, value):
+        """Allow dict-like assignment."""
+        self.db_track_id_to_art_info[key] = value
+
+    def __contains__(self, key) -> bool:
+        """Allow 'in' operator."""
+        return key in self.db_track_id_to_art_info
+
+    def __iter__(self):
+        """Allow iteration over keys."""
+        return iter(self.db_track_id_to_art_info)
+
+    def __len__(self) -> int:
+        """Allow len()."""
+        return len(self.db_track_id_to_art_info)
+
+    def get(self, key, default=None):
+        """Dict-like get() with default."""
+        return self.db_track_id_to_art_info.get(key, default)
+
+    def keys(self):
+        """Return dict keys."""
+        return self.db_track_id_to_art_info.keys()
+
+    def values(self):
+        """Return dict values."""
+        return self.db_track_id_to_art_info.values()
+
+    def items(self):
+        """Return dict items."""
+        return self.db_track_id_to_art_info.items()
 
     def commit(self) -> None:
         """Atomically replace all temp files with final paths."""
@@ -104,6 +140,48 @@ class PendingArtworkWrite:
                 os.remove(temp)
             except OSError:
                 pass
+
+
+class ArtworkDecisionKind(StrEnum):
+    """Per-track action for the final artwork state."""
+
+    NEW_FROM_PC = "new_from_pc"
+    PRESERVE_EXISTING = "preserve_existing"
+    CLEAR_ART = "clear_art"
+    PRESERVE_FALLBACK = "preserve_fallback"
+
+
+@dataclass(frozen=True)
+class ArtworkAssetRef:
+    """Identifies the shared artwork payload for dedupe/reuse."""
+
+    source: str
+    value: str | int
+
+
+@dataclass
+class TrackArtworkDecision:
+    """Resolved artwork action for one track in the final database."""
+
+    db_track_id: int
+    kind: ArtworkDecisionKind
+    asset_ref: ArtworkAssetRef | None = None
+    art_bytes: bytes | None = None
+    src_img_size: int = 0
+    existing_entry: dict | None = None
+
+
+@dataclass
+class ArtworkDecisionSummary:
+    """Counters for structured writer logging."""
+
+    preserved_unchanged: int = 0
+    preserved_fallback: int = 0
+    reencoded: int = 0
+    cleared: int = 0
+    shared_from_album: int = 0
+    salvaged: int = 0
+    dropped_invalid: int = 0
 
 
 def _write_mhod_string(mhod_type: int, string: str) -> bytes:
@@ -332,7 +410,7 @@ def _write_mhsd(ds_type: int, child_data: bytes) -> bytes:
 
 
 def _write_mhfd(datasets: list[bytes], next_mhii_id: int,
-                reference_mhfd: Optional[bytes] = None) -> bytes:
+                reference_mhfd: bytes | None = None) -> bytes:
     """
     Write MHFD (file header) for ArtworkDB.
 
@@ -431,7 +509,7 @@ def _read_existing_artwork(artworkdb_path: str, artwork_dir: str) -> dict:
     return entries
 
 
-def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional[dict]:
+def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> dict | None:
     """Parse a single MHII entry from the existing ArtworkDB.
 
     Returns location *references* (path / offset / size) for each format's
@@ -503,22 +581,68 @@ def _parse_mhii_existing(data: bytes, offset: int, artwork_dir: str) -> Optional
     }
 
 
-def _cleanup_stale_ithmb_files(artwork_dir: str, keep_format_ids: set[int]) -> None:
-    """Remove ithmb files whose format ID is not referenced by the final DB."""
+def _cleanup_stale_ithmb_files(artwork_dir: str, keep_format_ids: set[int], artdb_path: str | None = None) -> None:
+    """Remove ithmb files that are not referenced by the final ArtworkDB.
+
+    Historically this function removed files simply because their format
+    ID wasn't present in `keep_format_ids`, which could falsely remove
+    ithmb files that were still referenced by the newly-written ArtworkDB
+    (for example when preserved entries or mixed-format databases exist).
+
+    To be conservative, prefer parsing the on-disk `ArtworkDB` (if
+    available) to determine the authoritative set of referenced format
+    IDs. Any ithmb whose format ID is not referenced by the ArtworkDB
+    and not in `keep_format_ids` is eligible for removal.
+    """
     import re
     pattern = re.compile(r'^F(\d+)_\d+\.ithmb$', re.IGNORECASE)
     if not os.path.isdir(artwork_dir):
         return
+
+    # Determine authoritative referenced formats from the new ArtworkDB
+    referenced_formats: set[int] = set()
+    try:
+        if artdb_path is None:
+            artdb_path = os.path.join(artwork_dir, "ArtworkDB")
+        if artdb_path and os.path.exists(artdb_path):
+            with open(artdb_path, 'rb') as f:
+                data = f.read()
+            # Reuse helper from rgb565 module if available, fallback to
+            # simple parsing: extract mhif correlation IDs via _extract_format_ids
+            try:
+                from .rgb565 import _extract_format_ids
+                referenced_formats.update(_extract_format_ids(data))
+            except Exception:
+                # Best-effort parsing: look for 'mhif' chunks and read corr_id
+                import struct
+                if len(data) >= 8 and data[:4] == b'mhfd':
+                    mhfd_header = struct.unpack('<I', data[4:8])[0]
+                    offset = mhfd_header
+                    # scan for mhif signatures
+                    while offset + 12 < len(data):
+                        if data[offset:offset + 4] == b'mhif' and offset + 20 <= len(data):
+                            corr_id = struct.unpack('<I', data[offset + 16:offset + 20])[0]
+                            referenced_formats.add(corr_id)
+                            size = struct.unpack('<I', data[offset + 4:offset + 8])[0]
+                            offset += size
+                        else:
+                            offset += 4
+    except Exception:
+        # On any parsing failure, fall back to the provided keep_format_ids
+        referenced_formats = set()
+
+    # Final keep set: union of explicitly kept formats and those referenced
+    keep = set(keep_format_ids) | set(referenced_formats)
+
     for name in os.listdir(artwork_dir):
         m = pattern.match(name)
         if m:
             fmt_id = int(m.group(1))
-            if fmt_id not in keep_format_ids:
+            if fmt_id not in keep:
                 path = os.path.join(artwork_dir, name)
                 try:
                     os.remove(path)
-                    logger.info("ART: removed unreferenced ithmb file %s (format %d)",
-                                name, fmt_id)
+                    logger.info("ART: removed unreferenced ithmb file %s (format %d)", name, fmt_id)
                 except OSError as e:
                     logger.warning("ART: failed to remove stale ithmb %s: %s", name, e)
 
@@ -532,15 +656,430 @@ def _decode_preserved_frame(ref: dict, format_id: int, pixel_bytes: bytes, fmt_o
     return decode_pixels_for_format(format_id, pixel_bytes, width, height, hpad, vpad)
 
 
+def _get_track_artwork_hint(track) -> str:
+    """Read the optional sync hint injected by the executor."""
+    hint = _get_track_field(track, "_iop_artwork_sync_hint")
+    return str(hint or "").strip().lower()
+
+
+def _resolve_existing_art_entry(
+    track,
+    existing_art: dict[int, dict],
+    existing_by_song_id: dict[int, int],
+) -> tuple[int, dict] | None:
+    """Resolve the currently linked artwork entry for a track, if any."""
+    db_track_id = _get_track_field(track, "db_track_id")
+    if not db_track_id:
+        return None
+
+    resolved_img_id = existing_by_song_id.get(db_track_id)
+    if resolved_img_id is None:
+        mhii_link = _get_track_field(track, "mhii_link")
+        if not mhii_link:
+            mhii_link = _get_track_field(track, "mhiiLink")
+        if not mhii_link:
+            mhii_link = _get_track_field(track, "artwork_id_ref")
+        if mhii_link and mhii_link in existing_art:
+            resolved_img_id = mhii_link
+
+    if resolved_img_id is None:
+        return None
+
+    entry = existing_art.get(resolved_img_id)
+    if not entry:
+        return None
+    return resolved_img_id, entry
+
+
+def _validate_existing_format_ref(
+    fmt_id: int,
+    ref: dict,
+    device_format_defs: Mapping[int, ArtworkFormat],
+) -> dict | None:
+    """Return normalized preserve metadata if an existing ref is safe to reuse."""
+    w = max(1, int(ref.get("width", 0) or 0))
+    h_dim = max(1, int(ref.get("height", 0) or 0))
+    hpad = max(0, int(ref.get("hpad", 0) or 0))
+    vpad = max(0, int(ref.get("vpad", 0) or 0))
+    stored_w = max(1, w + hpad)
+    stored_h = max(1, h_dim + vpad)
+    expected_size = expected_size_bytes(
+        fmt_id,
+        stored_w,
+        stored_h,
+        stride_pixels=stored_w,
+        fmt_override=device_format_defs.get(fmt_id),
+    )
+    if expected_size > 0 and int(ref.get("size", 0) or 0) != expected_size:
+        return None
+
+    return {
+        "width": w,
+        "height": h_dim,
+        "size": int(ref.get("size", 0) or 0),
+        "hpad": hpad,
+        "vpad": vpad,
+        "stride_pixels": stored_w,
+        "path": ref.get("path"),
+        "ithmb_offset": int(ref.get("ithmb_offset", 0) or 0),
+    }
+
+
+def _existing_entry_supports_all_formats(
+    existing_entry: dict | None,
+    required_format_ids: list[int],
+    device_format_defs: Mapping[int, ArtworkFormat],
+) -> dict[int, dict] | None:
+    """Return per-format metadata when all required formats can be preserved."""
+    if existing_entry is None:
+        return None
+
+    refs = existing_entry.get("formats", {})
+    fmt_meta: dict[int, dict] = {}
+    for fmt_id in required_format_ids:
+        ref = refs.get(fmt_id)
+        if ref is None:
+            return None
+        meta = _validate_existing_format_ref(fmt_id, ref, device_format_defs)
+        if meta is None:
+            return None
+        fmt_meta[fmt_id] = meta
+    return fmt_meta
+
+
+def _build_existing_song_index(existing_art: dict[int, dict]) -> dict[int, int]:
+    """Map ArtworkDB song_id -> img_id for authoritative artwork lookup."""
+    existing_by_song_id: dict[int, int] = {}
+    for img_id, entry in existing_art.items():
+        sid = int(entry.get("song_id", 0) or 0)
+        if sid:
+            existing_by_song_id[sid] = img_id
+    return existing_by_song_id
+
+
+def _collect_track_artwork_decisions(
+    tracks: list,
+    pc_file_paths: dict[int, str],
+    existing_art: dict[int, dict],
+    required_format_ids: list[int],
+    device_format_defs: Mapping[int, ArtworkFormat],
+) -> tuple[dict[int, TrackArtworkDecision], ArtworkDecisionSummary]:
+    """Resolve the desired final artwork state for every track."""
+    decisions: dict[int, TrackArtworkDecision] = {}
+    summary = ArtworkDecisionSummary()
+    existing_by_song_id = _build_existing_song_index(existing_art)
+
+    for track in tracks:
+        db_track_id = _get_track_field(track, "db_track_id")
+        if not db_track_id:
+            title = _get_track_field(track, "title") or "?"
+            logger.warning("ART: track '%s' has no db_track_id, skipping", title)
+            continue
+
+        resolved_existing = _resolve_existing_art_entry(track, existing_art, existing_by_song_id)
+        existing_entry = resolved_existing[1] if resolved_existing else None
+        existing_img_id = resolved_existing[0] if resolved_existing else 0
+        preserve_ok = _existing_entry_supports_all_formats(
+            existing_entry,
+            required_format_ids,
+            device_format_defs,
+        ) is not None
+
+        hint = _get_track_artwork_hint(track)
+        pc_path = pc_file_paths.get(db_track_id)
+        if hint == "clear_art":
+            decisions[db_track_id] = TrackArtworkDecision(
+                db_track_id=db_track_id,
+                kind=ArtworkDecisionKind.CLEAR_ART,
+                existing_entry=existing_entry,
+            )
+            summary.cleared += 1
+            continue
+
+        if (
+            hint == "preserve_existing"
+            and pc_path
+            and os.path.exists(pc_path)
+            and preserve_ok
+            and existing_entry is not None
+        ):
+            decisions[db_track_id] = TrackArtworkDecision(
+                db_track_id=db_track_id,
+                kind=ArtworkDecisionKind.PRESERVE_EXISTING,
+                asset_ref=ArtworkAssetRef("preserve", existing_img_id),
+                src_img_size=int(existing_entry.get("src_img_size", 0) or 0),
+                existing_entry=existing_entry,
+            )
+            summary.preserved_unchanged += 1
+            continue
+
+        if not pc_path:
+            if preserve_ok and existing_entry is not None:
+                decisions[db_track_id] = TrackArtworkDecision(
+                    db_track_id=db_track_id,
+                    kind=ArtworkDecisionKind.PRESERVE_FALLBACK,
+                    asset_ref=ArtworkAssetRef("preserve", existing_img_id),
+                    src_img_size=int(existing_entry.get("src_img_size", 0) or 0),
+                    existing_entry=existing_entry,
+                )
+                summary.preserved_fallback += 1
+            else:
+                decisions[db_track_id] = TrackArtworkDecision(
+                    db_track_id=db_track_id,
+                    kind=ArtworkDecisionKind.CLEAR_ART,
+                    existing_entry=existing_entry,
+                )
+                summary.cleared += 1
+            continue
+
+        if not os.path.exists(pc_path):
+            title = _get_track_field(track, "title") or "?"
+            logger.warning("ART: PC file not found for '%s': %s", title, pc_path)
+            if preserve_ok and existing_entry is not None:
+                decisions[db_track_id] = TrackArtworkDecision(
+                    db_track_id=db_track_id,
+                    kind=ArtworkDecisionKind.PRESERVE_FALLBACK,
+                    asset_ref=ArtworkAssetRef("preserve", existing_img_id),
+                    src_img_size=int(existing_entry.get("src_img_size", 0) or 0),
+                    existing_entry=existing_entry,
+                )
+                summary.preserved_fallback += 1
+            else:
+                decisions[db_track_id] = TrackArtworkDecision(
+                    db_track_id=db_track_id,
+                    kind=ArtworkDecisionKind.CLEAR_ART,
+                    existing_entry=existing_entry,
+                )
+                summary.cleared += 1
+            continue
+
+        art_bytes = extract_art_with_folder(pc_path)
+        if art_bytes is None:
+            decisions[db_track_id] = TrackArtworkDecision(
+                db_track_id=db_track_id,
+                kind=ArtworkDecisionKind.CLEAR_ART,
+                existing_entry=existing_entry,
+            )
+            summary.cleared += 1
+            title = _get_track_field(track, "title") or "?"
+            logger.debug("ART: no art found for '%s' (%s)", title, pc_path)
+            continue
+
+        digest = art_hash(art_bytes)
+        decisions[db_track_id] = TrackArtworkDecision(
+            db_track_id=db_track_id,
+            kind=ArtworkDecisionKind.NEW_FROM_PC,
+            asset_ref=ArtworkAssetRef("pc", digest),
+            art_bytes=art_bytes,
+            src_img_size=len(art_bytes),
+            existing_entry=existing_entry,
+        )
+        summary.reencoded += 1
+
+    return decisions, summary
+
+
+def _convert_new_pc_art(
+    decisions: dict[int, TrackArtworkDecision],
+    device_formats: dict[int, tuple[int, int]],
+    device_format_defs: Mapping[int, ArtworkFormat],
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[ArtworkAssetRef, dict]:
+    """Convert only the PC-sourced artwork payloads that need re-encoding."""
+    pc_art_map: dict[ArtworkAssetRef, bytes] = {}
+    for decision in decisions.values():
+        if decision.kind != ArtworkDecisionKind.NEW_FROM_PC:
+            continue
+        if decision.asset_ref is None or decision.art_bytes is None:
+            continue
+        pc_art_map[decision.asset_ref] = decision.art_bytes
+
+    unique_converted: dict[ArtworkAssetRef, dict] = {}
+    if not pc_art_map:
+        return unique_converted
+
+    if progress_callback is not None:
+        progress_callback(
+            f"Artwork — converting {len(pc_art_map)} image{'s' if len(pc_art_map) != 1 else ''}"
+        )
+
+    def _convert_one(asset_ref: ArtworkAssetRef, art_bytes: bytes) -> tuple[ArtworkAssetRef, dict | None]:
+        img = image_from_bytes(art_bytes)
+        if img is None:
+            return asset_ref, None
+        formats: dict = {}
+        for fmt_id in sorted(device_formats.keys()):
+            try:
+                encoded = encode_image_for_format(
+                    img,
+                    fmt_id,
+                    *device_formats[fmt_id],
+                    fmt_override=device_format_defs.get(fmt_id),
+                )
+                formats[fmt_id] = encoded
+            except Exception as exc:
+                logger.debug(
+                    "ART: format %d conversion failed for %s: %s",
+                    fmt_id,
+                    asset_ref,
+                    exc,
+                )
+        return asset_ref, {"formats": formats, "src_img_size": len(art_bytes)} if formats else None
+
+    n_workers = max(1, min(len(pc_art_map), os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futs = {
+            pool.submit(_convert_one, asset_ref, art_bytes): asset_ref
+            for asset_ref, art_bytes in pc_art_map.items()
+        }
+        for fut in as_completed(futs):
+            asset_ref, result = fut.result()
+            if result is not None:
+                unique_converted[asset_ref] = result
+    return unique_converted
+
+
+def _load_preserved_art_payloads(
+    decisions: dict[int, TrackArtworkDecision],
+    required_format_ids: list[int],
+    device_formats: dict[int, tuple[int, int]],
+    device_format_defs: Mapping[int, ArtworkFormat],
+) -> tuple[dict[ArtworkAssetRef, dict], int, int]:
+    """Load or salvage preserved on-device artwork for reuse."""
+    preserve_entries: dict[ArtworkAssetRef, dict] = {}
+    preserve_refs: dict[ArtworkAssetRef, dict] = {}
+    ref_by_file_fmt: dict[tuple[str, int], list[tuple[int, ArtworkAssetRef, int]]] = defaultdict(list)
+
+    for decision in decisions.values():
+        if decision.kind not in (
+            ArtworkDecisionKind.PRESERVE_EXISTING,
+            ArtworkDecisionKind.PRESERVE_FALLBACK,
+        ):
+            continue
+        if decision.asset_ref is None or decision.existing_entry is None:
+            continue
+        if decision.asset_ref in preserve_entries or decision.asset_ref in preserve_refs:
+            continue
+
+        fmt_meta = _existing_entry_supports_all_formats(
+            decision.existing_entry,
+            required_format_ids,
+            device_format_defs,
+        )
+        if fmt_meta is not None:
+            preserve_entries[decision.asset_ref] = {
+                "fmt_meta": fmt_meta,
+                "src_img_size": int(decision.existing_entry.get("src_img_size", 0) or 0),
+            }
+            for fmt_id, meta in fmt_meta.items():
+                ref_by_file_fmt[(meta["path"], fmt_id)].append(
+                    (meta["ithmb_offset"], decision.asset_ref, meta["size"])
+                )
+        else:
+            preserve_refs[decision.asset_ref] = {
+                "refs": decision.existing_entry.get("formats", {}),
+                "src_img_size": int(decision.existing_entry.get("src_img_size", 0) or 0),
+            }
+
+    pixel_cache: dict[tuple[ArtworkAssetRef, int], bytes] = {}
+    for (ithmb_path, fmt_id), items in ref_by_file_fmt.items():
+        items.sort()
+        try:
+            with open(ithmb_path, "rb") as src:
+                for ithmb_offset, asset_ref, size in items:
+                    src.seek(ithmb_offset)
+                    pixel_bytes = src.read(size)
+                    if len(pixel_bytes) == size:
+                        pixel_cache[(asset_ref, fmt_id)] = pixel_bytes
+                    else:
+                        logger.debug("ART: short read for preserved %s fmt %d", asset_ref, fmt_id)
+        except OSError as exc:
+            logger.warning("ART: failed to read preserved ithmb %s: %s", ithmb_path, exc)
+
+    unique_converted: dict[ArtworkAssetRef, dict] = {}
+    dropped_invalid = 0
+    for asset_ref, meta in preserve_entries.items():
+        formats = {}
+        for fmt_id, dims in meta["fmt_meta"].items():
+            pixel_bytes = pixel_cache.get((asset_ref, fmt_id))
+            if pixel_bytes:
+                formats[fmt_id] = {
+                    "data": pixel_bytes,
+                    "width": dims["width"],
+                    "height": dims["height"],
+                    "size": dims["size"],
+                    "hpad": dims.get("hpad", 0),
+                    "vpad": dims.get("vpad", 0),
+                    "stride_pixels": dims.get("stride_pixels", dims["width"]),
+                }
+        if len(formats) == len(required_format_ids):
+            unique_converted[asset_ref] = {
+                "formats": formats,
+                "src_img_size": meta["src_img_size"],
+            }
+        else:
+            dropped_invalid += 1
+
+    salvaged = 0
+    for asset_ref, meta in preserve_refs.items():
+        if asset_ref in unique_converted:
+            continue
+
+        source_img = None
+        for fmt_id, ref in meta["refs"].items():
+            try:
+                with open(ref["path"], "rb") as src:
+                    src.seek(ref["ithmb_offset"])
+                    pixel_bytes = src.read(ref["size"])
+                if len(pixel_bytes) != ref["size"]:
+                    continue
+                source_img = _decode_preserved_frame(
+                    ref,
+                    int(fmt_id),
+                    pixel_bytes,
+                    fmt_override=device_format_defs.get(int(fmt_id)),
+                )
+                if source_img is not None:
+                    break
+            except OSError:
+                continue
+
+        if source_img is None:
+            dropped_invalid += 1
+            continue
+
+        formats = {}
+        for fmt_id in required_format_ids:
+            try:
+                formats[fmt_id] = encode_image_for_format(
+                    source_img,
+                    fmt_id,
+                    *device_formats[fmt_id],
+                    fmt_override=device_format_defs.get(fmt_id),
+                )
+            except Exception as exc:
+                logger.debug("ART: salvage re-encode failed for %s fmt %d: %s", asset_ref, fmt_id, exc)
+        if len(formats) == len(required_format_ids):
+            unique_converted[asset_ref] = {
+                "formats": formats,
+                "src_img_size": meta["src_img_size"],
+            }
+            salvaged += 1
+        else:
+            dropped_invalid += 1
+
+    return unique_converted, salvaged, dropped_invalid
+
+
 def write_artworkdb(
     ipod_path: str,
     tracks: list,
-    pc_file_paths: Optional[dict] = None,
+    pc_file_paths: dict | None = None,
     start_img_id: int = 100,
-    reference_artdb_path: Optional[str] = None,
-    artwork_formats: Optional[dict[int, tuple[int, int]]] = None,
+    reference_artdb_path: str | None = None,
+    artwork_formats: dict[int, tuple[int, int]] | None = None,
     defer_commit: bool = False,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict | PendingArtworkWrite:
     """
     Write ArtworkDB and ithmb files for an iPod.
@@ -585,384 +1124,114 @@ def write_artworkdb(
         if progress_callback is not None:
             progress_callback(msg)
 
-    # Detect device artwork formats if not explicitly provided
+    normalized_pc_paths: dict[int, str] = {}
+    if pc_file_paths:
+        for key, path in pc_file_paths.items():
+            try:
+                db_track_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if db_track_id > 0:
+                normalized_pc_paths[db_track_id] = str(path)
+
     if artwork_formats is None:
         artwork_formats = get_artwork_formats(ipod_path)
     device_formats = artwork_formats
     device_format_defs = get_artwork_format_definitions(ipod_path)
-    logger.info("ART: using formats %s", list(device_formats.keys()))
+    required_format_ids = sorted(device_formats.keys())
+    logger.info("ART: using formats %s", required_format_ids)
 
-    # Read reference ArtworkDB for header fields
     ref_mhfd = None
     if reference_artdb_path and os.path.exists(reference_artdb_path):
-        with open(reference_artdb_path, 'rb') as f:
+        with open(reference_artdb_path, "rb") as f:
             ref_mhfd = f.read()
 
-    # --- Step 0: Read existing artwork BEFORE we overwrite ithmb files ---
     artworkdb_path = os.path.join(artwork_dir, "ArtworkDB")
     existing_art = _read_existing_artwork(artworkdb_path, artwork_dir)
     if existing_art:
-        logger.info(f"ART: read {len(existing_art)} existing image entries from ArtworkDB")
+        logger.info("ART: read %d existing image entries from ArtworkDB", len(existing_art))
 
-    # --- Step 1: Extract and deduplicate album art from PC files ---
-    # Each track gets its own MHII (with song_id = track db_track_id) but
-    # identical images are written to ithmb only once.
     _prog(f"Artwork — scanning {len(tracks)} tracks")
-    art_map = {}      # art_hash → art_bytes
-    track_art = {}    # db_track_id → art_hash (or preserve_key)
+    decisions, decision_summary = _collect_track_artwork_decisions(
+        tracks,
+        normalized_pc_paths,
+        existing_art,
+        required_format_ids,
+        device_format_defs,
+    )
+    logger.info(
+        "ART decisions: preserve=%d fallback=%d reencode=%d clear=%d",
+        decision_summary.preserved_unchanged,
+        decision_summary.preserved_fallback,
+        decision_summary.reencoded,
+        decision_summary.cleared,
+    )
 
-    total_tracks = len(tracks)
-    tracks_with_db_track_id = 0
-    tracks_with_pc_path = 0
-    tracks_pc_path_exists = 0
-    tracks_art_extracted = 0
-    tracks_no_art = 0
-
-    for track in tracks:
-        db_track_id = _get_track_field(track, 'db_track_id')
-        if not db_track_id:
-            title = _get_track_field(track, 'title') or '?'
-            logger.warning(f"ART: track '{title}' has no db_track_id, skipping")
-            continue
-        tracks_with_db_track_id += 1
-
-        # Try to get art from PC source file
-        art_bytes = None
-        if pc_file_paths and db_track_id in pc_file_paths:
-            tracks_with_pc_path += 1
-            pc_path = pc_file_paths[db_track_id]
-            if os.path.exists(pc_path):
-                tracks_pc_path_exists += 1
-                art_bytes = extract_art_with_folder(pc_path)
-                if art_bytes:
-                    tracks_art_extracted += 1
-                else:
-                    tracks_no_art += 1
-                    title = _get_track_field(track, 'title') or '?'
-                    logger.debug(f"ART: no art found for '{title}' ({pc_path})")
-            else:
-                title = _get_track_field(track, 'title') or '?'
-                logger.warning(f"ART: PC file not found for '{title}': {pc_path}")
-
-        if art_bytes is not None:
-            h = art_hash(art_bytes)
-            art_map[h] = art_bytes
-            track_art[db_track_id] = h
-
-    logger.info(f"ART STATS: {total_tracks} total tracks, "
-                f"{tracks_with_db_track_id} with db_track_id, "
-                f"{tracks_with_pc_path} with PC path, "
-                f"{tracks_pc_path_exists} PC files exist, "
-                f"{tracks_art_extracted} have art, "
-                f"{tracks_no_art} have no art")
-
-    # --- Step 1a: Share art across album tracks ---
-    # If any track in an album has embedded art, apply it to all tracks
-    # in the same album that lack art. This matches iTunes behaviour.
-    album_groups: dict[tuple[str, str], list[int]] = {}   # (album, artist) → [db_track_id]
-    album_art_hash: dict[tuple[str, str], str] = {}       # (album, artist) → art_hash
-
-    for track in tracks:
-        db_track_id = _get_track_field(track, 'db_track_id')
-        if not db_track_id:
-            continue
-        album = _get_track_field(track, 'album') or ''
-        if not album:
-            continue  # can't group without album name
-        album_artist = (_get_track_field(track, 'album_artist') or _get_track_field(track, 'artist') or '')
-        key = (album, album_artist)
-        album_groups.setdefault(key, []).append(db_track_id)
-        if db_track_id in track_art and key not in album_art_hash:
-            album_art_hash[key] = track_art[db_track_id]
-
-    tracks_shared = 0
-    for key, db_track_ids in album_groups.items():
-        h = album_art_hash.get(key)
-        if not h:
-            continue
-        for db_track_id in db_track_ids:
-            if db_track_id not in track_art:
-                track_art[db_track_id] = h
-                tracks_shared += 1
-
-    if tracks_shared:
-        logger.info(f"ART: shared album art to {tracks_shared} additional "
-                    f"tracks via album-level dedup")
-
-    # --- Step 1b: Preserve existing art for tracks without PC paths ---
-    preserved_art = {}  # preserve_key → {formats: {fmt_id: bytes}, src_img_size, song_id}
-    tracks_preserved = 0
-
-    if existing_art:
-        # Build reverse index: song_id → img_id for the authoritative lookup.
-        # The MHII song_id is the db_track_id of the track it was written for — this
-        # is always correct even if the track's mhii_link got out of sync
-        # (e.g. after a partial write where ArtworkDB updated but CDB didn't).
-        existing_by_song_id: dict[int, int] = {}
-        for img_id, entry in existing_art.items():
-            sid = entry.get('song_id', 0)
-            if sid:
-                existing_by_song_id[sid] = img_id
-
-        for track in tracks:
-            db_track_id = _get_track_field(track, 'db_track_id')
-            if not db_track_id or db_track_id in track_art:
-                continue  # Already has new art from PC extraction
-
-            # Primary lookup: find MHII whose song_id matches this track's db_track_id
-            resolved_img_id = existing_by_song_id.get(db_track_id)
-
-            if resolved_img_id is None:
-                # Fallback: try the track's mhii_link field directly
-                mhii_link = _get_track_field(track, 'mhii_link')
-                if not mhii_link:
-                    mhii_link = _get_track_field(track, 'mhiiLink')
-                if not mhii_link:
-                    mhii_link = _get_track_field(track, 'artwork_id_ref')
-                if mhii_link and mhii_link in existing_art:
-                    resolved_img_id = mhii_link
-
-            if resolved_img_id is None:
-                continue
-
-            # Preserve this existing art entry
-            preserve_key = f"__preserved_{resolved_img_id}"
-            if preserve_key not in preserved_art:
-                preserved_art[preserve_key] = existing_art[resolved_img_id]
-            track_art[db_track_id] = preserve_key
-            tracks_preserved += 1
-
-    logger.info(f"ART STATS: {len(art_map)} new unique images, "
-                f"{len(preserved_art)} preserved existing images, "
-                f"{len(track_art)} total tracks with art "
-                f"({tracks_art_extracted} new, {tracks_preserved} preserved)")
-
-    if not art_map and not preserved_art:
-        logger.info("No album art found (new or existing)")
-        return {}
-
-    logger.info(f"Found {len(art_map)} new + {len(preserved_art)} preserved = "
-                f"{len(art_map) + len(preserved_art)} unique album art images "
-                f"for {len(track_art)} tracks")
-
-    # --- Step 2a: Convert unique images to iPod formats ---
-    # Build a lookup of converted pixel data keyed by art_hash.
-    # This avoids converting the same source image more than once.
-    unique_converted: dict[str, dict] = {}  # art_hash → {formats, src_img_size}
-
-    def _convert_one(h: str, art_bytes: bytes) -> tuple[str, Optional[dict]]:
-        """Decode once, resize to every target format. Runs in a thread pool."""
-        img = image_from_bytes(art_bytes)
-        if img is None:
-            return h, None
-        fmt_ids = sorted(device_formats.keys())
-        formats: dict = {}
-        for fmt_id in fmt_ids:
-            try:
-                encoded = encode_image_for_format(
-                    img,
-                    fmt_id,
-                    *device_formats[fmt_id],
-                    fmt_override=device_format_defs.get(fmt_id),
-                )
-                formats[fmt_id] = encoded
-            except Exception as exc:
-                logger.debug("ART: format %d conversion failed for hash %s: %s", fmt_id, h, exc)
-        return h, {'formats': formats, 'src_img_size': len(art_bytes)} if formats else None
-
-    # Pillow JPEG decode and NumPy RGB565 conversion both release the GIL,
-    # so a thread pool gives real concurrency for CPU-bound conversion.
-    n_new = len(art_map)
-    if n_new:
-        _prog(f"Artwork — converting {n_new} image{'s' if n_new != 1 else ''}")
-    n_workers = max(1, min(n_new, os.cpu_count() or 4))
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futs = {pool.submit(_convert_one, h, ab): h for h, ab in art_map.items()}
-        for fut in as_completed(futs):
-            h, result = fut.result()
-            if result:
-                unique_converted[h] = result
-
-    # Preserved art (already RGB565 in existing ithmb files).
-    # Collect only the references that are actually needed, group them by
-    # (source_file, format_id), sort by offset, and read sequentially.
-    # This avoids loading ALL existing pixel data upfront and minimises
-    # USB seeks — typically only 1–2 source ithmb files need to be opened.
-    # (ithmb_path, fmt_id) → sorted list of (ithmb_offset, preserve_key, size)
-    _ref_by_file_fmt: dict[tuple[str, int], list] = defaultdict(list)
-    _preserve_meta: dict[str, dict] = {}  # preserve_key → {fmt_id: {dims…}}
-    _preserve_fallback: dict[str, dict] = {}  # preserve_key → {refs, src_img_size}
-
-    for preserve_key, existing_entry in preserved_art.items():
-        fmt_meta: dict = {}
-        for fmt_id, ref in existing_entry['formats'].items():
-            w = max(1, int(ref.get('width', 0) or 0))
-            h_dim = max(1, int(ref.get('height', 0) or 0))
-            hpad = max(0, int(ref.get('hpad', 0) or 0))
-            vpad = max(0, int(ref.get('vpad', 0) or 0))
-            stored_w = max(1, w + hpad)
-            stored_h = max(1, h_dim + vpad)
-            expected_size = expected_size_bytes(
-                fmt_id,
-                stored_w,
-                stored_h,
-                stride_pixels=stored_w,
-                fmt_override=device_format_defs.get(fmt_id),
-            )
-            if expected_size > 0 and ref['size'] != expected_size:
-                logger.debug(
-                    "ART: skipping malformed preserved %s fmt %d (size=%d expected=%d)",
-                    preserve_key,
-                    fmt_id,
-                    ref['size'],
-                    expected_size,
-                )
-                continue
-
-            fmt_meta[fmt_id] = {
-                'width': w,
-                'height': h_dim,
-                'size': ref['size'],
-                'hpad': hpad,
-                'vpad': vpad,
-                'stride_pixels': stored_w,
-            }
-
-            _ref_by_file_fmt[(ref['path'], fmt_id)].append(
-                (ref['ithmb_offset'], preserve_key, ref['size'])
-            )
-        if fmt_meta:
-            _preserve_meta[preserve_key] = {
-                'fmt_meta': fmt_meta,
-                'src_img_size': existing_entry['src_img_size'],
-            }
-        elif preserve_key not in _preserve_fallback:
-            _preserve_fallback[preserve_key] = {
-                'refs': existing_entry['formats'],
-                'src_img_size': existing_entry['src_img_size'],
-            }
-
-    # Read pixel data in sorted offset order per (file, format) pair.
-    _pixel_cache: dict[tuple[str, int], bytes] = {}  # (preserve_key, fmt_id) → bytes
-    for (ithmb_path, fmt_id), items in _ref_by_file_fmt.items():
-        items.sort()  # ascending offset → sequential USB reads
-        try:
-            with open(ithmb_path, 'rb') as src:
-                for ithmb_offset, preserve_key, size in items:
-                    src.seek(ithmb_offset)
-                    pixel_bytes = src.read(size)
-                    if len(pixel_bytes) == size:
-                        _pixel_cache[(preserve_key, fmt_id)] = pixel_bytes
-                    else:
-                        logger.debug("ART: short read for preserved %s fmt %d", preserve_key, fmt_id)
-        except OSError as e:
-            logger.warning("ART: failed to read preserved ithmb %s: %s", ithmb_path, e)
-
-    for preserve_key, meta in _preserve_meta.items():
-        formats = {}
-        for fmt_id, dims in meta['fmt_meta'].items():
-            pixel_bytes = _pixel_cache.get((preserve_key, fmt_id))
-            if pixel_bytes:
-                formats[fmt_id] = {
-                    'data': pixel_bytes,
-                    'width': dims['width'],
-                    'height': dims['height'],
-                    'size': dims['size'],
-                    'hpad': dims.get('hpad', 0),
-                    'vpad': dims.get('vpad', 0),
-                    'stride_pixels': dims.get('stride_pixels', dims['width']),
-                }
-        if formats:
-            unique_converted[preserve_key] = {
-                'formats': formats,
-                'src_img_size': meta['src_img_size'],
-            }
-
-    salvaged_preserved = 0
-    for preserve_key, meta in _preserve_fallback.items():
-        if preserve_key in unique_converted:
-            continue
-
-        source_img = None
-        for _fmt_id, ref in meta['refs'].items():
-            try:
-                with open(ref['path'], 'rb') as src:
-                    src.seek(ref['ithmb_offset'])
-                    pixel_bytes = src.read(ref['size'])
-                if len(pixel_bytes) != ref['size']:
-                    continue
-                source_img = _decode_preserved_frame(
-                    ref,
-                    int(_fmt_id),
-                    pixel_bytes,
-                    fmt_override=device_format_defs.get(int(_fmt_id)),
-                )
-                if source_img is not None:
-                    break
-            except OSError:
-                continue
-
-        if source_img is None:
-            continue
-
-        formats = {}
-        for fmt_id in sorted(device_formats.keys()):
-            formats[fmt_id] = encode_image_for_format(
-                source_img,
-                fmt_id,
-                *device_formats[fmt_id],
-                fmt_override=device_format_defs.get(fmt_id),
-            )
-
-        unique_converted[preserve_key] = {
-            'formats': formats,
-            'src_img_size': meta['src_img_size'],
-        }
-        salvaged_preserved += 1
+    unique_converted = _convert_new_pc_art(
+        decisions,
+        device_formats,
+        device_format_defs,
+        progress_callback=progress_callback,
+    )
+    preserved_converted, salvaged_preserved, dropped_invalid = _load_preserved_art_payloads(
+        decisions,
+        required_format_ids,
+        device_formats,
+        device_format_defs,
+    )
+    unique_converted.update(preserved_converted)
+    decision_summary.salvaged = salvaged_preserved
+    decision_summary.dropped_invalid += dropped_invalid
 
     if salvaged_preserved:
-        logger.info("ART: salvaged %d preserved artwork entries via decode/re-encode fallback", salvaged_preserved)
+        logger.info(
+            "ART: salvaged %d preserved artwork entr%s via decode/re-encode fallback",
+            salvaged_preserved,
+            "ies" if salvaged_preserved != 1 else "y",
+        )
 
-    # --- Step 2b: Create per-track ArtworkEntry objects ---
-    # Each track gets its OWN MHII entry with song_id = track db_track_id.
-    # The iPod firmware (especially Nano) checks song_id to match the
-    # requesting track, so a shared MHII only works for one track.
     entries: list[ArtworkEntry] = []
+    entry_asset_keys: dict[int, ArtworkAssetRef] = {}
     img_id = start_img_id
-    skipped_preserved = 0
 
-    for db_track_id, h in track_art.items():
-        if h not in unique_converted:
-            if isinstance(h, str) and h.startswith("__preserved_"):
-                skipped_preserved += 1
+    for track in tracks:
+        db_track_id = _get_track_field(track, "db_track_id")
+        if not db_track_id:
             continue
-        uc = unique_converted[h]
+        decision = decisions.get(db_track_id)
+        if decision is None or decision.kind == ArtworkDecisionKind.CLEAR_ART:
+            continue
+        if decision.asset_ref is None:
+            continue
+        converted = unique_converted.get(decision.asset_ref)
+        if converted is None:
+            decision_summary.dropped_invalid += 1
+            continue
+
         entry = ArtworkEntry(
             img_id=img_id,
             db_track_id=db_track_id,
-            art_hash=h,
-            src_img_size=uc['src_img_size'],
+            art_hash=str(decision.asset_ref.value) if decision.asset_ref.source == "pc" else None,
+            src_img_size=int(converted["src_img_size"]),
             db_track_ids=[db_track_id],
         )
-        entry.formats = uc['formats']
+        entry.formats = converted["formats"]
         entries.append(entry)
+        entry_asset_keys[entry.img_id] = decision.asset_ref
         img_id += 1
 
-    if not entries:
-        logger.warning("Failed to convert any album art to iPod format")
-        return {}
+    logger.info(
+        "ART result: %d live entries from %d unique payloads (%d dropped invalid)",
+        len(entries),
+        len(set(entry_asset_keys.values())),
+        decision_summary.dropped_invalid,
+    )
 
-    if skipped_preserved:
-        logger.warning(
-            "ART: dropped %d preserved tracks due to incompatible/malformed existing formats",
-            skipped_preserved,
-        )
-
-    logger.info(f"ART: created {len(entries)} per-track MHII entries "
-                f"from {len(unique_converted)} unique images")
-
-    n_unique = len(set(e.art_hash for e in entries))
-    _prog(f"Artwork — writing {n_unique} image{'s' if n_unique != 1 else ''} to device")
+    n_unique = len(set(entry_asset_keys.values()))
+    if n_unique:
+        _prog(f"Artwork — writing {n_unique} image{'s' if n_unique != 1 else ''} to device")
+    else:
+        _prog("Artwork — clearing device artwork")
 
     # --- Step 3: Write ithmb files ---
     format_ids = sorted({fmt_id for entry in entries for fmt_id in entry.formats.keys()})
@@ -998,7 +1267,7 @@ def write_artworkdb(
     ithmb_final_paths: dict[int, str] = {}  # fmt_id → final path
     ithmb_files = {}
     # Track which unique images have been written to avoid ithmb duplication
-    art_hash_written: dict[str, dict[int, int]] = {}  # hash → {fmt: offset}
+    art_payload_written: dict[ArtworkAssetRef, dict[int, int]] = {}
     try:
         for fmt_id in format_ids:
             final = os.path.join(artwork_dir, f"F{fmt_id}_1.ithmb")
@@ -1011,10 +1280,10 @@ def write_artworkdb(
         # the same art_hash reuse the same ithmb offsets.
 
         for entry in entries:
-            h = entry.art_hash
-            if h in art_hash_written:
+            asset_ref = entry_asset_keys[entry.img_id]
+            if asset_ref in art_payload_written:
                 # Already written — reuse offsets
-                format_offsets_map[entry.img_id] = dict(art_hash_written[h])
+                format_offsets_map[entry.img_id] = dict(art_payload_written[asset_ref])
             else:
                 offsets = {}
                 for fmt_id in format_ids:
@@ -1023,7 +1292,7 @@ def write_artworkdb(
                         offsets[fmt_id] = ithmb_offsets[fmt_id]
                         ithmb_files[fmt_id].write(img_data)
                         ithmb_offsets[fmt_id] += len(img_data)
-                art_hash_written[h] = offsets
+                art_payload_written[asset_ref] = offsets
                 format_offsets_map[entry.img_id] = dict(offsets)
 
         # Flush ithmb temp files to OS buffers.  No fsync here — these are
@@ -1097,8 +1366,11 @@ def write_artworkdb(
         _cleanup_stale_ithmb_files(artwork_dir, keep_format_ids)
 
     if defer_commit:
-        logger.info(f"ART: prepared {len(art_hash_written)} unique images, "
-                    f"{len(entries)} MHII entries (per-track) — commit deferred")
+        logger.info(
+            "ART: prepared %d unique images, %d MHII entries (per-track) — commit deferred",
+            len(art_payload_written),
+            len(entries),
+        )
         return PendingArtworkWrite(
             db_track_id_to_art_info=db_track_id_to_art_info,
             _pending_renames=pending_renames,
@@ -1119,8 +1391,11 @@ def write_artworkdb(
                 pass
         raise
 
-    logger.info(f"Wrote ithmb files: {len(art_hash_written)} unique images, "
-                f"{len(entries)} MHII entries (per-track)")
+    logger.info(
+        "Wrote ithmb files: %d unique images, %d MHII entries (per-track)",
+        len(art_payload_written),
+        len(entries),
+    )
     for fmt_id in format_ids:
         size = os.path.getsize(ithmb_final_paths[fmt_id])
         logger.info(f"  F{fmt_id}_1.ithmb: {size} bytes")

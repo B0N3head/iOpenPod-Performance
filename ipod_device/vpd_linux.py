@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import sys
-from typing import Optional
 
 from .diagnostic_log import CAPABILITY_FIELDS, IDENTITY_FIELDS, format_fields
 from .sysinfo import normalize_guid, parse_sysinfo_extended
@@ -174,7 +173,7 @@ def query_ipod_vpd_for_path(
     *,
     usb_pid: int = 0,
     serial_filter: str = "",
-) -> Optional[dict]:
+) -> dict | None:
     """Read SCSI VPD SysInfoExtended from a mounted Linux iPod volume."""
     if sys.platform != "linux":
         return None

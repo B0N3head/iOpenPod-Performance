@@ -31,6 +31,7 @@ Detection pipeline:
     so that subsequent scans never need VPD again.
 """
 
+import ctypes
 import logging
 import os
 import struct
@@ -38,15 +39,13 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
-import ctypes
 if sys.platform == "win32":
     import ctypes.wintypes as wt
 elif TYPE_CHECKING:
     import ctypes.wintypes as wt  # type-checker only
 
-from .info import DeviceInfo
 from .diagnostic_log import (
     CAPABILITY_FIELDS,
     IDENTITY_FIELDS,
@@ -55,6 +54,7 @@ from .diagnostic_log import (
     format_fields,
     format_sources,
 )
+from .info import DeviceInfo
 from .models import USB_PID_TO_MODEL
 
 logger = logging.getLogger(__name__)
@@ -465,7 +465,7 @@ def _linux_find_block_device(mount_path: str) -> str | None:
         )
 
     try:
-        with open("/proc/mounts", "r") as f:
+        with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2:
@@ -766,7 +766,7 @@ def _probe_hardware_linux(mount_path: str) -> dict:
     return result
 
 
-def _identify_via_usb_for_drive(drive_letter: str) -> Optional[dict]:
+def _identify_via_usb_for_drive(drive_letter: str) -> dict | None:
     """
     Identify the iPod connected at a specific drive letter via WMI + USB registry.
 
@@ -962,7 +962,7 @@ _OPEN_EXISTING = 3
 _IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 
 
-def _identify_via_direct_ioctl(drive_letter: str) -> Optional[dict]:
+def _identify_via_direct_ioctl(drive_letter: str) -> dict | None:
     """
     Query the USB storage device directly via IOCTL_STORAGE_QUERY_PROPERTY.
 
@@ -1942,7 +1942,7 @@ def _resolve_model(
     return resolved
 
 
-def _identify_via_sysinfo(ipod_path: str) -> Optional[dict]:
+def _identify_via_sysinfo(ipod_path: str) -> dict | None:
     """Try to identify via SysInfo / SysInfoExtended files."""
 
     result: dict = {}
@@ -2177,7 +2177,7 @@ def _ipod_name_from_stream(f) -> str:
     return ""
 
 
-def _identify_via_hashing_scheme(ipod_path: str) -> Optional[dict]:
+def _identify_via_hashing_scheme(ipod_path: str) -> dict | None:
     """
     Identify generation class from iTunesDB hashing_scheme field.
 
@@ -2220,7 +2220,7 @@ def _identify_via_hashing_scheme(ipod_path: str) -> Optional[dict]:
         return None
 
 
-def _identify_via_serial_lookup(serial: str) -> Optional[dict]:
+def _identify_via_serial_lookup(serial: str) -> dict | None:
     """Look up model from serial number's last 3 characters."""
     from .lookup import lookup_by_serial
 
@@ -2316,7 +2316,7 @@ def _display_name_for_mount_path(mount_path: str) -> str:
 def identify_ipod_at_path(
     ipod_path: str,
     mount_name: str | None = None,
-) -> Optional[DeviceInfo]:
+) -> DeviceInfo | None:
     """Identify one selected iPod root without scanning every mounted volume."""
     if not ipod_path:
         return None
@@ -2373,9 +2373,11 @@ def _identify_ipod_mount(mount_path: str, display_name: str) -> DeviceInfo:
     ipod.usb_pid = resolved.get("usb_pid", 0)
     ipod.hashing_scheme = resolved.get("hashing_scheme", -1)
     ipod.identification_method = resolved.get("identification_method", "filesystem")
+    # `DeviceInfo.raw_identity_evidence` expects lists of evidence dicts;
+    # wrap the hw/fs dicts in single-item lists to satisfy the type.
     ipod.raw_identity_evidence = {
-        "hardware": hw,
-        "filesystem": fs,
+        "hardware": [hw] if hw is not None else [],
+        "filesystem": [fs] if fs is not None else [],
     }
     ipod.identity_conflicts = list(resolved.get("_conflicts", []))
     for field in (
