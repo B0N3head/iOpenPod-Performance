@@ -10,16 +10,29 @@ Shows the diff between PC library and iPod with:
 
 from __future__ import annotations
 
-import time
-
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QFrame, QStackedWidget, QMessageBox,
-    QFileDialog, QDialog, QCheckBox,
-)
-from PyQt6.QtGui import QFont, QColor, QPainter
+import html
+import logging
+import os
 import shutil
+import time
+from typing import TYPE_CHECKING, Any
+
+from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app_core.progress import ETATracker
 from app_core.sync_review_model import (
@@ -36,14 +49,10 @@ from app_core.sync_review_model import (
     sync_item_size_delta,
 )
 
-from .formatters import format_size as _format_size, format_duration_mmss as _format_duration
 from ..glyphs import glyph_pixmap
-from ..styles import Colors, FONT_FAMILY, Metrics, btn_css, make_scroll_area
-
-import html
-import os
-import logging
-from typing import TYPE_CHECKING, Any
+from ..styles import FONT_FAMILY, Colors, Metrics, btn_css, make_scroll_area
+from .formatters import format_duration_mmss as _format_duration
+from .formatters import format_size as _format_size
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +113,7 @@ class _StorageBarWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight((10))
+        self.setFixedHeight(10)
         self._total: int = 1
         self._current_used: int = 0
         self._sync_delta: int = 0  # positive = adding, negative = removing
@@ -226,7 +235,7 @@ class SyncTrackRow(QFrame):
 
         row = QHBoxLayout(self)
         row.setContentsMargins((14), (8), (14), (8))
-        row.setSpacing((10))
+        row.setSpacing(10)
 
         # Checkbox
         self.cb = QCheckBox(self)
@@ -259,7 +268,7 @@ class SyncTrackRow(QFrame):
         # Two-line text block
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing((2))
+        text_col.setSpacing(2)
 
         self.title_label = QLabel(self)
         self.title_label.setFont(QFont(FONT_FAMILY, Metrics.FONT_LG))
@@ -483,11 +492,11 @@ class _InfoRow(QFrame):
         """)
         row = QHBoxLayout(self)
         row.setContentsMargins((40), (4), (14), (4))
-        row.setSpacing((10))
+        row.setSpacing(10)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing((1))
+        text_col.setSpacing(1)
 
         t = QLabel(title, self)
         t.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
@@ -557,7 +566,7 @@ class SyncCategoryCard(QFrame):
         self._header_frame.setStyleSheet("background: transparent; border: none;")
         hdr = QHBoxLayout(self._header_frame)
         hdr.setContentsMargins((14), (10), (14), (10))
-        hdr.setSpacing((10))
+        hdr.setSpacing(10)
 
         # Select-all checkbox (only for checkable cards)
         self._select_all_cb = QCheckBox(self._header_frame)
@@ -617,8 +626,8 @@ class SyncCategoryCard(QFrame):
         count_lbl = QLabel(str(count), self._header_frame)
         count_lbl.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.Bold))
         count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        count_lbl.setFixedHeight((20))
-        count_lbl.setMinimumWidth((28))
+        count_lbl.setFixedHeight(20)
+        count_lbl.setMinimumWidth(28)
         count_lbl.setStyleSheet(f"""
             background: {accent};
             color: {Colors.BG_DARK};
@@ -893,26 +902,6 @@ class SyncReviewWidget(QWidget):
         self._backup_hint.setVisible(False)
         loading_layout.addWidget(self._backup_hint)
 
-        loading_layout.addSpacing(24)
-
-        # Centered cancel button \u2014 shown only on the loading/progress page.
-        # The footer cancel is hidden while this page is active.
-        self._loading_cancel_btn = QPushButton("Cancel", loading_widget)
-        self._loading_cancel_btn.setFixedWidth(120)
-        self._loading_cancel_btn.setStyleSheet(btn_css(
-            bg=Colors.SURFACE_RAISED,
-            bg_hover=Colors.SURFACE_ACTIVE,
-            bg_press=Colors.SURFACE_ALT,
-            border=f"1px solid {Colors.BORDER}",
-            radius=Metrics.BORDER_RADIUS_SM,
-            padding="7px 20px",
-        ))
-        self._loading_cancel_btn.clicked.connect(self._on_cancel_clicked)
-        self._loading_cancel_btn.setVisible(False)
-        loading_layout.addWidget(
-            self._loading_cancel_btn, alignment=Qt.AlignmentFlag.AlignCenter
-        )
-
         loading_layout.addStretch(4)
 
         self.stack.addWidget(loading_widget)  # Index 0
@@ -933,7 +922,7 @@ class SyncReviewWidget(QWidget):
         """)
         stats_lay = QHBoxLayout(self._stats_bar)
         stats_lay.setContentsMargins((16), (8), (16), (8))
-        stats_lay.setSpacing((16))
+        stats_lay.setSpacing(16)
         self._stats_layout = stats_lay
         self._stats_pills: list[QLabel] = []
         stats_lay.addStretch()
@@ -949,7 +938,7 @@ class SyncReviewWidget(QWidget):
         """)
         storage_outer = QHBoxLayout(self._storage_frame)
         storage_outer.setContentsMargins((16), (8), (16), (8))
-        storage_outer.setSpacing((12))
+        storage_outer.setSpacing(12)
 
         # iPod image
         self._storage_ipod_img = QLabel(self._storage_frame)
@@ -959,11 +948,11 @@ class SyncReviewWidget(QWidget):
 
         # Right side: name + bar + detail text stacked vertically
         storage_right = QVBoxLayout()
-        storage_right.setSpacing((3))
+        storage_right.setSpacing(3)
 
         # Top row: iPod name on left, detail text on right
         storage_top = QHBoxLayout()
-        storage_top.setSpacing((8))
+        storage_top.setSpacing(8)
         self._storage_name = QLabel("iPod", self._storage_frame)
         self._storage_name.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
         self._storage_name.setStyleSheet(f"color:{Colors.TEXT_PRIMARY}; background:transparent;")
@@ -981,7 +970,7 @@ class SyncReviewWidget(QWidget):
 
         # Legend row beneath bar
         legend_row = QHBoxLayout()
-        legend_row.setSpacing((12))
+        legend_row.setSpacing(12)
         self._legend_labels: list[QLabel] = []
         for color_hex, text in [
             (Colors.ACCENT, "Current"),
@@ -1014,7 +1003,7 @@ class SyncReviewWidget(QWidget):
         self._cards_container.setStyleSheet("background: transparent;")
         self._cards_layout = QVBoxLayout(self._cards_container)
         self._cards_layout.setContentsMargins((16), (12), (16), (12))
-        self._cards_layout.setSpacing((10))
+        self._cards_layout.setSpacing(10)
         self._cards_layout.addStretch()  # push cards to top
 
         self._scroll.setWidget(self._cards_container)
@@ -1029,7 +1018,7 @@ class SyncReviewWidget(QWidget):
         empty_widget = QWidget(self.stack)
         empty_layout = QVBoxLayout(empty_widget)
         empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        empty_layout.setSpacing((8))
+        empty_layout.setSpacing(8)
 
         empty_icon = QLabel("✓", empty_widget)
         empty_icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_XL))
@@ -1054,7 +1043,7 @@ class SyncReviewWidget(QWidget):
         results_widget = QWidget(self.stack)
         results_layout = QVBoxLayout(results_widget)
         results_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        results_layout.setSpacing((12))
+        results_layout.setSpacing(12)
 
         self.result_icon = QLabel("", results_widget)
         self.result_icon.setFont(QFont(FONT_FAMILY, Metrics.FONT_ICON_XL))
@@ -1070,7 +1059,7 @@ class SyncReviewWidget(QWidget):
         self.result_details.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: {Metrics.FONT_XXL}px;")
         self.result_details.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.result_details.setWordWrap(True)
-        self.result_details.setMaximumWidth((500))
+        self.result_details.setMaximumWidth(500)
         results_layout.addWidget(self.result_details, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.stack.addWidget(results_widget)  # Index 3
@@ -1083,10 +1072,10 @@ class SyncReviewWidget(QWidget):
 
         # Inner container — all content lives here, centered as one block
         presync_inner = QWidget(presync_widget)
-        presync_inner.setFixedWidth((460))
+        presync_inner.setFixedWidth(460)
         presync_layout = QVBoxLayout(presync_inner)
         presync_layout.setContentsMargins(0, 0, 0, 0)
-        presync_layout.setSpacing((16))
+        presync_layout.setSpacing(16)
 
         self._presync_icon = QLabel("", presync_inner)
         _px = glyph_pixmap("download", Metrics.FONT_ICON_XL, Colors.ACCENT)
@@ -1111,10 +1100,10 @@ class SyncReviewWidget(QWidget):
         self._presync_text.setWordWrap(True)
         presync_layout.addWidget(self._presync_text)
 
-        presync_layout.addSpacing((8))
+        presync_layout.addSpacing(8)
 
         presync_btn_row = QHBoxLayout()
-        presync_btn_row.setSpacing((12))
+        presync_btn_row.setSpacing(12)
         presync_btn_row.addStretch()
 
         # "Skip Backup & Sync Now" / "Sync Without Backup" — secondary action
@@ -1219,7 +1208,7 @@ class SyncReviewWidget(QWidget):
         self.selection_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
         footer_layout.addWidget(self.selection_label)
 
-        footer_layout.addSpacing((20))
+        footer_layout.addSpacing(20)
 
         # Cancel and Apply buttons
         self.cancel_btn = QPushButton("Cancel", footer)
@@ -1256,7 +1245,6 @@ class SyncReviewWidget(QWidget):
         footer_layout.addWidget(self.cancel_btn)
         footer_layout.addWidget(self.apply_btn)
 
-        self._footer = footer
         layout.addWidget(footer)
 
     # Map internal stage names → user-friendly labels
@@ -1299,12 +1287,6 @@ class SyncReviewWidget(QWidget):
 
         States: 'loading', 'plan', 'empty', 'executing', 'results', 'presync'
         """
-        # During loading/executing the page-embedded cancel is shown centered;
-        # the footer is hidden entirely so it doesn't compete with the layout.
-        loading_active = state in ("loading", "executing", "presync")
-        self._footer.setVisible(not loading_active)
-        self._loading_cancel_btn.setVisible(loading_active)
-
         show_plan_btns = (state == "plan")
         self.select_all_btn.setVisible(show_plan_btns)
         self.select_none_btn.setVisible(show_plan_btns)
@@ -1316,8 +1298,6 @@ class SyncReviewWidget(QWidget):
         if state == "loading":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
-            self._loading_cancel_btn.setText("Cancel")
-            self._loading_cancel_btn.setEnabled(True)
         elif state == "plan":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
@@ -1327,19 +1307,15 @@ class SyncReviewWidget(QWidget):
         elif state == "executing":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
-            self._loading_cancel_btn.setText("Cancel")
-            self._loading_cancel_btn.setEnabled(True)
         elif state == "presync":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
-            self._loading_cancel_btn.setText("Cancel")
-            self._loading_cancel_btn.setEnabled(True)
         elif state == "results":
             self.cancel_btn.setText("Done")
             self.cancel_btn.setEnabled(True)
 
     def _format_elapsed(self) -> str:
-        """Return a human-readable elapsed-time string, or '' if under 2 seconds."""
+        """Return human-readable elapsed time string, or '' if under 2 seconds."""
         secs = int(time.monotonic() - self._loading_start_time)
         if secs < 2:
             return ""
@@ -1400,8 +1376,7 @@ class SyncReviewWidget(QWidget):
             self.eta_label.setText(" · ".join(parts))
         else:
             self.progress_bar.setRange(0, 0)  # Indeterminate
-            elapsed_text = self._format_elapsed()
-            self.eta_label.setText(elapsed_text)
+            self.eta_label.setText(self._format_elapsed())
 
     def show_plan(self, plan: Any):
         """Display the sync plan as styled category cards."""
@@ -1536,7 +1511,7 @@ class SyncReviewWidget(QWidget):
             for t in ir.missing_files:
                 card.add_info_row(t.get("Title", "Unknown"),
                                   f"{t.get('Artist', 'Unknown')} · File missing from iPod")
-            for fp, db_track_id in ir.stale_mappings:
+            for _fp, db_track_id in ir.stale_mappings:
                 card.add_info_row(f"Stale mapping (db_track_id={db_track_id})", "Removed from mapping")
             for orphan in ir.orphan_files[:20]:
                 card.add_info_row(orphan.name, "Orphan file deleted")
@@ -2050,7 +2025,7 @@ class SyncReviewWidget(QWidget):
         is_backup = (stage == "backup")
         is_scrobble_timeout = (
             stage == "scrobble"
-            and "still trying to connect" in message.lower()
+            and "keep trying" in message.lower()
         )
         self._scrobble_timeout_retrying = is_scrobble_timeout
         self._backup_hint.setVisible(is_backup and self._is_auto_presync)
@@ -2058,7 +2033,7 @@ class SyncReviewWidget(QWidget):
             self.cancel_btn.setText("Skip Backup && Sync")
             self.cancel_btn.setEnabled(True)
         elif is_scrobble_timeout:
-            self.cancel_btn.setText("Give Up Scrobble")
+            self.cancel_btn.setText("Stop Retrying")
             self.cancel_btn.setEnabled(True)
         else:
             self.cancel_btn.setText("Cancel")
@@ -2198,14 +2173,21 @@ class SyncReviewWidget(QWidget):
         if not lines:
             lines.append("No changes were made.")
 
+        def _format_scrobble_message(message: str) -> str:
+            text = message.strip()
+            if text.startswith("listenbrainz:"):
+                text = "ListenBrainz:" + text[len("listenbrainz:"):]
+            return text
+
         # Partial save banner — explain what happened and reassure the user
         if partial_save:
             lines.append("")
             # Separate storage-full and cancelled into different messages
             storage_errors = [m for d, m in errors if d == "storage"]
             cancel_errors = [m for d, m in errors if d == "cancelled"]
+            scrobble_errors = [m for d, m in errors if d == "scrobble"]
             other_errors = [(d, m) for d, m in errors
-                            if d not in ("storage", "cancelled")]
+                            if d not in ("storage", "cancelled", "scrobble")]
             if storage_errors:
                 lines.append(
                     f"<span style='color: {Colors.WARNING};'>"
@@ -2248,13 +2230,47 @@ class SyncReviewWidget(QWidget):
                         f"<span style='color: {Colors.DANGER};'>"
                         f"  …and {len(other_errors) - 8} more</span>"
                     )
+            if scrobble_errors:
+                lines.append("")
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'>"
+                    f"<b>ListenBrainz needs attention.</b></span>"
+                )
+                for msg in scrobble_errors[:3]:
+                    lines.append(
+                        f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                        f"{_format_scrobble_message(msg)}</span>"
+                    )
+                if len(scrobble_errors) > 3:
+                    lines.append(
+                        f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                        f"…and {len(scrobble_errors) - 3} more ListenBrainz issue"
+                        f"{'s' if len(scrobble_errors) - 3 != 1 else ''}.</span>"
+                    )
         elif errors:
+            scrobble_errors = [m for d, m in errors if d == "scrobble"]
+            other_errors = [(d, m) for d, m in errors if d != "scrobble"]
             lines.append("")
             lines.append(f"<span style='color: {Colors.DANGER};'><b>{len(errors)} error{'s' if len(errors) != 1 else ''}:</b></span>")
-            for desc, msg in errors[:10]:  # Show max 10
+            if scrobble_errors:
+                lines.append(
+                    f"<span style='color: {Colors.WARNING};'><b>ListenBrainz</b></span>"
+                )
+                for msg in scrobble_errors[:3]:
+                    lines.append(
+                        f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                        f"{_format_scrobble_message(msg)}</span>"
+                    )
+                if len(scrobble_errors) > 3:
+                    lines.append(
+                        f"<span style='color: {Colors.TEXT_SECONDARY};'>"
+                        f"…and {len(scrobble_errors) - 3} more ListenBrainz issue"
+                        f"{'s' if len(scrobble_errors) - 3 != 1 else ''}.</span>"
+                    )
+            for desc, msg in other_errors[:10]:  # Show max 10
                 lines.append(f"<span style='color: {Colors.DANGER};'>  {desc}: {msg}</span>")
-            if len(errors) > 10:
-                lines.append(f"<span style='color: {Colors.DANGER};'>  ...and {len(errors) - 10} more</span>")
+            if len(other_errors) > 10:
+                lines.append(f"<span style='color: {Colors.DANGER};'>  ...and {len(other_errors) - 10} more</span>")
 
         # Safe-eject reminder
         if (success or partial_save) and (added or removed or updated_file or updated_meta):
@@ -2420,22 +2436,16 @@ class SyncReviewWidget(QWidget):
                 # Skip the in-progress backup and proceed to sync
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Skipping backup…")
-                self._loading_cancel_btn.setEnabled(False)
-                self._loading_cancel_btn.setText("Skipping backup…")
                 self.skip_backup_signal.emit()
             elif self._current_exec_stage == "scrobble" and self._scrobble_timeout_retrying:
                 self.cancel_btn.setEnabled(False)
-                self.cancel_btn.setText("Giving up…")
-                self._loading_cancel_btn.setEnabled(False)
-                self._loading_cancel_btn.setText("Giving up…")
+                self.cancel_btn.setText("Stopping retries…")
                 self.give_up_scrobble_signal.emit()
             else:
                 # Full cancel
                 self._cancelled = True
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Cancelling...")
-                self._loading_cancel_btn.setEnabled(False)
-                self._loading_cancel_btn.setText("Cancelling...")
                 self.cancelled.emit()
         else:
             # Plan view, empty view, or results view — just go back
@@ -2640,7 +2650,7 @@ class SyncReviewWidget(QWidget):
         # Styled confirmation dialog (matches dark theme)
         confirm = QDialog(self)
         confirm.setWindowTitle("Confirm Sync")
-        confirm.setMinimumWidth((420))
+        confirm.setMinimumWidth(420)
         confirm.setStyleSheet(f"""
             QDialog {{
                 background: {Colors.BG_DARK};
@@ -2653,7 +2663,7 @@ class SyncReviewWidget(QWidget):
         """)
         cl = QVBoxLayout(confirm)
         cl.setContentsMargins((20), (16), (20), (16))
-        cl.setSpacing((12))
+        cl.setSpacing(12)
 
         confirm_title = QLabel("Confirm Sync", confirm)
         confirm_title.setFont(QFont(FONT_FAMILY, Metrics.FONT_TITLE, QFont.Weight.Bold))
@@ -2665,7 +2675,7 @@ class SyncReviewWidget(QWidget):
         confirm_body.setStyleSheet(f"color:{Colors.TEXT_SECONDARY}; background:transparent;")
         cl.addWidget(confirm_body)
 
-        cl.addSpacing((8))
+        cl.addSpacing(8)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel", confirm)
@@ -2723,14 +2733,13 @@ class SyncReviewWidget(QWidget):
 class PCFolderDialog(QDialog):
     """Dialog to select PC media folder for syncing."""
 
-    def __init__(self, parent=None, last_folder: str = "", ipod_hdd: bool = False):
+    def __init__(self, parent=None, last_folder: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Select Media Folder")
-        self.setMinimumWidth((440))
+        self.setMinimumWidth(440)
         self.selected_folder = ""
         self.sync_mode = ""  # "full" | "selective" | "back_sync"
         self.last_folder = last_folder
-        self.is_ipod_hdd = bool(ipod_hdd)
 
         # Dark theme stylesheet
         self.setStyleSheet(f"""
@@ -2758,7 +2767,7 @@ class PCFolderDialog(QDialog):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing((12))
+        layout.setSpacing(12)
         layout.setContentsMargins((20), (16), (20), (16))
 
         # Title
@@ -2814,7 +2823,7 @@ class PCFolderDialog(QDialog):
 
         layout.addLayout(folder_layout)
 
-        layout.addSpacing((8))
+        layout.addSpacing(8)
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -2824,23 +2833,14 @@ class PCFolderDialog(QDialog):
         btn_row.addWidget(cancel_btn)
 
         selective_btn = QPushButton("Selective Sync", self)
-        selective_btn.setToolTip(
-            "Browse the chosen media folder and pick specific tracks/photos to sync."
-        )
         selective_btn.clicked.connect(self._accept_selective)
         btn_row.addWidget(selective_btn)
 
         back_sync_btn = QPushButton("Back Sync", self)
-        back_sync_btn.setToolTip(
-            "Copy iPod-only tracks back to your chosen media folder"
-        )
         back_sync_btn.clicked.connect(self._accept_back_sync)
         btn_row.addWidget(back_sync_btn)
 
         full_btn = QPushButton("Full Sync", self)
-        full_btn.setToolTip(
-            "Compare the entire chosen media folder with your iPod, then sync all changes"
-        )
         full_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {Colors.ACCENT};
