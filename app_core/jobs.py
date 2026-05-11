@@ -388,6 +388,7 @@ class BackupCreateRequest:
     backup_dir: str
     max_backups: int
     device_meta: dict[str, str]
+    ipod_hdd: bool = False
 
 
 class BackupCreateWorker(QThread):
@@ -411,6 +412,7 @@ class BackupCreateWorker(QThread):
                 backup_dir=request.backup_dir,
                 device_name=request.device_name,
                 device_meta=request.device_meta,
+                max_workers=(1 if request.ipod_hdd else 0),
             )
 
             def on_progress(prog) -> None:
@@ -448,6 +450,7 @@ class BackupRestoreRequest:
     ipod_path: str
     device_id: str
     backup_dir: str
+    ipod_hdd: bool = False
 
 
 class BackupRestoreWorker(QThread):
@@ -469,6 +472,7 @@ class BackupRestoreWorker(QThread):
             manager = BackupManager(
                 device_id=request.device_id,
                 backup_dir=request.backup_dir,
+                max_workers=(1 if request.ipod_hdd else 0),
             )
 
             def on_progress(prog) -> None:
@@ -509,6 +513,7 @@ class SyncDiffRequest:
     fpcalc_path: str = ""
     photo_sync_settings: dict[str, bool] | None = None
     transcode_options: Any = None
+    ipod_hdd: bool = False
 
 
 class SyncDiffWorker(QThread):
@@ -539,6 +544,8 @@ class SyncDiffWorker(QThread):
                 transcode_options=request.transcode_options,
             )
 
+            # HDD: 1 bootstrap worker (avoid seek contention). SSD/flash: up to 3.
+            bootstrap_workers = 1 if request.ipod_hdd else min(3, os.cpu_count() or 2)
             plan = diff_engine.compute_diff(
                 request.ipod_tracks,
                 progress_callback=lambda stage, cur, tot, msg: self.progress.emit(
@@ -553,6 +560,7 @@ class SyncDiffWorker(QThread):
                 sync_workers=request.sync_workers,
                 rating_strategy=request.rating_strategy,
                 allowed_paths=request.allowed_paths,
+                bootstrap_workers=bootstrap_workers,
             )
 
             if not self.isInterruptionRequested():
@@ -571,6 +579,7 @@ class BackSyncRequest:
     pc_folder: str
     ipod_tracks: list
     ipod_path: str
+    ipod_hdd: bool = False
 
 
 class BackSyncWorker(QThread):
@@ -718,7 +727,7 @@ class BackSyncWorker(QThread):
                     return track, ipod_file, fp, title
 
                 # Cap USB workers at 3 — USB 2.0 saturates quickly with concurrent reads.
-                ipod_workers = min(3, total_ipod or 1)
+                ipod_workers = 1 if request.ipod_hdd else min(3, total_ipod or 1)
                 with ThreadPoolExecutor(max_workers=ipod_workers) as pool:
                     futures = {
                         pool.submit(_fp_ipod, pair): pair for pair in ipod_candidates
@@ -1594,6 +1603,7 @@ class SyncExecuteWorker(QThread):
         user_playlists: list | None = None,
         device_info: DeviceIdentitySnapshot | None = None,
         on_sync_complete: Callable[[], None] | None = None,
+        ipod_hdd: bool = False,
     ):
         super().__init__()
         self.ipod_path = ipod_path
@@ -1604,6 +1614,7 @@ class SyncExecuteWorker(QThread):
         self.settings = settings
         self.device_info = device_info
         self.on_sync_complete = on_sync_complete
+        self.ipod_hdd = ipod_hdd
         self._give_up_scrobble_requested = False
         self._partial_save_event: threading.Event | None = None
         self._partial_save_decision: list[bool] = [True]
@@ -1658,6 +1669,7 @@ class SyncExecuteWorker(QThread):
                 fpcalc_path=settings.fpcalc_path,
                 transcode_options=build_transcode_options(settings),
                 device_info=self.device_info,
+                ipod_hdd=self.ipod_hdd,
                 photo_sync_settings={
                     "rotate_tall_photos_for_device": (
                         settings.rotate_tall_photos_for_device
@@ -1724,6 +1736,7 @@ class SyncExecuteWorker(QThread):
                 backup_dir=settings.backup_dir,
                 device_name=device_name,
                 device_meta=device_meta,
+                max_workers=(1 if self.ipod_hdd else 0),
             )
 
             def on_backup_progress(prog) -> None:

@@ -10,6 +10,8 @@ Shows the diff between PC library and iPod with:
 
 from __future__ import annotations
 
+import time
+
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -767,6 +769,7 @@ class SyncReviewWidget(QWidget):
         self._cancelled = False
         self._ipod_tracks_cache: list = []
         self._eta_tracker = ETATracker()
+        self._loading_start_time: float = 0.0
         self._skip_presync_backup: bool = False
         self._pending_sync_items: list = []
         self._is_auto_presync: bool = False
@@ -889,6 +892,26 @@ class SyncReviewWidget(QWidget):
         self._backup_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._backup_hint.setVisible(False)
         loading_layout.addWidget(self._backup_hint)
+
+        loading_layout.addSpacing(24)
+
+        # Centered cancel button \u2014 shown only on the loading/progress page.
+        # The footer cancel is hidden while this page is active.
+        self._loading_cancel_btn = QPushButton("Cancel", loading_widget)
+        self._loading_cancel_btn.setFixedWidth(120)
+        self._loading_cancel_btn.setStyleSheet(btn_css(
+            bg=Colors.SURFACE_RAISED,
+            bg_hover=Colors.SURFACE_ACTIVE,
+            bg_press=Colors.SURFACE_ALT,
+            border=f"1px solid {Colors.BORDER}",
+            radius=Metrics.BORDER_RADIUS_SM,
+            padding="7px 20px",
+        ))
+        self._loading_cancel_btn.clicked.connect(self._on_cancel_clicked)
+        self._loading_cancel_btn.setVisible(False)
+        loading_layout.addWidget(
+            self._loading_cancel_btn, alignment=Qt.AlignmentFlag.AlignCenter
+        )
 
         loading_layout.addStretch(4)
 
@@ -1233,6 +1256,7 @@ class SyncReviewWidget(QWidget):
         footer_layout.addWidget(self.cancel_btn)
         footer_layout.addWidget(self.apply_btn)
 
+        self._footer = footer
         layout.addWidget(footer)
 
     # Map internal stage names → user-friendly labels
@@ -1275,6 +1299,12 @@ class SyncReviewWidget(QWidget):
 
         States: 'loading', 'plan', 'empty', 'executing', 'results', 'presync'
         """
+        # During loading/executing the page-embedded cancel is shown centered;
+        # the footer is hidden entirely so it doesn't compete with the layout.
+        loading_active = state in ("loading", "executing", "presync")
+        self._footer.setVisible(not loading_active)
+        self._loading_cancel_btn.setVisible(loading_active)
+
         show_plan_btns = (state == "plan")
         self.select_all_btn.setVisible(show_plan_btns)
         self.select_none_btn.setVisible(show_plan_btns)
@@ -1286,6 +1316,8 @@ class SyncReviewWidget(QWidget):
         if state == "loading":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
+            self._loading_cancel_btn.setText("Cancel")
+            self._loading_cancel_btn.setEnabled(True)
         elif state == "plan":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
@@ -1295,15 +1327,30 @@ class SyncReviewWidget(QWidget):
         elif state == "executing":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
+            self._loading_cancel_btn.setText("Cancel")
+            self._loading_cancel_btn.setEnabled(True)
         elif state == "presync":
             self.cancel_btn.setText("Cancel")
             self.cancel_btn.setEnabled(True)
+            self._loading_cancel_btn.setText("Cancel")
+            self._loading_cancel_btn.setEnabled(True)
         elif state == "results":
             self.cancel_btn.setText("Done")
             self.cancel_btn.setEnabled(True)
 
+    def _format_elapsed(self) -> str:
+        """Return a human-readable elapsed-time string, or '' if under 2 seconds."""
+        secs = int(time.monotonic() - self._loading_start_time)
+        if secs < 2:
+            return ""
+        if secs < 60:
+            return f"{secs}s elapsed"
+        m, s = divmod(secs, 60)
+        return f"{m}m {s:02d}s elapsed" if s else f"{m}m elapsed"
+
     def show_loading(self):
         """Show loading state."""
+        self._loading_start_time = time.monotonic()
         self.stack.setCurrentIndex(0)
         self.loading_label.setText("Scanning library...")
         self.progress_bar.setRange(0, 0)  # Indeterminate
@@ -1316,6 +1363,7 @@ class SyncReviewWidget(QWidget):
 
     def show_back_sync_loading(self):
         """Show the Back Sync progress state."""
+        self._loading_start_time = time.monotonic()
         self._cancelled = False
         self.stack.setCurrentIndex(0)
         self.loading_label.setText("Preparing Back Sync")
@@ -1346,10 +1394,14 @@ class SyncReviewWidget(QWidget):
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(current)
             self._eta_tracker.update(stage, current, total)
-            self.eta_label.setText(self._eta_tracker.format_stage_progress(stage, current, total))
+            eta_text = self._eta_tracker.format_stage_progress(stage, current, total)
+            elapsed_text = self._format_elapsed()
+            parts = [p for p in (elapsed_text, eta_text) if p]
+            self.eta_label.setText(" · ".join(parts))
         else:
             self.progress_bar.setRange(0, 0)  # Indeterminate
-            self.eta_label.setText("")
+            elapsed_text = self._format_elapsed()
+            self.eta_label.setText(elapsed_text)
 
     def show_plan(self, plan: Any):
         """Display the sync plan as styled category cards."""
@@ -1910,6 +1962,7 @@ class SyncReviewWidget(QWidget):
 
     def show_executing(self):
         """Show executing state - similar to loading but for sync execution."""
+        self._loading_start_time = time.monotonic()
         self._cancelled = False
         self._scrobble_timeout_retrying = False
         self._completed_stages = []
@@ -2052,22 +2105,24 @@ class SyncReviewWidget(QWidget):
                     elapsed = stats.elapsed
                     remaining = elapsed / size_progress * (1.0 - size_progress)
                     eta = ETATracker._format_duration(remaining)
-            parts = [f"{current} of {total}"]
+            parts = [self._format_elapsed(), f"{current} of {total}"]
             if eta:
                 parts.append(eta)
-            self.eta_label.setText(" \u00b7 ".join(parts))
+            self.eta_label.setText(" \u00b7 ".join(p for p in parts if p))
         elif total > 0:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(current)
             if is_substep:
-                # Sub-step stages: bar moves but don't show "3 of 8"
-                self.eta_label.setText("")
+                self.eta_label.setText(self._format_elapsed())
             else:
                 self._eta_tracker.update(stage, current, total)
-                self.eta_label.setText(self._eta_tracker.format_stage_progress(stage, current, total))
+                eta_text = self._eta_tracker.format_stage_progress(stage, current, total)
+                elapsed_text = self._format_elapsed()
+                parts = [p for p in (elapsed_text, eta_text) if p]
+                self.eta_label.setText(" \u00b7 ".join(parts))
         else:
             self.progress_bar.setRange(0, 0)  # Indeterminate
-            self.eta_label.setText("")
+            self.eta_label.setText(self._format_elapsed())
 
     def show_result(self, result):
         """Show sync completion results in a styled view."""
@@ -2365,16 +2420,22 @@ class SyncReviewWidget(QWidget):
                 # Skip the in-progress backup and proceed to sync
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Skipping backup…")
+                self._loading_cancel_btn.setEnabled(False)
+                self._loading_cancel_btn.setText("Skipping backup…")
                 self.skip_backup_signal.emit()
             elif self._current_exec_stage == "scrobble" and self._scrobble_timeout_retrying:
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Giving up…")
+                self._loading_cancel_btn.setEnabled(False)
+                self._loading_cancel_btn.setText("Giving up…")
                 self.give_up_scrobble_signal.emit()
             else:
                 # Full cancel
                 self._cancelled = True
                 self.cancel_btn.setEnabled(False)
                 self.cancel_btn.setText("Cancelling...")
+                self._loading_cancel_btn.setEnabled(False)
+                self._loading_cancel_btn.setText("Cancelling...")
                 self.cancelled.emit()
         else:
             # Plan view, empty view, or results view — just go back
@@ -2662,13 +2723,14 @@ class SyncReviewWidget(QWidget):
 class PCFolderDialog(QDialog):
     """Dialog to select PC media folder for syncing."""
 
-    def __init__(self, parent=None, last_folder: str = ""):
+    def __init__(self, parent=None, last_folder: str = "", ipod_hdd: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Select Media Folder")
         self.setMinimumWidth((440))
         self.selected_folder = ""
         self.sync_mode = ""  # "full" | "selective" | "back_sync"
         self.last_folder = last_folder
+        self.is_ipod_hdd = bool(ipod_hdd)
 
         # Dark theme stylesheet
         self.setStyleSheet(f"""
@@ -2762,14 +2824,23 @@ class PCFolderDialog(QDialog):
         btn_row.addWidget(cancel_btn)
 
         selective_btn = QPushButton("Selective Sync", self)
+        selective_btn.setToolTip(
+            "Browse the chosen media folder and pick specific tracks/photos to sync."
+        )
         selective_btn.clicked.connect(self._accept_selective)
         btn_row.addWidget(selective_btn)
 
         back_sync_btn = QPushButton("Back Sync", self)
+        back_sync_btn.setToolTip(
+            "Copy iPod-only tracks back to your chosen media folder"
+        )
         back_sync_btn.clicked.connect(self._accept_back_sync)
         btn_row.addWidget(back_sync_btn)
 
         full_btn = QPushButton("Full Sync", self)
+        full_btn.setToolTip(
+            "Compare the entire chosen media folder with your iPod, then sync all changes"
+        )
         full_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {Colors.ACCENT};

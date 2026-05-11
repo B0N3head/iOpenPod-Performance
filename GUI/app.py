@@ -443,6 +443,7 @@ class MainWindow(QMainWindow):
                         return
                     folder = selected_ipod.path or folder
 
+                self._ensure_ipod_drive_tag(selected_ipod, folder)
                 device_manager.discovered_ipod = selected_ipod
                 device_manager.device_path = folder
                 # Persist selection
@@ -475,6 +476,12 @@ class MainWindow(QMainWindow):
         from .widgets.MBGridViewItem import clear_pixmap_cache
         clear_artwork_api()
         clear_pixmap_cache()
+
+        if path and self.device_manager.discovered_ipod is not None:
+            self._ensure_ipod_drive_tag(
+                self.device_manager.discovered_ipod,
+                path,
+            )
 
         if self._apply_effective_theme():
             self._schedule_themed_rebuild(restore_page=0)
@@ -518,6 +525,43 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to refresh settings scope availability", exc_info=True)
         if getattr(self.settingsPage, "_settings_scope", "global") == "device":
             self.settingsPage.load_from_settings()
+
+    def _get_ipod_hdd_tag(self) -> bool:
+        from infrastructure.device_tags import get_ipod_hdd_tag
+
+        device = self.device_manager.discovered_ipod
+        ipod_root = self.device_manager.device_path or ""
+        value = get_ipod_hdd_tag(device, ipod_root)
+        return bool(value) if value is not None else False
+
+    def _set_ipod_hdd_tag(self, ipod_hdd: bool) -> None:
+        from infrastructure.device_tags import set_ipod_hdd_tag
+
+        device = self.device_manager.discovered_ipod
+        if device is None:
+            return
+        ipod_root = self.device_manager.device_path or ""
+        set_ipod_hdd_tag(device, ipod_root, ipod_hdd)
+
+    def _ensure_ipod_drive_tag(self, device_info, ipod_root: str) -> None:
+        from infrastructure.device_tags import get_ipod_hdd_tag, set_ipod_hdd_tag
+
+        if get_ipod_hdd_tag(device_info, ipod_root) is not None:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("iPod Storage Type")
+        msg.setText(
+            "Does this iPod have solid state storage (SSD / microSD / flash) "
+            "or the original hard drive (HDD)?\n\n"
+            "If you are not sure, select HDD."
+        )
+        btn_ssd = msg.addButton("SSD / Flash", QMessageBox.ButtonRole.YesRole)
+        btn_hdd = msg.addButton("HDD (Original)", QMessageBox.ButtonRole.NoRole)
+        msg.setDefaultButton(btn_hdd)
+        msg.exec()
+        is_ssd = msg.clickedButton() is btn_ssd
+        set_ipod_hdd_tag(device_info, ipod_root, not is_ssd)
 
     def resyncDevice(self):
         """Rebuild the cache from the current device."""
@@ -946,9 +990,15 @@ class MainWindow(QMainWindow):
                 # User clicked Continue Anyway (only possible when fpcalc is present)
 
         # Show folder selection dialog
-        dialog = PCFolderDialog(self, self._last_pc_folder)
+        dialog = PCFolderDialog(
+            self,
+            self._last_pc_folder,
+            ipod_hdd=self._get_ipod_hdd_tag(),
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
+
+        self._set_ipod_hdd_tag(bool(dialog.is_ipod_hdd))
 
         self._last_pc_folder = dialog.selected_folder
         # Persist the folder choice
@@ -977,6 +1027,7 @@ class MainWindow(QMainWindow):
                     pc_folder=self._last_pc_folder,
                     ipod_tracks=ipod_tracks,
                     ipod_path=device_manager.device_path or "",
+                    ipod_hdd=bool(dialog.is_ipod_hdd),
                 ),
                 artwork_provider=self._create_back_sync_artwork_provider(
                     device_manager.device_path or "",
@@ -1036,6 +1087,7 @@ class MainWindow(QMainWindow):
                     "fit_photo_thumbnails": settings.fit_photo_thumbnails,
                 },
                 transcode_options=build_transcode_options(settings),
+                ipod_hdd=self._get_ipod_hdd_tag(),
             )
         )
         self._sync_worker.progress.connect(self.syncReview.update_progress)
@@ -1277,6 +1329,7 @@ class MainWindow(QMainWindow):
                 },
                 transcode_options=build_transcode_options(settings),
                 allowed_paths=frozenset(selected_track_paths),
+                ipod_hdd=self._get_ipod_hdd_tag(),
             )
         )
         self._sync_worker.progress.connect(self.syncReview.update_progress)
@@ -1429,6 +1482,7 @@ class MainWindow(QMainWindow):
             user_playlists=user_playlists,
             device_info=device_session.identity,
             on_sync_complete=_on_sync_complete,
+            ipod_hdd=self._get_ipod_hdd_tag(),
         )
         self._sync_execute_worker.progress.connect(self.syncReview.update_execute_progress)
         self._sync_execute_worker.finished.connect(self._onSyncExecuteComplete)

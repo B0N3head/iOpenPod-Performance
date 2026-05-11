@@ -440,6 +440,7 @@ class FingerprintDiffEngine:
         sync_workers: int = 0,
         rating_strategy: str = "ipod_wins",
         allowed_paths: Optional[frozenset[str]] = None,
+        bootstrap_workers: int = 0,
     ) -> SyncPlan:
         """
         Compute the full sync plan.
@@ -663,6 +664,7 @@ class FingerprintDiffEngine:
                 pc_by_fp,
                 progress_callback=progress_callback,
                 is_cancelled=is_cancelled,
+                bootstrap_workers=bootstrap_workers,
             )
 
             if boot_added > 0:
@@ -725,24 +727,35 @@ class FingerprintDiffEngine:
         # mapping entries have already been claimed so each PC track gets its own.
         claimed_db_track_ids: set[int] = set()
 
-        # Sort identity groups so that groups whose album matches an existing
+        # Partition identity groups so that groups whose album matches an existing
         # iPod mapping entry process first.  Without this, iteration order is
         # arbitrary (dict insertion order) and a *new* album variant can claim
         # a mapping entry before the *matching* album group processes — causing
         # a spurious duplicate ADD and a misattributed match.
-        def _album_match_priority(item):
-            (fp, album_key), _tracks = item
-            for entry in mapping.get_entries(fp):
-                ipod_track = ipod_by_db_track_id.get(entry.db_track_id)
-                if ipod_track:
-                    ipod_album = (ipod_track.get("Album", "") or "").strip().lower()
-                    if ipod_album == album_key:
-                        return 0  # has a matching entry → process first
-            return 1  # no match → process after confident matches
+        # Partition is O(n) vs sorted()'s O(n log n) — same correctness guarantee.
+        _matched_first: list = []
+        _unmatched: list = []
+        for _item in identity_groups.items():
+            (fp, album_key), _ = _item
+            _has_match = False
+            for _entry in mapping.get_entries(fp):
+                _ipod_t = ipod_by_db_track_id.get(_entry.db_track_id)
+                if _ipod_t and (_ipod_t.get("Album", "") or "").strip().lower() == album_key:
+                    _has_match = True
+                    break
+            (_matched_first if _has_match else _unmatched).append(_item)
+        sorted_groups = _matched_first + _unmatched
+        n_groups = len(sorted_groups)
 
-        sorted_groups = sorted(identity_groups.items(), key=_album_match_priority)
+        for _diff_idx, ((fp, _album_key), pc_tracks_for_group) in enumerate(sorted_groups):
+            if progress_callback and _diff_idx % 100 == 0 and n_groups > 0:
+                progress_callback(
+                    "diff",
+                    _diff_idx,
+                    n_groups,
+                    f"Comparing {_diff_idx:,} / {n_groups:,} tracks…",
+                )
 
-        for (fp, _album_key), pc_tracks_for_group in sorted_groups:
             # Pick representative track (first one from this album group)
             pc_track = pc_tracks_for_group[0]
             mapping_entries = mapping.get_entries(fp)
@@ -1254,6 +1267,7 @@ class FingerprintDiffEngine:
         *,
         progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        bootstrap_workers: int = 0,
     ) -> tuple[int, int, set[int]]:
         """Seed mapping entries by fingerprinting unmapped iPod tracks.
 
@@ -1287,24 +1301,58 @@ class FingerprintDiffEngine:
         skipped_no_fp = 0
         skipped_no_pc_match = 0
         sample_no_match_fp: Optional[str] = None
-        for index, (db_track_id, ipod_track) in enumerate(bootstrap_candidates, start=1):
-            if is_cancelled and is_cancelled():
-                break
 
-            if progress_callback:
-                label = ipod_track.get("Title") or ipod_track.get("Location") or str(db_track_id)
-                progress_callback("bootstrap_mapping", index, total, str(label))
+        # Phase A — parallel path resolution + fingerprinting (I/O bound).
+        # Results stored in original candidate order so Phase B is deterministic.
+        workers = max(1, bootstrap_workers)
+        fp_results: list[tuple[Optional[Path], Optional[str]]] = [(None, None)] * total
 
-            ipod_path = self._ipod_track_file_path(ipod_track)
-            if ipod_path is None:
-                skipped_no_path += 1
-                continue
-
+        def _resolve_and_fingerprint(
+            idx: int,
+            ipod_track: dict,
+        ) -> tuple[int, Optional[Path], Optional[str]]:
+            path = self._ipod_track_file_path(ipod_track)
+            if path is None:
+                return idx, None, None
             fp = get_or_compute_fingerprint(
-                ipod_path,
+                path,
                 fpcalc_path=self.fpcalc_path,
                 write_to_file=False,
             )
+            return idx, path, fp
+
+        if workers > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_resolve_and_fingerprint, idx, trk): (db_id, trk)
+                    for idx, (db_id, trk) in enumerate(bootstrap_candidates)
+                }
+                completed = 0
+                for fut in as_completed(futures):
+                    if is_cancelled and is_cancelled():
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    completed += 1
+                    db_id, trk = futures[fut]
+                    idx, path, fp = fut.result()
+                    fp_results[idx] = (path, fp)
+                    if progress_callback and completed % 5 == 0:
+                        label = trk.get("Title") or trk.get("Location") or str(db_id)
+                        progress_callback("bootstrap_mapping", completed, total, str(label))
+        else:
+            for idx, (db_id, trk) in enumerate(bootstrap_candidates):
+                if is_cancelled and is_cancelled():
+                    break
+                if progress_callback:
+                    label = trk.get("Title") or trk.get("Location") or str(db_id)
+                    progress_callback("bootstrap_mapping", idx + 1, total, str(label))
+                fp_results[idx] = _resolve_and_fingerprint(idx, trk)[1:]
+
+        # Phase B — serial match + mapping (shared state: mapping, claimed_pc_paths_by_fp).
+        for (db_track_id, ipod_track), (ipod_path, fp) in zip(bootstrap_candidates, fp_results):
+            if ipod_path is None:
+                skipped_no_path += 1
+                continue
             if not fp:
                 skipped_no_fp += 1
                 continue
@@ -1320,7 +1368,6 @@ class FingerprintDiffEngine:
             protected_db_track_ids.add(db_track_id)
 
             used_paths = claimed_pc_paths_by_fp.setdefault(fp, set())
-
             pc_track = self._select_bootstrap_pc_candidate(
                 ipod_track,
                 pc_candidates,
@@ -1536,6 +1583,11 @@ class FingerprintDiffEngine:
         for pc_field, ipod_field in METADATA_FIELDS.items():
             pc_value = getattr(pc_track, pc_field, None)
             ipod_value = ipod_track.get(ipod_field)
+
+            # Fast path: identical raw values — skip all normalization (covers
+            # the vast majority of fields on stable, already-synced tracks).
+            if pc_value == ipod_value:
+                continue
 
             # Normalize None → ""
             if pc_value is None:

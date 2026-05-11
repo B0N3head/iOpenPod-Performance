@@ -44,7 +44,6 @@ def _copy_device_settings_state(state: DeviceSettingsState) -> DeviceSettingsSta
         path=state.path,
     )
 
-
 def _coerce_setting_value(current_value, value):
     expected_type = type(current_value)
     if expected_type is bool:

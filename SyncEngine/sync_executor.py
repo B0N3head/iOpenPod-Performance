@@ -191,6 +191,7 @@ class SyncExecutor:
         photo_sync_settings: dict[str, bool] | None = None,
         transcode_options: TranscodeOptions | None = None,
         device_info: object | None = None,
+        ipod_hdd: bool | None = None,
     ):
         from .transcode_cache import TranscodeCache
 
@@ -218,6 +219,7 @@ class SyncExecutor:
             max_device_write_workers,
             self._max_workers,
             device_info,
+            ipod_hdd=ipod_hdd,
         )
         self._device_write_semaphore = threading.Semaphore(
             self._max_device_write_workers
@@ -244,11 +246,21 @@ class SyncExecutor:
         configured_write_workers: int,
         max_workers: int,
         device_info: object | None,
+        *,
+        ipod_hdd: bool | None = None,
     ) -> int:
         overall_workers = max(1, max_workers)
         if configured_write_workers > 0:
             return max(1, min(configured_write_workers, overall_workers))
 
+        # Explicit tag takes precedence over model-family heuristic.
+        # True = HDD (sequential), False = SSD/flash (parallel).
+        if ipod_hdd is True:
+            return 1
+        if ipod_hdd is False:
+            return min(overall_workers, 4)
+
+        # Fall back to model-family detection for untagged devices.
         if device_info is None:
             return overall_workers
 

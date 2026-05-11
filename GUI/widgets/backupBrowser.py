@@ -898,6 +898,9 @@ class BackupBrowserWidget(QWidget):
             return
 
         settings = self._settings_service.get_effective_settings()
+        from infrastructure.device_tags import get_ipod_hdd_tag
+        _hdd_tag = get_ipod_hdd_tag(device.discovered_ipod, device.device_path)
+        ipod_hdd = _hdd_tag if _hdd_tag is not None else True  # unknown → treat as HDD (safe)
         backup_context = build_backup_device_context(
             device.device_path,
             device.discovered_ipod,
@@ -924,6 +927,7 @@ class BackupBrowserWidget(QWidget):
                 backup_dir=settings.backup_dir,
                 max_backups=settings.max_backups,
                 device_meta=backup_context.device_meta,
+                ipod_hdd=ipod_hdd,
             )
         )
         self._backup_worker.progress.connect(self._on_backup_progress)
@@ -1042,6 +1046,9 @@ class BackupBrowserWidget(QWidget):
             device.discovered_ipod,
         )
         connected_id = connected_context.device_id
+        from infrastructure.device_tags import get_ipod_hdd_tag
+        _hdd_tag = get_ipod_hdd_tag(device.discovered_ipod, device.device_path)
+        ipod_hdd = _hdd_tag if _hdd_tag is not None else True  # unknown → treat as HDD (safe)
 
         # Safety: only restore to the matching device
         if connected_id != self._current_device_id:
@@ -1087,6 +1094,7 @@ class BackupBrowserWidget(QWidget):
                 ipod_path=device.device_path,
                 device_id=connected_id,
                 backup_dir=settings.backup_dir,
+                ipod_hdd=ipod_hdd,
             )
         )
         self._restore_worker.progress.connect(self._on_restore_progress)

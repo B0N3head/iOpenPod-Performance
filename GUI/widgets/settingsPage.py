@@ -1179,9 +1179,23 @@ class SettingsPage(QWidget):
             )
         )
 
+        self.storage_type_row = ComboRow(
+            "Storage Type",
+            "Does this iPod have solid state storage (SSD / microSD / flash) "
+            "or the original hard drive (HDD)? "
+            "This controls how many parallel operations are used during sync and backup. "
+            "If unsure, select HDD.",
+            options=["HDD (Original)", "SSD / Flash"],
+            current="HDD (Original)",
+        )
+        self.storage_type_row.changed.connect(self._on_storage_type_changed)
+
         self._manage_card = _SettingsCard(
             self.use_global_settings,
             self.reset_device_settings,
+        )
+        self._device_card = _SettingsCard(
+            self.storage_type_row,
         )
         self._appearance_card = _SettingsCard(
             self.theme_combo,
@@ -1200,6 +1214,8 @@ class SettingsPage(QWidget):
             "General",
             "Manage",
             self._manage_card,
+            "Device",
+            self._device_card,
             "Appearance",
             self._appearance_card,
             "About",
@@ -1711,6 +1727,13 @@ class SettingsPage(QWidget):
 
         self._manage_card.setVisible(device_scope)
         self._set_section_visible("General", "Manage", device_scope)
+
+        # Device card (storage type) — always visible, enabled only when device connected
+        has_device = self._current_device_context() is not None
+        self._device_card.setVisible(True)
+        self._set_section_visible("General", "Device", True)
+        self.storage_type_row.combo.setEnabled(has_device)
+
         self._appearance_card.set_row_visible(self.theme_combo, not device_scope)
         self._appearance_card.set_row_visible(self.high_contrast, not device_scope)
         self._appearance_card.set_row_visible(self.font_scale, not device_scope)
@@ -1940,6 +1963,19 @@ class SettingsPage(QWidget):
         idx = self.device_write_workers.combo.findText(dww_text)
         if idx >= 0:
             self.device_write_workers.combo.setCurrentIndex(idx)
+
+        # Storage type — keyed per device in device_tags.json, not AppSettings
+        try:
+            from infrastructure.device_tags import get_ipod_hdd_tag
+            session = self._device_sessions.current_session()
+            tag = get_ipod_hdd_tag(session.discovered_ipod, session.device_path or "")
+            st_text = "HDD (Original)" if (tag is None or tag is True) else "SSD / Flash"
+            idx = self.storage_type_row.combo.findText(st_text)
+            if idx >= 0:
+                self.storage_type_row.combo.setCurrentIndex(idx)
+            self.storage_type_row.combo.setEnabled(session.device_path is not None and session.device_path != "")
+        except Exception:
+            self.storage_type_row.combo.setEnabled(False)
 
         self._apply_scope_visibility()
 
@@ -2316,6 +2352,20 @@ class SettingsPage(QWidget):
         )
         self.load_from_settings()
         self._apply_theme_change_if_needed(theme_before)
+
+    def _on_storage_type_changed(self, text: str) -> None:
+        """Persist the HDD/SSD selection to device_tags.json for the connected device."""
+        if self._loading_settings:
+            return
+        try:
+            from infrastructure.device_tags import set_ipod_hdd_tag
+            session = self._device_sessions.current_session()
+            if not session.device_path:
+                return
+            is_ssd = text == "SSD / Flash"
+            set_ipod_hdd_tag(session.discovered_ipod, session.device_path, not is_ssd)
+        except Exception:
+            pass
 
     def _save(self, *_args):
         """Read controls back into the active settings scope and persist."""

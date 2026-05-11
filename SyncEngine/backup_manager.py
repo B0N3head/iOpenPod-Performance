@@ -125,10 +125,12 @@ class BackupManager:
 
     def __init__(self, device_id: str, backup_dir: str = "",
                  device_name: str = "iPod",
-                 device_meta: dict | None = None):
+                 device_meta: dict | None = None,
+                 max_workers: int = 0):
         self.device_id = self._sanitize_id(device_id)
         self.device_name = device_name
         self.device_meta = device_meta or {}
+        self._num_workers = max(1, max_workers) if max_workers and max_workers > 0 else _NUM_WORKERS
         self.backup_root = Path(backup_dir or _DEFAULT_BACKUP_DIR)
         self.device_dir = self.backup_root / self.device_id
         self.blobs_dir = self.backup_root / "blobs"  # Shared across devices
@@ -185,6 +187,10 @@ class BackupManager:
             ))
 
         all_files = self._walk_device(ipod_root)
+        if self._num_workers == 1:
+            # Single-worker (HDD) path: sort by path so files in the same
+            # directory are read together, minimising rotational head seeks.
+            all_files.sort(key=lambda t: t[0])
         total_files = len(all_files)
 
         if total_files == 0:
@@ -277,7 +283,7 @@ class BackupManager:
                 is_new = self._store_blob(full_path, file_hash)
                 return rel_path, fsize, fmtime, file_hash, is_new
 
-            with ThreadPoolExecutor(max_workers=_NUM_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
                 futures = {
                     pool.submit(_process_file, rp, fp, sz, mt): rp
                     for rp, fp, sz, mt in uncached
@@ -557,7 +563,7 @@ class BackupManager:
                 file_hash = self._hash_file(full_path)
                 return rel_path, file_hash
 
-            with ThreadPoolExecutor(max_workers=_NUM_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
                 futures = {
                     pool.submit(_hash_ipod_file, rp, fp): rp
                     for rp, fp in uncached_scan
@@ -696,7 +702,7 @@ class BackupManager:
                 except (OSError, PermissionError) as exc:
                     return rel_path, False, str(exc)
 
-            with ThreadPoolExecutor(max_workers=_NUM_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
                 futures = {
                     pool.submit(_restore_file, rp, target_files[rp]["hash"]): rp
                     for rp in to_copy
