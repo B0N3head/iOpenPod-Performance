@@ -20,6 +20,7 @@ Binary layout (offsets relative to chunk start)::
 from __future__ import annotations
 
 import iTunesDB_Shared as idb
+
 from ._parsing import ParseResult
 from .chunk_parser import parse_children
 

@@ -60,10 +60,10 @@ def read_generic_header(
 
     try:
         chunk_type = raw_type.decode("ascii")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
         raise CorruptHeaderError(
             offset,
             f"chunk type bytes are not valid ASCII: {raw_type!r}",
-        )
+        ) from exc
 
     return chunk_type, header_length, length_or_children

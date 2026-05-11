@@ -10,7 +10,6 @@ path so callers can preserve transport provenance.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from .diagnostic_log import CAPABILITY_FIELDS, IDENTITY_FIELDS, format_fields
 from .models import IPOD_USB_PIDS
@@ -47,7 +46,7 @@ def _find_ipod_devices() -> list:
     found = usb.core.find(find_all=True, idVendor=APPLE_VID, backend=backend)
     if found is None:
         return []
-    return [dev for dev in found if dev.idProduct in IPOD_USB_PIDS]
+    return [dev for dev in found if getattr(dev, "idProduct", None) in IPOD_USB_PIDS]
 
 
 def _device_serial(dev) -> str:
@@ -80,18 +79,15 @@ def _read_sysinfo_extended_from_device(dev) -> bytes:
 def query_ipod_usb_sysinfo_extended(
     usb_pid: int = 0,
     serial_filter: str = "",
-) -> Optional[dict]:
+) -> dict | None:
     """Query one iPod through Apple's USB vendor-control SysInfo command.
 
     Returns a dict shaped similarly to the SCSI VPD readers, with parsed
     SysInfoExtended keys plus ``vpd_raw_xml``, ``usb_pid``, ``usb_serial`` and
     provenance metadata.  Returns ``None`` if no matching iPod answers.
     """
-    try:
-        import usb.core
-    except ImportError:
-        logger.info("USB vendor SysInfoExtended query skipped: pyusb not installed")
-        return None
+    # _find_ipod_devices already checks for pyusb availability and the backend.
+    # No need to import usb.core again here.
 
     serial_filter = serial_filter.replace(" ", "").strip().upper()
     logger.info(
@@ -101,12 +97,12 @@ def query_ipod_usb_sysinfo_extended(
     )
     candidates = [
         dev for dev in _find_ipod_devices()
-        if not usb_pid or dev.idProduct == usb_pid
+        if not usb_pid or getattr(dev, "idProduct", None) == usb_pid
     ]
     logger.info(
         "USB vendor SysInfoExtended candidates: count=%d pids=%s",
         len(candidates),
-        ", ".join(f"0x{dev.idProduct:04X}" for dev in candidates) or "none",
+        ", ".join(f"0x{getattr(dev, 'idProduct', 0):04X}" for dev in candidates) or "none",
     )
     target = None
     if serial_filter:
@@ -137,14 +133,14 @@ def query_ipod_usb_sysinfo_extended(
                 "USB vendor SysInfoExtended backend is available, but Windows "
                 "driver access does not support device control transfers for "
                 "PID=0x%04X serial=%s: %s",
-                target.idProduct,
+                getattr(target, "idProduct", 0),
                 usb_serial,
                 exc,
             )
         else:
             logger.info(
                 "USB vendor SysInfoExtended read failed for PID=0x%04X serial=%s: %s",
-                target.idProduct,
+                getattr(target, "idProduct", 0),
                 usb_serial,
                 exc,
             )
@@ -154,7 +150,7 @@ def query_ipod_usb_sysinfo_extended(
         logger.info(
             "USB vendor SysInfoExtended query returned empty payload: "
             "PID=0x%04X serial=%s",
-            target.idProduct,
+            getattr(target, "idProduct", 0),
             usb_serial,
         )
         return None
@@ -164,13 +160,13 @@ def query_ipod_usb_sysinfo_extended(
         logger.info(
             "USB vendor SysInfoExtended parse returned no plist keys: "
             "PID=0x%04X serial=%s",
-            target.idProduct,
+            getattr(target, "idProduct", 0),
             usb_serial,
         )
         return None
 
     result: dict = {
-        "usb_pid": target.idProduct,
+        "usb_pid": getattr(target, "idProduct", 0),
         "usb_serial": usb_serial,
         "vpd_raw_xml": parsed.raw_xml or raw_xml,
         "_source": "usb_vendor",
@@ -179,14 +175,14 @@ def query_ipod_usb_sysinfo_extended(
     }
     result.update(parsed.plist)
     log_identity = dict(parsed.identity)
-    log_identity["usb_pid"] = target.idProduct
+    log_identity["usb_pid"] = getattr(target, "idProduct", 0)
     if usb_serial:
         log_identity["usb_serial"] = usb_serial
 
     logger.info(
         "USB vendor SysInfoExtended query successful: PID=0x%04X serial=%s "
         "keys=%d identity=[%s] caps=[%s]",
-        target.idProduct,
+        getattr(target, "idProduct", 0),
         usb_serial,
         len(parsed.plist),
         format_fields(log_identity, IDENTITY_FIELDS),
@@ -201,7 +197,7 @@ def query_all_ipod_usb_sysinfo_extended() -> list[dict]:
     for dev in _find_ipod_devices():
         try:
             info = query_ipod_usb_sysinfo_extended(
-                usb_pid=dev.idProduct,
+                usb_pid=getattr(dev, "idProduct", 0),
                 serial_filter=_device_serial(dev),
             )
             if info:
@@ -209,7 +205,7 @@ def query_all_ipod_usb_sysinfo_extended() -> list[dict]:
         except Exception as exc:
             logger.debug(
                 "USB vendor SysInfoExtended query failed for PID=0x%04X: %s",
-                dev.idProduct,
+                getattr(dev, "idProduct", 0),
                 exc,
             )
     return results

@@ -30,9 +30,7 @@ import socket
 import sys
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Any
 
 from .diagnostic_log import (
     CAPABILITY_FIELDS,
@@ -42,13 +40,16 @@ from .diagnostic_log import (
     format_sources,
 )
 
+logger = logging.getLogger(__name__)
+
+
 _LIVE_VALIDATION_LOCK = threading.Lock()
 _LIVE_VALIDATION_INFLIGHT: set[str] = set()
 
 
 def _source_rank(source: str) -> int:
     try:
-        from .authority import SOURCE_RANK, _WORST_RANK
+        from .authority import _WORST_RANK, SOURCE_RANK
 
         return SOURCE_RANK.get(source, _WORST_RANK)
     except Exception:
@@ -67,7 +68,7 @@ def _values_match(field: str, left, right) -> bool:
 
 
 def _set_field_from_source(
-    info: "DeviceInfo",
+    info: DeviceInfo,
     field: str,
     value,
     source: str,
@@ -252,7 +253,7 @@ class DeviceInfo:
         Uses family-level fallback when generation is unknown but all
         generations of the family share identical capabilities.
         """
-        from .capabilities import capabilities_for_family_gen, DeviceCapabilities
+        from .capabilities import DeviceCapabilities, capabilities_for_family_gen
         caps = None
         if self.model_family:
             caps = capabilities_for_family_gen(
@@ -355,7 +356,7 @@ def read_sysinfo(ipod_path: str) -> dict:
     if not os.path.exists(sysinfo_path):
         raise FileNotFoundError(f"SysInfo not found at {sysinfo_path}")
 
-    with open(sysinfo_path, "r", errors="ignore") as f:
+    with open(sysinfo_path, errors="ignore") as f:
         content = f.read()
 
     from .sysinfo import parse_sysinfo_text
@@ -459,12 +460,16 @@ def _restore_usb_pid_identity_if_needed(info: DeviceInfo) -> None:
 
     pid_family, pid_generation = pid_info
     if info.model_number:
+        model_info = None
+        usb_pid_identity_conflicts = None
         try:
-            from .lookup import get_model_info, usb_pid_identity_conflicts
+            from .lookup import get_model_info
+            from .lookup import usb_pid_identity_conflicts as _usb_pid_identity_conflicts
             model_info = get_model_info(info.model_number)
+            usb_pid_identity_conflicts = _usb_pid_identity_conflicts
         except Exception:
             model_info = None
-        if model_info and not usb_pid_identity_conflicts(
+        if model_info and usb_pid_identity_conflicts and not usb_pid_identity_conflicts(
             model_info[0],
             model_info[1],
             pid_family,
@@ -575,7 +580,7 @@ def _sanitize_variant_fields(info: DeviceInfo) -> None:
 
     if capacity_valid and color_valid and info.capacity and info.color:
         try:
-            from .authority import SOURCE_RANK, _WORST_RANK
+            from .authority import _WORST_RANK, SOURCE_RANK
             cap_rank = SOURCE_RANK.get(
                 info._field_sources.get("capacity", "unknown"),
                 _WORST_RANK,
@@ -634,7 +639,7 @@ class _Store:
     that happen *after* the device is stored.
     """
 
-    _instance: Optional[_Store] = None
+    _instance: _Store | None = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -696,8 +701,8 @@ def detect_checksum_type(ipod_path: str):
     Reads from the centralised store first; falls back to SysInfo probing.
     Returns a :class:`ipod_device.ChecksumType` enum value.
     """
-    from .checksum import ChecksumType
     from .capabilities import checksum_type_for_family_gen
+    from .checksum import ChecksumType
     from .lookup import extract_model_number, get_model_info
 
     # Fast path: centralised store
@@ -788,7 +793,7 @@ def get_firewire_id(ipod_path: str, *, known_guid: str | None = None) -> bytes:
     sysinfo_ex_path = os.path.join(ipod_path, "iPod_Control", "Device", "SysInfoExtended")
     if os.path.exists(sysinfo_ex_path):
         try:
-            with open(sysinfo_ex_path, "r", errors="ignore") as f:
+            with open(sysinfo_ex_path, errors="ignore") as f:
                 content = f.read()
             import re as _re
             m = _re.search(
@@ -1260,14 +1265,14 @@ def _log_live_validation_differences(
         "color": live_result.get("color", ""),
     }
     mismatches = []
-    for field, live_value in checks.items():
-        cached_value = getattr(cached, field, "")
+    for fld, live_value in checks.items():
+        cached_value = getattr(cached, fld, "")
         if (
             cached_value
             and live_value
-            and not _values_match(field, cached_value, live_value)
+            and not _values_match(fld, cached_value, live_value)
         ):
-            mismatches.append(f"{field}: cached={cached_value!r}, live={live_value!r}")
+            mismatches.append(f"{fld}: cached={cached_value!r}, live={live_value!r}")
     if mismatches:
         logger.warning(
             "Live identity validation from %s disagreed with cache for %s: %s",
@@ -1290,7 +1295,7 @@ def _apply_live_result_to_cache(
     if usb_pid:
         validated._field_sources["usb_pid"] = usb_pid_source or "unknown"
 
-    for field in (
+    for fld in (
         "serial",
         "firewire_guid",
         "firmware",
@@ -1300,20 +1305,20 @@ def _apply_live_result_to_cache(
         "capacity",
         "color",
     ):
-        value = live_result.get(field, "")
+        value = live_result.get(fld, "")
         if value:
-            setattr(validated, field, value)
-            validated._field_sources[field] = live_source
+            setattr(validated, fld, value)
+            validated._field_sources[fld] = live_source
 
     vpd_info = live_result.get("vpd_info") or {}
-    for vpd_key, field in (
+    for vpd_key, fld in (
         ("FamilyID", "family_id"),
         ("UpdaterFamilyID", "updater_family_id"),
     ):
         value = vpd_info.get(vpd_key)
         if value not in (None, ""):
-            setattr(validated, field, value)
-            validated._field_sources[field] = live_source
+            setattr(validated, fld, value)
+            validated._field_sources[fld] = live_source
 
     try:
         from .authority import update_sysinfo as _update_sysinfo
@@ -1409,7 +1414,7 @@ def _start_live_identity_validation(info: DeviceInfo) -> None:
             )
             _log_live_validation_differences(cached, result, live_source)
             _cache_live_sysinfo_extended(cached.path, vpd_raw, live_source)
-            for field in (
+            for fld in (
                 "serial",
                 "firewire_guid",
                 "firmware",
@@ -1421,8 +1426,8 @@ def _start_live_identity_validation(info: DeviceInfo) -> None:
             ):
                 _set_field_from_source(
                     info,
-                    field,
-                    result.get(field),
+                    fld,
+                    result.get(fld),
                     live_source,
                     label=f"{live_source} validation",
                 )
@@ -1452,7 +1457,7 @@ def _start_live_identity_validation(info: DeviceInfo) -> None:
                     live=True,
                 )
                 identity_sources = identity.setdefault("_sources", {})
-                for field in (
+                for fld in (
                     "usb_pid",
                     "usb_vid",
                     "usb_serial",
@@ -1460,10 +1465,10 @@ def _start_live_identity_validation(info: DeviceInfo) -> None:
                     "scsi_product",
                     "scsi_revision",
                 ):
-                    value = vpd_raw.get(field)
+                    value = vpd_raw.get(fld)
                     if value not in (None, "", b""):
-                        identity[field] = value
-                        identity_sources[field] = live_source
+                        identity[fld] = value
+                        identity_sources[fld] = live_source
                 _apply_sysinfo_extended_identity(info, identity, live_source)
             except Exception as exc:
                 logger.debug("live validation: applying rich fields failed: %s", exc)
@@ -1614,13 +1619,13 @@ def _populate_fields_from_sysinfo(info: DeviceInfo) -> None:
         from .sysinfo import identity_from_sysinfo
 
         identity = identity_from_sysinfo(info.sysinfo, "sysinfo")
-        for field in ("family_id", "updater_family_id"):
-            if field in identity:
+        for fld in ("family_id", "updater_family_id"):
+            if fld in identity:
                 _set_field_from_source(
                     info,
-                    field,
-                    identity[field],
-                    identity.get("_sources", {}).get(field, "sysinfo"),
+                    fld,
+                    identity[fld],
+                    identity.get("_sources", {}).get(fld, "sysinfo"),
                     label="SysInfo",
                 )
     except Exception:
@@ -1651,7 +1656,7 @@ def _enrich_from_sysinfo_extended(info: DeviceInfo) -> None:
         metadata = _sysinfo_extended_cache_metadata(info.path)
         if metadata:
             sources = identity.setdefault("_sources", {})
-            for field, key in (
+            for fld, key in (
                 ("usb_vid", "usb_vid"),
                 ("usb_pid", "usb_pid"),
                 ("usb_serial", "usb_serial"),
@@ -1661,8 +1666,8 @@ def _enrich_from_sysinfo_extended(info: DeviceInfo) -> None:
             ):
                 value = metadata.get(key)
                 if value not in (None, "", b""):
-                    identity[field] = value
-                    sources[field] = metadata.get("_source", "sysinfo_extended")
+                    identity[fld] = value
+                    sources[fld] = metadata.get("_source", "sysinfo_extended")
         logger.debug(
             "enrich: SysInfoExtended parsed bytes=%d keys=%d regex_fallback=%s "
             "identity=[%s] caps=[%s]",
@@ -1749,14 +1754,14 @@ def _apply_sysinfo_extended_identity(
         "photo_formats",
         "chapter_image_formats",
     )
-    for field in fields:
-        if field not in identity:
+    for fld in fields:
+        if fld not in identity:
             continue
         _set_field_from_source(
             info,
-            field,
-            identity[field],
-            sources.get(field, "sysinfo_extended"),
+            fld,
+            identity[fld],
+            sources.get(fld, "sysinfo_extended"),
             label=label,
         )
 
@@ -1874,7 +1879,7 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
         info._field_sources["model_number"] = _hw_method
         logger.debug("enrich: model_number from hardware: %s", info.model_number)
 
-    for field, value, source in (
+    for fld, value, source in (
         ("usb_vid", hw.get("usb_vid"), _fw_source),
         ("usb_serial", hw.get("usb_serial"), _fw_source),
         ("usbstor_instance_id", hw.get("usbstor_instance_id"), _fw_source),
@@ -1888,7 +1893,7 @@ def _enrich_from_hardware_probe(info: DeviceInfo) -> None:
         ("scsi_product", hw.get("scsi_product") or hw.get("product"), _hw_method),
         ("scsi_revision", hw.get("scsi_revision") or hw.get("firmware"), _hw_method),
     ):
-        _set_field_from_source(info, field, value, source, label="hardware")
+        _set_field_from_source(info, fld, value, source, label="hardware")
 
     if info.identification_method == "unknown":
         info.identification_method = "hardware"
@@ -2018,7 +2023,7 @@ def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
                 live=True,
             )
             identity_sources = identity.setdefault("_sources", {})
-            for field in (
+            for fld in (
                 "usb_pid",
                 "usb_vid",
                 "usb_serial",
@@ -2026,10 +2031,10 @@ def _enrich_from_usb_vpd(info: DeviceInfo) -> None:
                 "scsi_product",
                 "scsi_revision",
             ):
-                value = vpd_raw.get(field)
+                value = vpd_raw.get(fld)
                 if value not in (None, "", b""):
-                    identity[field] = value
-                    identity_sources[field] = vpd_source
+                    identity[fld] = value
+                    identity_sources[fld] = vpd_source
             _apply_sysinfo_extended_identity(info, identity, vpd_source)
     except Exception as exc:
         logger.debug("enrich: VPD artwork/capability parse failed: %s", exc)
@@ -2074,7 +2079,7 @@ def _enrich_from_serial_lookup(info: DeviceInfo) -> None:
     # trustworthy as the serial they came from.
     _src = info._field_sources.get("serial", "serial_lookup")
 
-    from .authority import SOURCE_RANK, _WORST_RANK
+    from .authority import _WORST_RANK, SOURCE_RANK
     _serial_rank = SOURCE_RANK.get(_src, _WORST_RANK)
 
     # Apply model_number with the same rank comparison used for other fields.
@@ -2291,8 +2296,8 @@ def _resolve_checksum_type(info: DeviceInfo) -> None:
       6. Default to NONE (safe for pre-2007 iPods)
     """
     try:
-        from .checksum import ChecksumType
         from .capabilities import checksum_type_for_family_gen
+        from .checksum import ChecksumType
     except ImportError:
         return
 
@@ -2370,7 +2375,7 @@ def _enrich_artwork_from_artworkdb(info: DeviceInfo) -> None:
     _MAX_HEADER_READ = 65536
 
     try:
-        from ArtworkDB_Writer.rgb565 import _extract_format_ids, ALL_KNOWN_FORMATS
+        from ArtworkDB_Writer.rgb565 import ALL_KNOWN_FORMATS, _extract_format_ids
         with open(artdb_path, "rb") as f:
             data = f.read(_MAX_HEADER_READ)
 
@@ -2404,5 +2409,5 @@ def generate_library_id() -> bytes:
     always produces the same ID, but different computers produce
     different IDs.
     """
-    identity = f"iOpenPod:{socket.gethostname()}".encode("utf-8")
+    identity = f"iOpenPod:{socket.gethostname()}".encode()
     return hashlib.sha256(identity).digest()[:8]

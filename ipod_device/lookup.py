@@ -1,7 +1,6 @@
 """Model lookup functions — identify iPods from model numbers, serials, etc."""
 
 import re
-from typing import Optional
 
 from .capabilities import _FAMILY_GEN_CAPABILITIES
 from .models import IPOD_MODELS, SERIAL_LAST3_TO_MODEL
@@ -11,7 +10,7 @@ def _identity_text(value: str | None) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
 
-def extract_model_number(model_str: str) -> Optional[str]:
+def extract_model_number(model_str: str) -> str | None:
     """Extract normalised model number from ModelNumStr.
 
     ModelNumStr format varies:
@@ -83,7 +82,7 @@ def usb_pid_identity_conflicts(
     return True
 
 
-def get_model_info(model_number: Optional[str]) -> tuple[str, str, str, str] | None:
+def get_model_info(model_number: str | None) -> tuple[str, str, str, str] | None:
     """Get detailed model information from model number.
 
     Returns:
@@ -108,7 +107,7 @@ def get_model_info(model_number: Optional[str]) -> tuple[str, str, str, str] | N
     return None
 
 
-def get_friendly_model_name(model_number: Optional[str]) -> str:
+def get_friendly_model_name(model_number: str | None) -> str:
     """Return a user-friendly model name string."""
     info = get_model_info(model_number)
     if info:
@@ -142,7 +141,7 @@ def lookup_by_serial(serial: str) -> tuple[str, tuple[str, str, str, str]] | Non
 def infer_generation(
     family: str,
     capacity: str = "",
-) -> Optional[str]:
+) -> str | None:
     """Best-effort generation inference from family + available signals.
 
     Uses the model table to find which generations match a given capacity.

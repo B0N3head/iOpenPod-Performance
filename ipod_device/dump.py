@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 IDENTITY_FIELDS: tuple[str, ...] = (
     "serial",
     "firewire_guid",

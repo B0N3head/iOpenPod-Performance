@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import plistlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
-
+from typing import Any
 
 COVER_ART_KEYS: tuple[str, ...] = (
     "AlbumArt",
